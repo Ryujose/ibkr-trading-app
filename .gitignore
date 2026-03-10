@@ -1,0 +1,164 @@
+# =========================
+
+# Build directories
+
+# =========================
+
+build/
+bin/
+lib/
+out/
+dist/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# =========================
+
+# Compiler outputs
+
+# =========================
+
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+*.app
+
+# =========================
+
+# Debug / profiling
+
+# =========================
+
+*.dSYM/
+*.stackdump
+*.core
+*.gcno
+*.gcda
+*.gmon
+
+# =========================
+
+# Dependency files
+
+# =========================
+
+*.d
+*.dep
+
+# =========================
+
+# Temporary files
+
+# =========================
+
+*.tmp
+*.temp
+*.log
+*.cache
+*.swp
+*.swo
+*~
+
+# =========================
+
+# OS files
+
+# =========================
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+
+# Visual Studio
+
+# =========================
+
+.vs/
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+ipch/
+Debug/
+Release/
+x64/
+x86/
+
+# =========================
+
+# VSCode
+
+# =========================
+
+.vscode/
+
+# =========================
+
+# JetBrains / CLion
+
+# =========================
+
+.idea/
+
+# =========================
+
+# Dear ImGui
+
+# =========================
+
+imgui.ini
+
+# =========================
+
+# Package managers
+
+# =========================
+
+.vcpkg/
+vcpkg_installed/
+
+# =========================
+
+# Generated files
+
+# =========================
+
+*.generated.*
+
+# =========================
+
+# Claude Code
+
+# =========================
+
+.claude/settings.local.json
+.claude/*.local.json
+CLAUDE.local.md
+
+# Optional: ignore full folder if you don't share configs
+
+# .claude/
+
+# =========================
+
+# Environment / secrets
+
+# =========================
+
+.env
+.env.*
+*.key
+*.pem
