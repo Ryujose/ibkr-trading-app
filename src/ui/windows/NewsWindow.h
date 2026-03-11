@@ -32,6 +32,7 @@ public:
 private:
     // ---- UI state -----------------------------------------------------------
     bool m_open              = true;
+    bool m_hasRealData       = false;
     int  m_activeTab         = 0;          // 0=Market, 1=Portfolio, 2=Stock
     char m_stockSymbol[16]   = "AAPL";
     char m_stockSymbolPrev[16] = "";       // detect symbol change

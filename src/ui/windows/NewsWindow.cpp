@@ -39,6 +39,7 @@ NewsWindow::NewsWindow() {
 // Public API for IB Gateway callbacks (future)
 // ============================================================================
 void NewsWindow::OnMarketNewsItem(const core::NewsItem& item) {
+    m_hasRealData = true;
     m_marketNews.insert(m_marketNews.begin(), item);
 }
 void NewsWindow::OnPortfolioNewsItem(const core::NewsItem& item) {
@@ -64,8 +65,8 @@ bool NewsWindow::Render() {
         return m_open;
     }
 
-    // Auto-refresh
-    if (m_autoRefresh) {
+    // Auto-refresh (simulation only — skip when receiving real IB news)
+    if (m_autoRefresh && !m_hasRealData) {
         auto now = Clock::now();
         auto sec = [](float s){ return std::chrono::duration<float>(s); };
         if (now - m_lastRefreshMarket    > sec(m_refreshIntervalSec)) RefreshMarket();

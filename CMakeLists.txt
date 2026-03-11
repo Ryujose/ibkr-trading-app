@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(ibkr-trading-app
     VERSION 1.0.0
     DESCRIPTION "Interactive Brokers Trading Application with C++ and ImGui/Vulkan"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 # ============================================================================
@@ -169,25 +169,40 @@ target_include_directories(implot-lib PUBLIC
     ${imgui_SOURCE_DIR}
 )
 # ============================================================================
-# The IB Gateway API requires manual setup from Interactive Brokers
-# Users must download and install the TWS or IB Gateway API package
-# https://www.interactivebrokers.com/en/software/api/apiguide/overview.htm
+# IB TWS C++ API — bundled in-tree at twsapi_macunix.1037.02
+# ============================================================================
+set(IBAPI_DIR "${CMAKE_SOURCE_DIR}/twsapi_macunix.1037.02/IBJts/source/cppclient/client")
+set(IBAPI_PROTO_DIR "${IBAPI_DIR}/protobufUnix")
 
-set(IBKR_API_DIR "" CACHE PATH "Path to IBKR API installation directory")
+# BID stubs (replaces Intel libbid which is not available on this system)
+add_library(bid-stubs STATIC src/bid_stubs/bid_stubs.c)
+target_include_directories(bid-stubs PUBLIC ${IBAPI_DIR})
 
-if(IBKR_API_DIR)
-    message(STATUS "IBKR API directory: ${IBKR_API_DIR}")
-    set(HOST_NAME "${CMAKE_HOST_SYSTEM_NAME}" CACHE STRING "Target host name for IBKR API")
-else()
-    message(WARNING "IBKR API directory not specified. Set -DIBKR_API_DIR=<path> during CMake configuration.")
-    message(STATUS "Download from: https://www.interactivebrokers.com/en/software/api/apiguide/overview.htm")
-endif()
+# Protobuf (system-installed)
+find_package(Protobuf REQUIRED)
+
+# IB API static library
+file(GLOB IBAPI_CPP_SOURCES "${IBAPI_DIR}/*.cpp")
+file(GLOB IBAPI_PROTO_SOURCES "${IBAPI_PROTO_DIR}/*.cc")
+
+add_library(ibapi-lib STATIC ${IBAPI_CPP_SOURCES} ${IBAPI_PROTO_SOURCES})
+target_include_directories(ibapi-lib PUBLIC
+    ${IBAPI_DIR}
+    ${IBAPI_PROTO_DIR}
+    ${Protobuf_INCLUDE_DIRS}
+)
+target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES} pthread)
+# Suppress warnings from third-party IB API code
+target_compile_options(ibapi-lib PRIVATE -w)
+# IB API uses C++14 features; allow its sources to compile as C++17
+set_target_properties(ibapi-lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED OFF)
 
 # ============================================================================
 # Main Application Sources
 # ============================================================================
 set(APPLICATION_SOURCES
     src/main.cpp
+    src/core/services/IBKRClient.cpp
     src/ui/windows/ChartWindow.cpp
     src/ui/windows/NewsWindow.cpp
     src/ui/windows/TradingWindow.cpp
@@ -205,6 +220,8 @@ set(APPLICATION_LIBS
     Vulkan::Vulkan
     glm::glm
     glfw
+    ibapi-lib
+    bid-stubs
 )
 
 # Platform-specific libraries
@@ -253,16 +270,13 @@ target_include_directories(ibkr-trading-app PRIVATE
     ${imgui_SOURCE_DIR}/examples
     ${implot_SOURCE_DIR}
     ${glm_SOURCE_DIR}
+    ${IBAPI_DIR}
+    ${IBAPI_PROTO_DIR}
+    ${Protobuf_INCLUDE_DIRS}
 )
 
 # Include GLFW headers from fetch content
 target_include_directories(ibkr-trading-app PRIVATE ${glfw_SOURCE_DIR}/include)
-
-if(IBKR_API_DIR)
-    target_include_directories(ibkr-trading-app PRIVATE
-        ${IBKR_API_DIR}/Source
-    )
-endif()
 
 # Link libraries
 target_link_libraries(ibkr-trading-app PRIVATE
@@ -305,7 +319,8 @@ message(STATUS "Vulkan Found:      ${Vulkan_FOUND}")
 message(STATUS "ImGui Source:      ${imgui_SOURCE_DIR}")
 message(STATUS "ImPlot Source:     ${implot_SOURCE_DIR}")
 message(STATUS "GLM Source:        ${glm_SOURCE_DIR}")
-message(STATUS "IBKR API Dir:      ${IBKR_API_DIR}")
+message(STATUS "IB API Dir:        ${IBAPI_DIR}")
+message(STATUS "Protobuf Found:    ${Protobuf_FOUND}")
 message(STATUS "")
 message(STATUS "To build, run:")
 message(STATUS "  cmake --build <build-dir>")

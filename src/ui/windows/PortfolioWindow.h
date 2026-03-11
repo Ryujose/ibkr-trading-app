@@ -50,6 +50,7 @@ public:
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;
+    bool m_hasRealData = false;
 
     // ---- Account data -------------------------------------------------------
     core::AccountValues              m_account;

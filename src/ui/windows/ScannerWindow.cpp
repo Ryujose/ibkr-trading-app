@@ -39,7 +39,6 @@ ScannerWindow::ScannerWindow()
 {
     m_lastScanTime   = Clock::now();
     m_lastQuoteUpdate = Clock::now();
-    RunScan();
 }
 
 // ============================================================================
@@ -49,6 +48,7 @@ ScannerWindow::ScannerWindow()
 void ScannerWindow::OnScanData(int /*reqId*/,
                                const std::vector<core::ScanResult>& results)
 {
+    m_hasRealData = true;
     m_results = results;
     SortResults();
 }
@@ -90,8 +90,8 @@ bool ScannerWindow::Render()
         }
     }
 
-    // Live quote drift (every 0.5s)
-    {
+    // Live quote drift (every 0.5s) — only when no real IB data
+    if (!m_hasRealData) {
         auto now = Clock::now();
         float dt = std::chrono::duration<float>(now - m_lastQuoteUpdate).count();
         if (dt >= 0.5f) {
@@ -682,9 +682,44 @@ void ScannerWindow::DrawStatusBar()
 
 void ScannerWindow::RunScan()
 {
-    m_results.clear();
     m_selectedRow = -1;
+    m_lastScanTime = Clock::now();
 
+    if (OnScanRequest) {
+        // Map preset → IB scanner code
+        const char* scanCode = "TOP_PERC_GAIN";
+        switch (kPresets[m_presetIdx]) {
+            case core::ScanPreset::TopGainers:    scanCode = "TOP_PERC_GAIN";      break;
+            case core::ScanPreset::TopLosers:     scanCode = "TOP_PERC_LOSE";      break;
+            case core::ScanPreset::VolumeLeaders: scanCode = "TOP_VOLUME_RATE";    break;
+            case core::ScanPreset::MostActive:    scanCode = "HOT_BY_VOLUME";      break;
+            case core::ScanPreset::NewHighs:      scanCode = "HIGH_52_WK_HL";      break;
+            case core::ScanPreset::NewLows:       scanCode = "LOW_52_WK_HL";       break;
+            case core::ScanPreset::RSIOverbought: scanCode = "RSI_OVER_BUY";       break;
+            case core::ScanPreset::RSIOversold:   scanCode = "RSI_OVER_SELL";      break;
+            case core::ScanPreset::NearEarnings:  scanCode = "NEAR_EARNINGS_DATE"; break;
+            case core::ScanPreset::Custom:        scanCode = "TOP_PERC_GAIN";      break;
+        }
+        // Map asset class → IB instrument / location
+        const char* instrument = "STK";
+        const char* location   = "STK.US.MAJOR";
+        switch (m_activeClass) {
+            case core::AssetClass::ETFs:
+                instrument = "STK"; location = "STK.US.MAJOR"; break;
+            case core::AssetClass::Indexes:
+                instrument = "IND"; location = "IND.US";        break;
+            case core::AssetClass::Futures:
+                instrument = "FUT"; location = "FUT.US";        break;
+            default: break;
+        }
+        m_results.clear();
+        m_scanning = true;
+        OnScanRequest(scanCode, instrument, location);
+        return;
+    }
+
+    // Simulation fallback (no IB connection)
+    m_results.clear();
     switch (m_activeClass) {
         case core::AssetClass::Stocks:  SimulateStocks();  break;
         case core::AssetClass::Indexes: SimulateIndexes(); break;
@@ -692,7 +727,7 @@ void ScannerWindow::RunScan()
         case core::AssetClass::Futures: SimulateFutures(); break;
     }
 
-    // Apply preset filter (override/sort after simulation)
+    // Apply preset filter/sort
     auto preset = kPresets[m_presetIdx];
     switch (preset) {
         case core::ScanPreset::TopGainers:
@@ -711,7 +746,6 @@ void ScannerWindow::RunScan()
         case core::ScanPreset::NewHighs:
             m_sortCol = core::ScanColumn::PctFrom52H;
             m_sortAscending = false;
-            // Keep only stocks near 52W high
             m_results.erase(std::remove_if(m_results.begin(), m_results.end(),
                 [](const core::ScanResult& r){ return r.pctFrom52H < -2.0; }),
                 m_results.end());
@@ -740,16 +774,11 @@ void ScannerWindow::RunScan()
         default:
             break;
     }
-
     SortResults();
-
-    // Record scan time
-    m_lastScanTime = Clock::now();
-    std::time_t t  = std::time(nullptr);
-    std::tm*    tm = std::localtime(&t);
-    if (tm)
-        std::strftime(m_lastScanTimeStr, sizeof(m_lastScanTimeStr),
-                      "%H:%M:%S", tm);
+    std::time_t now2 = std::time(nullptr);
+    std::tm* tm2 = std::localtime(&now2);
+    if (tm2)
+        std::strftime(m_lastScanTimeStr, sizeof(m_lastScanTimeStr), "%H:%M:%S", tm2);
 }
 
 // ============================================================================

@@ -51,9 +51,15 @@ public:
     // Called when user double-clicks a row — host wires this to ChartWindow
     std::function<void(const std::string& symbol)> OnSymbolSelected;
 
+    // Called by main once IB is connected — triggers a real IB scanner request
+    std::function<void(const std::string& scanCode,
+                       const std::string& instrument,
+                       const std::string& location)> OnScanRequest;
+
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;
+    bool m_hasRealData = false;
 
     // ---- Asset class tabs ---------------------------------------------------
     core::AssetClass m_activeClass = core::AssetClass::Stocks;

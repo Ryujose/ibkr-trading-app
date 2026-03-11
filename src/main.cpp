@@ -1,8 +1,8 @@
 /**
- * Interactive Brokers Trading Application - Main Entry Point
+ * Interactive Brokers Trading Application — Main Entry Point
  *
- * A cross-platform trading application built with C++20, ImGui (Vulkan backend),
- * and IB Gateway API integration.
+ * Connects to a running IB Gateway or TWS via the C++ TWS API.
+ * Authentication is handled by TWS/Gateway itself; we only need host/port/clientId.
  */
 
 #include <cstdlib>
@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <unordered_map>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
@@ -29,60 +30,67 @@
 #include "ui/windows/ScannerWindow.h"
 #include "ui/windows/PortfolioWindow.h"
 
-// Global window instances (created on login, destroyed on disconnect)
+#include "core/services/IBKRClient.h"
+
+// ============================================================================
+// Global window instances
+// ============================================================================
 static ui::ChartWindow*    g_ChartWindow    = nullptr;
 static ui::NewsWindow*     g_NewsWindow     = nullptr;
 static ui::TradingWindow*  g_TradingWindow  = nullptr;
 static ui::ScannerWindow*  g_ScannerWindow  = nullptr;
 static ui::PortfolioWindow* g_PortfolioWindow = nullptr;
 
+// IB API client (created on Connect, deleted on Disconnect)
+static core::services::IBKRClient* g_IBClient = nullptr;
+
+// Pending bar accumulation for the chart (fills as historicalData callbacks arrive)
+static core::BarSeries g_pendingBars;
+
+// Pending scanner results (fills as scannerData callbacks arrive)
+static std::vector<core::ScanResult> g_pendingScanResults;
+
+// tickerId → symbol mapping (for routing tick data to windows)
+static std::unordered_map<int, std::string> g_tickerSymbols;
+
+static int g_nextOrderId = 1;
+
+// Request IDs (reserved ranges)
+static constexpr int HIST_REQID   = 1;    // historical data for the chart
+static constexpr int DEPTH_REQID  = 200;  // market depth
+static constexpr int SCAN_REQID   = 300;  // scanner
+static constexpr int MKT_REQID_BASE = 100; // market data per-symbol offset
+
 // ============================================================================
 // Connection / Login state
 // ============================================================================
-enum class ConnectionState {
-    Disconnected,
-    Connecting,
-    Connected,
-    Error,
-};
-
-enum class ApiType {
-    TWS = 0,
-    Gateway,
-};
+enum class ConnectionState { Disconnected, Connecting, Connected, Error };
+enum class ApiType          { TWS = 0, Gateway };
 
 struct LoginState {
-    // UI fields
-    char     username[64]  = "";
-    char     password[64]  = "";
-    char     host[128]     = "127.0.0.1";
-    int      port          = 7497;       // updated automatically
-    int      clientId      = 1;
-    bool     isLive        = false;
-    ApiType  apiType       = ApiType::TWS;
+    char    host[128]  = "127.0.0.1";
+    int     port       = 7497;
+    int     clientId   = 1;
+    bool    isLive     = false;
+    ApiType apiType    = ApiType::TWS;
 
-    // Runtime state
-    ConnectionState state  = ConnectionState::Disconnected;
+    ConnectionState state    = ConnectionState::Disconnected;
     std::string     errorMsg;
     std::string     connectedAs;
 
-    // Simulated connection timer
-    std::chrono::steady_clock::time_point connectStartTime;
-
     void UpdatePort() {
-        if (apiType == ApiType::TWS) {
+        if (apiType == ApiType::TWS)
             port = isLive ? 7496 : 7497;
-        } else {
+        else
             port = isLive ? 4001 : 4002;
-        }
     }
 };
 
-static LoginState g_Login;
-static GLFWwindow* g_AppWindow = nullptr; // set in main, used by UI
+static LoginState  g_Login;
+static GLFWwindow* g_AppWindow = nullptr;
 
 // ============================================================================
-// Vulkan globals (managed via ImGui helper structures)
+// Vulkan globals
 // ============================================================================
 static VkAllocationCallbacks*   g_Allocator      = nullptr;
 static VkInstance               g_Instance       = VK_NULL_HANDLE;
@@ -98,74 +106,67 @@ static uint32_t                 g_MinImageCount    = 2;
 static bool                     g_SwapChainRebuild = false;
 
 // ============================================================================
-// Error helpers
+// Helpers
 // ============================================================================
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
-
 static void check_vk_result(VkResult err) {
     if (err == VK_SUCCESS) return;
     fprintf(stderr, "[vulkan] Error: VkResult = %d\n", err);
     if (err < 0) abort();
 }
-
 static bool IsExtensionAvailable(const ImVector<VkExtensionProperties>& props, const char* ext) {
     for (const VkExtensionProperties& p : props)
-        if (strcmp(p.extensionName, ext) == 0)
-            return true;
+        if (strcmp(p.extensionName, ext) == 0) return true;
     return false;
 }
 
 // ============================================================================
-// Vulkan setup
+// Vulkan setup / teardown
 // ============================================================================
 static void SetupVulkan(ImVector<const char*> instance_extensions) {
     VkResult err;
-
     {
-        VkInstanceCreateInfo create_info = {};
-        create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        VkInstanceCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 
-        uint32_t props_count = 0;
+        uint32_t cnt = 0;
         ImVector<VkExtensionProperties> props;
-        vkEnumerateInstanceExtensionProperties(nullptr, &props_count, nullptr);
-        props.resize((int)props_count);
-        err = vkEnumerateInstanceExtensionProperties(nullptr, &props_count, props.Data);
-        check_vk_result(err);
+        vkEnumerateInstanceExtensionProperties(nullptr, &cnt, nullptr);
+        props.resize((int)cnt);
+        vkEnumerateInstanceExtensionProperties(nullptr, &cnt, props.Data);
 
         if (IsExtensionAvailable(props, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
             instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 #ifdef VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME
         if (IsExtensionAvailable(props, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
             instance_extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-            create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
         }
 #endif
-        create_info.enabledExtensionCount   = (uint32_t)instance_extensions.Size;
-        create_info.ppEnabledExtensionNames = instance_extensions.Data;
-        err = vkCreateInstance(&create_info, g_Allocator, &g_Instance);
+        ci.enabledExtensionCount   = (uint32_t)instance_extensions.Size;
+        ci.ppEnabledExtensionNames = instance_extensions.Data;
+        err = vkCreateInstance(&ci, g_Allocator, &g_Instance);
         check_vk_result(err);
     }
 
     g_PhysicalDevice = ImGui_ImplVulkanH_SelectPhysicalDevice(g_Instance);
     IM_ASSERT(g_PhysicalDevice != VK_NULL_HANDLE);
-
     g_QueueFamily = ImGui_ImplVulkanH_SelectQueueFamilyIndex(g_PhysicalDevice);
     IM_ASSERT(g_QueueFamily != (uint32_t)-1);
 
     {
-        ImVector<const char*> device_exts;
-        device_exts.push_back("VK_KHR_swapchain");
-
-        uint32_t props_count = 0;
-        ImVector<VkExtensionProperties> props;
-        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &props_count, nullptr);
-        props.resize((int)props_count);
-        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &props_count, props.Data);
+        ImVector<const char*> dev_exts;
+        dev_exts.push_back("VK_KHR_swapchain");
+        uint32_t cnt2 = 0;
+        ImVector<VkExtensionProperties> props2;
+        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &cnt2, nullptr);
+        props2.resize((int)cnt2);
+        vkEnumerateDeviceExtensionProperties(g_PhysicalDevice, nullptr, &cnt2, props2.Data);
 #ifdef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
-        if (IsExtensionAvailable(props, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
-            device_exts.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+        if (IsExtensionAvailable(props2, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
+            dev_exts.push_back(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
 #endif
         const float prio[] = {1.0f};
         VkDeviceQueueCreateInfo qi[1] = {};
@@ -173,21 +174,21 @@ static void SetupVulkan(ImVector<const char*> instance_extensions) {
         qi[0].queueFamilyIndex = g_QueueFamily;
         qi[0].queueCount       = 1;
         qi[0].pQueuePriorities = prio;
-
-        VkDeviceCreateInfo ci = {};
-        ci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        ci.queueCreateInfoCount    = IM_ARRAYSIZE(qi);
-        ci.pQueueCreateInfos       = qi;
-        ci.enabledExtensionCount   = (uint32_t)device_exts.Size;
-        ci.ppEnabledExtensionNames = device_exts.Data;
-        err = vkCreateDevice(g_PhysicalDevice, &ci, g_Allocator, &g_Device);
+        VkDeviceCreateInfo dci = {};
+        dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        dci.queueCreateInfoCount    = IM_ARRAYSIZE(qi);
+        dci.pQueueCreateInfos       = qi;
+        dci.enabledExtensionCount   = (uint32_t)dev_exts.Size;
+        dci.ppEnabledExtensionNames = dev_exts.Data;
+        err = vkCreateDevice(g_PhysicalDevice, &dci, g_Allocator, &g_Device);
         check_vk_result(err);
         vkGetDeviceQueue(g_Device, g_QueueFamily, 0, &g_Queue);
     }
 
     {
         VkDescriptorPoolSize pool_sizes[] = {
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+             IMGUI_IMPL_VULKAN_MINIMUM_IMAGE_SAMPLER_POOL_SIZE},
         };
         VkDescriptorPoolCreateInfo pi = {};
         pi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -212,14 +213,15 @@ static void SetupVulkanWindow(ImGui_ImplVulkanH_Window* wd, VkSurfaceKHR surface
     };
     wd->Surface       = surface;
     wd->SurfaceFormat = ImGui_ImplVulkanH_SelectSurfaceFormat(
-        g_PhysicalDevice, surface, fmts, IM_ARRAYSIZE(fmts), VK_COLORSPACE_SRGB_NONLINEAR_KHR);
-
+        g_PhysicalDevice, surface, fmts, IM_ARRAYSIZE(fmts),
+        VK_COLORSPACE_SRGB_NONLINEAR_KHR);
     VkPresentModeKHR pm[] = {VK_PRESENT_MODE_FIFO_KHR};
-    wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(g_PhysicalDevice, surface, pm, IM_ARRAYSIZE(pm));
-
+    wd->PresentMode = ImGui_ImplVulkanH_SelectPresentMode(
+        g_PhysicalDevice, surface, pm, IM_ARRAYSIZE(pm));
     IM_ASSERT(g_MinImageCount >= 2);
     ImGui_ImplVulkanH_CreateOrResizeWindow(
-        g_Instance, g_PhysicalDevice, g_Device, wd, g_QueueFamily, g_Allocator, w, h, g_MinImageCount, 0);
+        g_Instance, g_PhysicalDevice, g_Device, wd, g_QueueFamily,
+        g_Allocator, w, h, g_MinImageCount, 0);
 }
 
 static void CleanupVulkan() {
@@ -227,7 +229,6 @@ static void CleanupVulkan() {
     vkDestroyDevice(g_Device, g_Allocator);
     vkDestroyInstance(g_Instance, g_Allocator);
 }
-
 static void CleanupVulkanWindow(ImGui_ImplVulkanH_Window* wd) {
     ImGui_ImplVulkanH_DestroyWindow(g_Instance, g_Device, wd, g_Allocator);
     vkDestroySurfaceKHR(g_Instance, wd->Surface, g_Allocator);
@@ -266,7 +267,6 @@ static void FrameRender(ImGui_ImplVulkanH_Window* wd, ImDrawData* draw_data) {
     ri.clearValueCount          = 1;
     ri.pClearValues             = &wd->ClearValue;
     vkCmdBeginRenderPass(fd->CommandBuffer, &ri, VK_SUBPASS_CONTENTS_INLINE);
-
     ImGui_ImplVulkan_RenderDrawData(draw_data, fd->CommandBuffer);
     vkCmdEndRenderPass(fd->CommandBuffer);
 
@@ -280,7 +280,7 @@ static void FrameRender(ImGui_ImplVulkanH_Window* wd, ImDrawData* draw_data) {
     si.pCommandBuffers      = &fd->CommandBuffer;
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores    = &rend_sem;
-    err = vkEndCommandBuffer(fd->CommandBuffer);  check_vk_result(err);
+    err = vkEndCommandBuffer(fd->CommandBuffer);   check_vk_result(err);
     err = vkQueueSubmit(g_Queue, 1, &si, fd->Fence); check_vk_result(err);
 }
 
@@ -302,78 +302,283 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 }
 
 // ============================================================================
-// Login simulation helpers
+// Window lifecycle helpers
 // ============================================================================
+static void CreateTradingWindows() {
+    delete g_ChartWindow;    g_ChartWindow    = new ui::ChartWindow();
+    delete g_NewsWindow;     g_NewsWindow     = new ui::NewsWindow();
+    delete g_TradingWindow;  g_TradingWindow  = new ui::TradingWindow();
+    delete g_ScannerWindow;  g_ScannerWindow  = new ui::ScannerWindow();
+    delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
 
-// Called once per frame while Connecting — simulates a 1.5 s handshake delay.
-// In a real app, replace with actual IBKR EClient::eConnect() call.
-static void TickConnecting() {
-    using namespace std::chrono;
-    auto elapsed = duration_cast<milliseconds>(
-        steady_clock::now() - g_Login.connectStartTime).count();
-
-    if (elapsed >= 1500) {
-        // Simulate success: in a real app check EClient::isConnected()
-        if (g_Login.username[0] != '\0') {
-            g_Login.state       = ConnectionState::Connected;
-            g_Login.connectedAs = std::string(g_Login.username) +
-                                  (g_Login.isLive ? " [LIVE]" : " [PAPER]");
-            printf("[ibkr] Connected to %s:%d as %s\n",
-                   g_Login.host, g_Login.port, g_Login.connectedAs.c_str());
-            // Initialise trading windows
-            delete g_ChartWindow;
-            g_ChartWindow = new ui::ChartWindow();
-            delete g_NewsWindow;
-            g_NewsWindow    = new ui::NewsWindow();
-            delete g_TradingWindow;
-            g_TradingWindow = new ui::TradingWindow();
-            delete g_ScannerWindow;
-            g_ScannerWindow = new ui::ScannerWindow();
-            // Wire scanner → chart: double-click a row to view its chart
-            g_ScannerWindow->OnSymbolSelected = [](const std::string& sym) {
-                if (g_ChartWindow) g_ChartWindow->SetSymbol(sym);
-            };
-            delete g_PortfolioWindow;
-            g_PortfolioWindow = new ui::PortfolioWindow();
-        } else {
-            g_Login.state    = ConnectionState::Error;
-            g_Login.errorMsg = "Username cannot be empty.";
+    // Scanner row double-click → switch chart symbol + request new data
+    g_ScannerWindow->OnSymbolSelected = [](const std::string& sym) {
+        if (g_ChartWindow) g_ChartWindow->SetSymbol(sym);
+        if (g_IBClient) {
+            g_IBClient->CancelHistoricalData(HIST_REQID);
+            g_IBClient->CancelMarketData(MKT_REQID_BASE);
+            g_IBClient->CancelMktDepth(DEPTH_REQID);
+            g_pendingBars = core::BarSeries{};
+            g_pendingBars.symbol    = sym;
+            g_pendingBars.timeframe = core::Timeframe::D1;
+            g_IBClient->ReqHistoricalData(HIST_REQID, sym);
+            g_tickerSymbols[MKT_REQID_BASE] = sym;
+            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym);
+            g_IBClient->ReqMktDepth(DEPTH_REQID, sym);
         }
+    };
+
+    // Wire order submission / cancellation to IB
+    g_TradingWindow->SetNextOrderId(g_nextOrderId);
+    g_TradingWindow->OnOrderSubmit = [](int orderId, const std::string& sym,
+                                        const std::string& action,
+                                        const std::string& orderType,
+                                        double qty, double limitPrice) {
+        if (g_IBClient)
+            g_IBClient->PlaceOrder(orderId, sym, action, orderType, qty, limitPrice);
+    };
+    g_TradingWindow->OnOrderCancel = [](int orderId) {
+        if (g_IBClient) g_IBClient->CancelOrder(orderId);
+    };
+
+    // Wire scanner to IB
+    g_ScannerWindow->OnScanRequest = [](const std::string& scanCode,
+                                        const std::string& instrument,
+                                        const std::string& location) {
+        if (g_IBClient)
+            g_IBClient->ReqScannerData(SCAN_REQID, scanCode, instrument, location);
+    };
+}
+
+static void DestroyTradingWindows() {
+    delete g_ChartWindow;    g_ChartWindow    = nullptr;
+    delete g_NewsWindow;     g_NewsWindow     = nullptr;
+    delete g_TradingWindow;  g_TradingWindow  = nullptr;
+    delete g_ScannerWindow;  g_ScannerWindow  = nullptr;
+    delete g_PortfolioWindow; g_PortfolioWindow = nullptr;
+}
+
+// ============================================================================
+// IB API connection wiring
+// ============================================================================
+static void WireIBCallbacks() {
+    // ── Connection state ──────────────────────────────────────────────────
+    g_IBClient->onConnectionChanged = [](bool connected, const std::string& info) {
+        if (connected) {
+            g_Login.state       = ConnectionState::Connected;
+            g_Login.connectedAs = g_Login.isLive ? "[LIVE]" : "[PAPER]";
+            printf("[IB] %s\n", info.c_str());
+
+            CreateTradingWindows();
+
+            // Set market data type before any subscriptions.
+            // Live:  type 1 (real-time, requires active data subscriptions).
+            // Paper: type 3 (delayed 15-20 min, free on all paper accounts).
+            g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 3);
+
+            // Start subscriptions
+            g_IBClient->ReqAccountUpdates(true);
+            g_IBClient->ReqPositions();
+            g_IBClient->ReqScannerData(SCAN_REQID);
+
+            // Chart — default AAPL
+            const std::string sym = "AAPL";
+            g_pendingBars.symbol    = sym;
+            g_pendingBars.timeframe = core::Timeframe::D1;
+            g_tickerSymbols[MKT_REQID_BASE] = sym;
+            g_IBClient->ReqHistoricalData(HIST_REQID, sym);
+            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym);
+            g_IBClient->ReqMktDepth(DEPTH_REQID, sym);
+        } else {
+            if (g_Login.state == ConnectionState::Connecting) {
+                g_Login.state    = ConnectionState::Error;
+                g_Login.errorMsg = info;
+            } else {
+                g_Login.state = ConnectionState::Disconnected;
+                DestroyTradingWindows();
+            }
+            printf("[IB] Disconnected: %s\n", info.c_str());
+        }
+    };
+
+    // ── Historical bars (chart) ───────────────────────────────────────────
+    g_IBClient->onBarData = [](int /*reqId*/, const core::Bar& bar, bool done) {
+        if (!done) {
+            g_pendingBars.bars.push_back(bar);
+        } else if (g_ChartWindow) {
+            g_ChartWindow->SetHistoricalData(g_pendingBars);
+            g_pendingBars.bars.clear();
+        }
+    };
+
+    // ── Market data ticks ─────────────────────────────────────────────────
+    g_IBClient->onTickPrice = [](int tickerId, int field, double price) {
+        auto it = g_tickerSymbols.find(tickerId);
+        if (it == g_tickerSymbols.end()) return;
+        const std::string& sym = it->second;
+        // field 4 = LAST
+        if (field == 4 && g_TradingWindow) {
+            g_TradingWindow->OnTick(price, 1.0, true);
+            g_TradingWindow->SetSymbol(sym, price);
+        }
+        // Update scanner quote
+        if (field == 4 && g_ScannerWindow)
+            g_ScannerWindow->OnQuoteUpdate(sym, price, 0.0, 0.0, 0.0);
+    };
+
+    g_IBClient->onTickSize = [](int /*tickerId*/, int /*field*/, double /*size*/) {
+        // Could feed volume/size data here
+    };
+
+    // ── Account values ────────────────────────────────────────────────────
+    g_IBClient->onAccountValue = [](const std::string& key, const std::string& val,
+                                    const std::string& currency,
+                                    const std::string& acct) {
+        if (g_PortfolioWindow)
+            g_PortfolioWindow->OnAccountValue(key, val, currency, acct);
+    };
+
+    // ── Positions ─────────────────────────────────────────────────────────
+    g_IBClient->onPositionData = [](const core::Position& pos, bool done) {
+        if (g_PortfolioWindow) {
+            if (!done)
+                g_PortfolioWindow->OnPositionUpdate(pos);
+            else
+                g_PortfolioWindow->OnAccountEnd();
+        }
+        // Keep scanner aware of held positions
+        if (!done && g_ScannerWindow) {
+            static std::vector<std::string> held;
+            held.push_back(pos.symbol);
+            g_ScannerWindow->SetPortfolioSymbols(held);
+        }
+    };
+
+    // ── Portfolio updates (P&L etc.) ──────────────────────────────────────
+    g_IBClient->onPortfolioUpdate = [](const core::Position& pos) {
+        if (g_PortfolioWindow) g_PortfolioWindow->OnPositionUpdate(pos);
+    };
+
+    // ── Order status ──────────────────────────────────────────────────────
+    g_IBClient->onOrderStatusChanged = [](int orderId, core::OrderStatus status,
+                                          double filled, double avgPrice) {
+        if (g_TradingWindow)
+            g_TradingWindow->OnOrderStatus(orderId, status, filled, avgPrice);
+    };
+
+    // ── Fills ─────────────────────────────────────────────────────────────
+    g_IBClient->onFillReceived = [](const core::Fill& fill) {
+        if (g_TradingWindow) g_TradingWindow->OnFill(fill);
+        if (g_PortfolioWindow) {
+            core::TradeRecord tr;
+            tr.tradeId   = fill.orderId;
+            tr.symbol    = fill.symbol;
+            tr.side      = fill.side == core::OrderSide::Buy ? "BUY" : "SELL";
+            tr.quantity  = fill.quantity;
+            tr.price     = fill.price;
+            tr.commission = fill.commission;
+            g_PortfolioWindow->OnTradeExecuted(tr);
+        }
+    };
+
+    // ── Market depth ──────────────────────────────────────────────────────
+    g_IBClient->onDepthUpdate = [](int /*id*/, bool isBid, int pos, int /*op*/,
+                                   double price, double size) {
+        if (g_TradingWindow)
+            g_TradingWindow->OnDepthUpdate(isBid, pos, price, size);
+    };
+
+    // ── Scanner ───────────────────────────────────────────────────────────
+    g_IBClient->onScanItem = [](int reqId, const core::ScanResult& result) {
+        if (reqId == SCAN_REQID) g_pendingScanResults.push_back(result);
+    };
+    g_IBClient->onScanEnd = [](int reqId) {
+        if (reqId == SCAN_REQID && g_ScannerWindow && !g_pendingScanResults.empty()) {
+            g_ScannerWindow->OnScanData(reqId, g_pendingScanResults);
+            g_pendingScanResults.clear();
+        }
+    };
+
+    // ── News ──────────────────────────────────────────────────────────────
+    g_IBClient->onNewsItem = [](std::time_t ts, const std::string& provider,
+                                const std::string& articleId,
+                                const std::string& headline) {
+        if (!g_NewsWindow) return;
+        core::NewsItem item;
+        item.id        = static_cast<int>(ts);
+        item.headline  = headline;
+        item.source    = provider;
+        item.summary   = articleId;
+        item.timestamp = ts;
+        item.sentiment = core::NewsSentiment::Neutral;
+        item.category  = core::NewsCategory::Market;
+        g_NewsWindow->OnMarketNewsItem(item);
+    };
+
+    // ── Errors ────────────────────────────────────────────────────────────
+    g_IBClient->onError = [](int code, const std::string& msg) {
+        fprintf(stderr, "[IB Error %d] %s\n", code, msg.c_str());
+        // Surface critical errors in the UI
+        if (code == 162 || code == 200 || code == 321) {
+            // Ignore common benign errors (no data/historical, invalid contract)
+        }
+    };
+
+    // ── Next valid order id ───────────────────────────────────────────────
+    g_IBClient->onNextValidId = [](int id) {
+        g_nextOrderId = id;
+        printf("[IB] Next valid order ID: %d\n", id);
+    };
+}
+
+// ============================================================================
+// Connect / Disconnect
+// ============================================================================
+static void StartConnect() {
+    g_Login.state    = ConnectionState::Connecting;
+    g_Login.errorMsg.clear();
+
+    delete g_IBClient;
+    g_IBClient = new core::services::IBKRClient();
+    WireIBCallbacks();
+
+    printf("[IB] Connecting to %s:%d  clientId=%d  account=%s\n",
+           g_Login.host, g_Login.port, g_Login.clientId,
+           g_Login.isLive ? "LIVE" : "PAPER");
+
+    bool ok = g_IBClient->Connect(g_Login.host, g_Login.port, g_Login.clientId);
+    if (!ok) {
+        g_Login.state    = ConnectionState::Error;
+        g_Login.errorMsg = std::string("Cannot reach ") + g_Login.host +
+                           ":" + std::to_string(g_Login.port) +
+                           " — is IB Gateway / TWS running?";
+        delete g_IBClient;
+        g_IBClient = nullptr;
     }
 }
 
-static void StartConnect() {
-    g_Login.state            = ConnectionState::Connecting;
-    g_Login.errorMsg.clear();
-    g_Login.connectStartTime = std::chrono::steady_clock::now();
-    printf("[ibkr] Connecting to %s:%d  clientId=%d  account=%s\n",
-           g_Login.host, g_Login.port, g_Login.clientId,
-           g_Login.isLive ? "LIVE" : "PAPER");
-}
-
 static void Disconnect() {
+    if (g_IBClient) {
+        g_IBClient->ReqAccountUpdates(false);
+        g_IBClient->Disconnect();
+        delete g_IBClient;
+        g_IBClient = nullptr;
+    }
     g_Login.state       = ConnectionState::Disconnected;
     g_Login.connectedAs.clear();
     g_Login.errorMsg.clear();
-    delete g_ChartWindow;
-    g_ChartWindow = nullptr;
-    delete g_NewsWindow;
-    g_NewsWindow    = nullptr;
-    delete g_TradingWindow;
-    g_TradingWindow = nullptr;
-    delete g_ScannerWindow;
-    g_ScannerWindow = nullptr;
-    delete g_PortfolioWindow;
-    g_PortfolioWindow = nullptr;
-    printf("[ibkr] Disconnected.\n");
+    g_pendingBars       = core::BarSeries{};
+    g_pendingScanResults.clear();
+    g_tickerSymbols.clear();
+    DestroyTradingWindows();
+    printf("[IB] Disconnected.\n");
 }
 
 // ============================================================================
-// Mandatory Login Window
-// Renders a centered, non-closeable dialog that blocks the trading UI.
+// Login Window
 // ============================================================================
 static void RenderLoginWindow() {
-    // Dim the entire screen with a dark overlay
+    // Dark overlay
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->Pos);
     ImGui::SetNextWindowSize(vp->Size);
@@ -387,8 +592,7 @@ static void RenderLoginWindow() {
     ImGui::End();
     ImGui::PopStyleVar(2);
 
-    // Center the login dialog
-    const ImVec2 loginSize = {440.0f, 360.0f};
+    const ImVec2 loginSize = {460.0f, 340.0f};
     ImGui::SetNextWindowPos(
         ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
         ImGuiCond_Always, ImVec2(0.5f, 0.5f));
@@ -396,47 +600,44 @@ static void RenderLoginWindow() {
     ImGui::SetNextWindowBgAlpha(1.0f);
 
     ImGuiWindowFlags dlgFlags =
-        ImGuiWindowFlags_NoResize     | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse   | ImGuiWindowFlags_NoSavedSettings;
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 18.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 10.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.0f, 10.0f));
 
     if (ImGui::Begin("Interactive Brokers Login", nullptr, dlgFlags)) {
 
-        // ---- Header ----
+        // Header
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.7f, 0.1f, 1.0f));
-        float textW = ImGui::CalcTextSize("Interactive Brokers").x;
-        ImGui::SetCursorPosX((loginSize.x - textW) * 0.5f);
+        float tw = ImGui::CalcTextSize("Interactive Brokers").x;
+        ImGui::SetCursorPosX((loginSize.x - tw) * 0.5f);
         ImGui::Text("Interactive Brokers");
         ImGui::PopStyleColor();
-
-        float subW = ImGui::CalcTextSize("Trading Application").x;
-        ImGui::SetCursorPosX((loginSize.x - subW) * 0.5f);
+        float sw = ImGui::CalcTextSize("Trading Application").x;
+        ImGui::SetCursorPosX((loginSize.x - sw) * 0.5f);
         ImGui::TextDisabled("Trading Application");
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
         bool isConnecting = (g_Login.state == ConnectionState::Connecting);
-
-        // ---- Account Type ----
-        ImGui::Text("Account Type");
-        ImGui::SameLine(140);
-
         if (isConnecting) ImGui::BeginDisabled();
 
+        // Account type
+        ImGui::Text("Account Type");
+        ImGui::SameLine(140);
         bool changedType = false;
         if (ImGui::RadioButton("Paper", !g_Login.isLive)) { g_Login.isLive = false; changedType = true; }
         ImGui::SameLine();
         if (ImGui::RadioButton("Live",   g_Login.isLive)) { g_Login.isLive = true;  changedType = true; }
 
-        // ---- API Type ----
+        // API type
         ImGui::Text("API");
         ImGui::SameLine(140);
         int apiIdx = (int)g_Login.apiType;
-        if (ImGui::RadioButton("TWS", &apiIdx, 0))     { g_Login.apiType = ApiType::TWS;     changedType = true; }
+        if (ImGui::RadioButton("TWS",        &apiIdx, 0)) { g_Login.apiType = ApiType::TWS;     changedType = true; }
         ImGui::SameLine();
         if (ImGui::RadioButton("IB Gateway", &apiIdx, 1)) { g_Login.apiType = ApiType::Gateway; changedType = true; }
         if (changedType) g_Login.UpdatePort();
@@ -445,20 +646,7 @@ static void RenderLoginWindow() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        // ---- Credentials ----
-        ImGui::Text("Username");
-        ImGui::SameLine(140);
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##user", g_Login.username, sizeof(g_Login.username));
-
-        ImGui::Text("Password");
-        ImGui::SameLine(140);
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##pass", g_Login.password, sizeof(g_Login.password),
-                         ImGuiInputTextFlags_Password);
-
-        // ---- Connection params ----
-        ImGui::Spacing();
+        // Connection parameters
         ImGui::Text("Host");
         ImGui::SameLine(140);
         ImGui::SetNextItemWidth(-1);
@@ -482,7 +670,14 @@ static void RenderLoginWindow() {
         ImGui::Separator();
         ImGui::Spacing();
 
-        // ---- Status ----
+        // Info note
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::TextWrapped("Ensure IB Gateway or TWS is running with API enabled on the port above. "
+                           "Username / password are handled by TWS/Gateway.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+
+        // Error / status
         if (g_Login.state == ConnectionState::Error) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
             ImGui::TextWrapped("Error: %s", g_Login.errorMsg.c_str());
@@ -491,64 +686,59 @@ static void RenderLoginWindow() {
         }
 
         if (isConnecting) {
-            // Animated dots while connecting
             using namespace std::chrono;
+            static auto startTime = steady_clock::now();
             int dots = (int)(duration_cast<milliseconds>(
-                steady_clock::now() - g_Login.connectStartTime).count() / 400) % 4;
+                steady_clock::now() - startTime).count() / 400) % 4;
             char buf[32];
             snprintf(buf, sizeof(buf), "Connecting%.*s", dots, "...");
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 1.0f, 1.0f));
-            float w = ImGui::CalcTextSize(buf).x;
-            ImGui::SetCursorPosX((loginSize.x - w) * 0.5f);
+            float bw = ImGui::CalcTextSize(buf).x;
+            ImGui::SetCursorPosX((loginSize.x - bw) * 0.5f);
             ImGui::Text("%s", buf);
             ImGui::PopStyleColor();
         }
 
-        // ---- Connect button ----
+        // Connect button
         if (!isConnecting) {
-            ImVec4 btnColor = g_Login.isLive
-                ? ImVec4(0.7f, 0.1f, 0.1f, 1.0f)   // red for live
-                : ImVec4(0.1f, 0.5f, 0.2f, 1.0f);  // green for paper
-            ImVec4 btnHover = g_Login.isLive
-                ? ImVec4(0.9f, 0.2f, 0.2f, 1.0f)
-                : ImVec4(0.2f, 0.7f, 0.3f, 1.0f);
-            ImVec4 btnActive = g_Login.isLive
-                ? ImVec4(0.5f, 0.05f, 0.05f, 1.0f)
-                : ImVec4(0.08f, 0.35f, 0.15f, 1.0f);
-
+            ImVec4 btnColor = g_Login.isLive ? ImVec4(0.7f, 0.1f, 0.1f, 1.0f)
+                                             : ImVec4(0.1f, 0.5f, 0.2f, 1.0f);
+            ImVec4 btnHover = g_Login.isLive ? ImVec4(0.9f, 0.2f, 0.2f, 1.0f)
+                                             : ImVec4(0.2f, 0.7f, 0.3f, 1.0f);
+            ImVec4 btnAct   = g_Login.isLive ? ImVec4(0.5f, 0.05f, 0.05f, 1.0f)
+                                             : ImVec4(0.08f, 0.35f, 0.15f, 1.0f);
             ImGui::PushStyleColor(ImGuiCol_Button,        btnColor);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, btnHover);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btnActive);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btnAct);
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
 
-            const char* btnLabel = g_Login.isLive ? "Connect to Live Account"
-                                                  : "Connect to Paper Account";
-            float btnW = loginSize.x - 48.0f; // full width minus padding
-            if (ImGui::Button(btnLabel, ImVec2(btnW, 32.0f)))
+            const char* lbl = g_Login.isLive ? "Connect to Live Account"
+                                             : "Connect to Paper Account";
+            float btnW = loginSize.x - 48.0f;
+            if (ImGui::Button(lbl, ImVec2(btnW, 32.0f)))
                 StartConnect();
 
             ImGui::PopStyleColor(3);
             ImGui::PopStyleVar();
-        }
 
-        // ---- Warning for live ----
-        if (g_Login.isLive && !isConnecting) {
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
-            ImGui::TextWrapped("WARNING: Live account uses real money. Orders will be executed in the market.");
-            ImGui::PopStyleColor();
+            if (g_Login.isLive) {
+                ImGui::Spacing();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+                ImGui::TextWrapped("WARNING: Live account — real orders will be executed.");
+                ImGui::PopStyleColor();
+            }
         }
     }
     ImGui::End();
     ImGui::PopStyleVar(3);
 
-    // Tick the connecting state machine each frame
-    if (g_Login.state == ConnectionState::Connecting)
-        TickConnecting();
+    // Poll IB messages while connecting (connection is async)
+    if (g_Login.state == ConnectionState::Connecting && g_IBClient)
+        g_IBClient->ProcessMessages();
 }
 
 // ============================================================================
-// Trading UI (only shown when connected)
+// Trading UI (post-login)
 // ============================================================================
 static void RenderTradingUI() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -562,8 +752,6 @@ static void RenderTradingUI() {
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
 
     if (ImGui::Begin("##TradingHost", nullptr, hostFlags)) {
-
-        // ---- Menu bar ----
         if (ImGui::BeginMenuBar()) {
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Disconnect")) Disconnect();
@@ -571,19 +759,16 @@ static void RenderTradingUI() {
                 if (ImGui::MenuItem("Exit")) glfwSetWindowShouldClose(g_AppWindow, GLFW_TRUE);
                 ImGui::EndMenu();
             }
-            if (ImGui::BeginMenu("View")) {
-                ImGui::MenuItem("Demo Window", nullptr, nullptr, false);
-                ImGui::EndMenu();
-            }
             if (ImGui::BeginMenu("Windows")) {
-                ImGui::MenuItem("Chart",     nullptr, nullptr, false);
-                ImGui::MenuItem("Order Entry", nullptr, nullptr, false);
-                ImGui::MenuItem("Portfolio", nullptr, nullptr, false);
-                ImGui::MenuItem("News",      nullptr, nullptr, false);
+                ImGui::MenuItem("Chart",      nullptr, nullptr, false);
+                ImGui::MenuItem("Order Book", nullptr, nullptr, false);
+                ImGui::MenuItem("Portfolio",  nullptr, nullptr, false);
+                ImGui::MenuItem("News",       nullptr, nullptr, false);
+                ImGui::MenuItem("Scanner",    nullptr, nullptr, false);
                 ImGui::EndMenu();
             }
 
-            // Status indicator on the right side of the menu bar
+            // Status indicator
             const std::string& who = g_Login.connectedAs;
             ImGui::SameLine(ImGui::GetContentRegionAvail().x
                             - ImGui::CalcTextSize(who.c_str()).x - 12.0f);
@@ -596,79 +781,16 @@ static void RenderTradingUI() {
             ImGui::EndMenuBar();
         }
 
-        // Dockspace
         ImGuiID dockId = ImGui::GetID("TradingDock");
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
     }
     ImGui::End();
 
-    // ---- Chart window (Task #4) ----
-    if (g_ChartWindow) g_ChartWindow->Render();
-
-    // ---- News window (Task #5) ----
-    if (g_NewsWindow)    g_NewsWindow->Render();
-
-    // ---- Trading window (Task #6) ----
-    if (g_TradingWindow) g_TradingWindow->Render();
-
-    // ---- Scanner window (Task #7) ----
-    if (g_ScannerWindow) g_ScannerWindow->Render();
-
-    // ---- Portfolio window (Task #8) ----
+    if (g_ChartWindow)    g_ChartWindow->Render();
+    if (g_NewsWindow)     g_NewsWindow->Render();
+    if (g_TradingWindow)  g_TradingWindow->Render();
+    if (g_ScannerWindow)  g_ScannerWindow->Render();
     if (g_PortfolioWindow) g_PortfolioWindow->Render();
-
-    if (ImGui::Begin("Order Entry - AAPL")) {
-        static int  orderType      = 0;
-        static char quantity[32]   = "100";
-        static char limitPrice[32] = "";
-
-        ImGui::Text("Symbol: AAPL");
-        if (ImGui::BeginCombo("Order Type", orderType == 0 ? "Market" : "Limit")) {
-            if (ImGui::Selectable("Market", orderType == 0)) orderType = 0;
-            if (ImGui::Selectable("Limit",  orderType == 1)) orderType = 1;
-            ImGui::EndCombo();
-        }
-        if (orderType == 1)
-            ImGui::InputText("Limit Price", limitPrice, sizeof(limitPrice));
-        ImGui::InputText("Quantity", quantity, sizeof(quantity));
-
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.5f, 0.2f, 1.0f));
-        if (ImGui::Button("BUY",  ImVec2(80, 0)))
-            printf("BUY  %s @ %s\n", quantity, orderType == 1 ? limitPrice : "MARKET");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
-        if (ImGui::Button("SELL", ImVec2(80, 0)))
-            printf("SELL %s @ %s\n", quantity, orderType == 1 ? limitPrice : "MARKET");
-        ImGui::PopStyleColor();
-    }
-    ImGui::End();
-
-    if (ImGui::Begin("Portfolio Summary")) {
-        static float equity = 125000.0f;
-        static float dayPnl =   1250.5f;
-        ImGui::Text("Total Equity: $%.2f", equity);
-        ImVec4 pnlCol = dayPnl >= 0
-            ? ImVec4(0.2f, 0.8f, 0.3f, 1.0f)
-            : ImVec4(0.9f, 0.3f, 0.3f, 1.0f);
-        ImGui::SameLine();
-        ImGui::TextColored(pnlCol, "  Day P&L: %+.2f", dayPnl);
-        if (ImGui::Button("Refresh")) { /* TODO: fetch from IB Gateway */ }
-    }
-    ImGui::End();
-
-    if (ImGui::Begin("News Feed")) {
-        const char* headlines[] = {
-            "Market opens higher on strong earnings",
-            "Fed signals potential rate cuts ahead",
-            "Tech stocks rally amid AI optimism",
-            "Oil prices stabilize after recent volatility",
-        };
-        for (const char* h : headlines)
-            if (ImGui::Selectable(h))
-                printf("News: %s\n", h);
-    }
-    ImGui::End();
 }
 
 // ============================================================================
@@ -682,29 +804,28 @@ static void RenderMainUI() {
 }
 
 // ============================================================================
-// Entry point
+// main
 // ============================================================================
 int main(int argc, char* argv[]) {
     (void)argc; (void)argv;
 
-    std::cout << "========================================\n"
+    std::cout << "============================================\n"
               << "Interactive Brokers Trading Application\n"
-              << "Version: 1.0.0\n"
-              << "Build: " << __DATE__ << " " << __TIME__ << "\n"
-              << "========================================\n";
+              << "Version: 1.0.0   Build: " << __DATE__ << " " << __TIME__ << "\n"
+              << "============================================\n";
 
     glfwSetErrorCallback(glfw_error_callback);
-    if (!glfwInit()) { std::cerr << "Failed to initialize GLFW\n"; return 1; }
-    if (!glfwVulkanSupported()) { std::cerr << "Vulkan not supported\n"; glfwTerminate(); return 1; }
+    if (!glfwInit()) { std::cerr << "Failed to initialise GLFW\n"; return 1; }
+    if (!glfwVulkanSupported()) {
+        std::cerr << "Vulkan not supported\n"; glfwTerminate(); return 1;
+    }
 
-    // Collect required Vulkan extensions from GLFW
     ImVector<const char*> extensions;
     uint32_t ext_count = 0;
     const char** glfw_exts = glfwGetRequiredInstanceExtensions(&ext_count);
     for (uint32_t i = 0; i < ext_count; i++) extensions.push_back(glfw_exts[i]);
     SetupVulkan(extensions);
 
-    // Create window
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     g_AppWindow = glfwCreateWindow(1920, 1080, "IBKR Trading App", nullptr, nullptr);
@@ -713,7 +834,6 @@ int main(int argc, char* argv[]) {
         CleanupVulkan(); glfwTerminate(); return 1;
     }
 
-    // Create surface + swapchain
     VkSurfaceKHR surface;
     VkResult err = glfwCreateWindowSurface(g_Instance, g_AppWindow, g_Allocator, &surface);
     check_vk_result(err);
@@ -723,7 +843,6 @@ int main(int argc, char* argv[]) {
     ImGui_ImplVulkanH_Window* wd = &g_MainWindowData;
     SetupVulkanWindow(wd, surface, fb_w, fb_h);
 
-    // Setup ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
@@ -759,22 +878,22 @@ int main(int argc, char* argv[]) {
     init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&init_info);
 
-    // Initialize login defaults
     g_Login.UpdatePort();
 
     ImVec4 clear_color = ImVec4(0.08f, 0.08f, 0.08f, 1.0f);
     printf("Application running. Close window to exit.\n");
 
-    // ---- Main loop ----
+    // ── Main loop ──────────────────────────────────────────────────────────
     while (!glfwWindowShouldClose(g_AppWindow)) {
         glfwPollEvents();
 
-        // Resize swapchain if needed
+        // Drain IB message queue each frame (when connected)
+        if (g_IBClient) g_IBClient->ProcessMessages();
+
         int cur_w, cur_h;
         glfwGetFramebufferSize(g_AppWindow, &cur_w, &cur_h);
         if (cur_w > 0 && cur_h > 0 &&
-            (g_SwapChainRebuild || wd->Width != cur_w || wd->Height != cur_h))
-        {
+            (g_SwapChainRebuild || wd->Width != cur_w || wd->Height != cur_h)) {
             ImGui_ImplVulkan_SetMinImageCount(g_MinImageCount);
             ImGui_ImplVulkanH_CreateOrResizeWindow(
                 g_Instance, g_PhysicalDevice, g_Device, wd,
@@ -809,11 +928,17 @@ int main(int argc, char* argv[]) {
             ImGui::UpdatePlatformWindows();
             ImGui::RenderPlatformWindowsDefault();
         }
-
         if (!minimized) FramePresent(wd);
     }
 
     // Cleanup
+    if (g_IBClient) {
+        g_IBClient->Disconnect();
+        delete g_IBClient;
+        g_IBClient = nullptr;
+    }
+    DestroyTradingWindows();
+
     err = vkDeviceWaitIdle(g_Device);
     check_vk_result(err);
 
@@ -824,17 +949,6 @@ int main(int argc, char* argv[]) {
 
     CleanupVulkanWindow(wd);
     CleanupVulkan();
-
-    delete g_ChartWindow;
-    g_ChartWindow = nullptr;
-    delete g_NewsWindow;
-    g_NewsWindow    = nullptr;
-    delete g_TradingWindow;
-    g_TradingWindow = nullptr;
-    delete g_ScannerWindow;
-    g_ScannerWindow = nullptr;
-    delete g_PortfolioWindow;
-    g_PortfolioWindow = nullptr;
 
     glfwDestroyWindow(g_AppWindow);
     glfwTerminate();
