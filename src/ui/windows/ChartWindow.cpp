@@ -27,8 +27,35 @@ ChartWindow::ChartWindow() {
 void ChartWindow::SetSymbol(const std::string& symbol) {
     if (symbol.size() < sizeof(m_symbol)) {
         std::memcpy(m_symbol, symbol.c_str(), symbol.size() + 1);
+        m_hasRealData  = false;   // clear real data; RefreshData will regenerate simulated
         m_needsRefresh = true;
     }
+}
+
+void ChartWindow::AddBar(const core::Bar& bar, bool done) {
+    if (!m_hasRealData) {
+        // First real bar arriving: discard any simulated data
+        m_series.bars.clear();
+        m_series.symbol    = m_symbol;
+        m_series.timeframe = m_timeframe;
+        m_hasRealData      = true;
+        m_needsRefresh     = false;
+    }
+    if (!done) {
+        m_series.bars.push_back(bar);
+    } else {
+        // Historical data stream complete — rebuild display arrays
+        RebuildFlatArrays();
+        ComputeIndicators();
+    }
+}
+
+void ChartWindow::SetHistoricalData(const core::BarSeries& series) {
+    m_series       = series;
+    m_hasRealData  = true;
+    m_needsRefresh = false;
+    RebuildFlatArrays();
+    ComputeIndicators();
 }
 
 // ============================================================================
@@ -408,8 +435,8 @@ void ChartWindow::DrawRsiChart() {
 // Data management
 // ============================================================================
 void ChartWindow::RefreshData() {
-    int barCount = 200;
-    m_series = GenerateSimulatedBars(m_symbol, m_timeframe, barCount);
+    if (m_hasRealData) return;  // real data already loaded; don't overwrite
+    m_series = GenerateSimulatedBars(m_symbol, m_timeframe, 200);
     RebuildFlatArrays();
     ComputeIndicators();
 }

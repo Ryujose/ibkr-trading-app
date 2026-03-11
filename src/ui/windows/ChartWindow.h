@@ -3,6 +3,7 @@
 #include "core/models/MarketData.h"
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace ui {
 
@@ -21,6 +22,13 @@ public:
 
     // Change the symbol being charted (e.g., from scanner row click).
     void SetSymbol(const std::string& symbol);
+
+    // Feed real historical bars from IB API (replaces simulated data).
+    // Call once per bar while receiving data, then once more with done=true.
+    void AddBar(const core::Bar& bar, bool done);
+
+    // Replace the entire bar series at once (e.g. from a completed feed).
+    void SetHistoricalData(const core::BarSeries& series);
 
 private:
     // ---- Settings -----------------------------------------------------------
@@ -45,6 +53,7 @@ private:
     core::Timeframe   m_timeframe       = core::Timeframe::D1;
     bool              m_needsRefresh    = true;
     bool              m_open            = true;
+    bool              m_hasRealData     = false;   // true when IB bars loaded
 
     IndicatorSettings m_ind;
     core::BarSeries   m_series;

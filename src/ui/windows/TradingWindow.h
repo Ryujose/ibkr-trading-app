@@ -6,6 +6,7 @@
 #include <deque>
 #include <chrono>
 #include <random>
+#include <functional>
 
 namespace ui {
 
@@ -46,9 +47,18 @@ public:
     // Seed the mid-price when a symbol changes (from market data window later)
     void SetSymbol(const std::string& symbol, double midPrice);
 
+    // Called by main once IB is connected
+    void SetNextOrderId(int id);
+    std::function<void(int orderId, const std::string& sym,
+                       const std::string& action,    // "BUY"|"SELL"
+                       const std::string& orderType, // "MKT"|"LMT"|"STP"|"STPLMT"
+                       double qty, double limitPrice)> OnOrderSubmit;
+    std::function<void(int orderId)> OnOrderCancel;
+
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;
+    bool m_hasRealData = false;
 
     // ---- Symbol / price -----------------------------------------------------
     char   m_symbol[16]     = "AAPL";

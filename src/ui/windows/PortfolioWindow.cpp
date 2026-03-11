@@ -42,6 +42,7 @@ void PortfolioWindow::OnAccountValue(const std::string& key, const std::string& 
                                      const std::string& /*currency*/,
                                      const std::string& /*accountName*/)
 {
+    m_hasRealData = true;
     double d = std::atof(val.c_str());
     if      (key == "NetLiquidation")    m_account.netLiquidation  = d;
     else if (key == "TotalCashValue")    m_account.totalCashValue  = d;
@@ -56,6 +57,10 @@ void PortfolioWindow::OnAccountValue(const std::string& key, const std::string& 
 
 void PortfolioWindow::OnPositionUpdate(const core::Position& pos)
 {
+    if (!m_hasRealData) {
+        m_hasRealData = true;
+        m_positions.clear();
+    }
     for (auto& p : m_positions) {
         if (p.symbol == pos.symbol) { p = pos; return; }
     }
@@ -83,8 +88,8 @@ bool PortfolioWindow::Render()
 {
     if (!m_open) return false;
 
-    // Periodic quote drift
-    {
+    // Periodic quote drift — only when no real IB data
+    if (!m_hasRealData) {
         auto now = Clock::now();
         float dt = std::chrono::duration<float>(now - m_lastQuoteUpdate).count();
         if (dt >= m_quoteUpdateIntervalSec) {

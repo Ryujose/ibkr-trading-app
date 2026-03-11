@@ -37,6 +37,7 @@ TradingWindow::TradingWindow()
 // Public API — IB Gateway callbacks (future)
 // ============================================================================
 void TradingWindow::OnDepthUpdate(bool isBid, int pos, double price, double size) {
+    m_hasRealData = true;
     auto& levels = isBid ? m_bids : m_asks;
     if (pos < 0 || pos >= (int)levels.size()) return;
     levels[pos].flashAge = 0.0f;
@@ -62,6 +63,7 @@ void TradingWindow::OnFill(const core::Fill& fill) {
 }
 
 void TradingWindow::OnTick(double price, double size, bool isUptick) {
+    m_hasRealData = true;
     core::Tick t;
     t.price     = price;
     t.size      = size;
@@ -98,9 +100,11 @@ bool TradingWindow::Render() {
         return 0.0f;
     };
 
-    if (float dt = elapsed(m_lastBookUpdate, m_bookUpdateIntervalSec))  SimulateBookTick(dt);
-    if (elapsed(m_lastTickUpdate,  m_tickIntervalSec) > 0)               SimulateNewTick();
-    if (float dt = elapsed(m_lastOrderCheck,  m_orderCheckIntervalSec)) SimulateOrderLifecycle(dt);
+    if (!m_hasRealData) {
+        if (float dt = elapsed(m_lastBookUpdate, m_bookUpdateIntervalSec))  SimulateBookTick(dt);
+        if (elapsed(m_lastTickUpdate,  m_tickIntervalSec) > 0)               SimulateNewTick();
+        if (float dt = elapsed(m_lastOrderCheck,  m_orderCheckIntervalSec)) SimulateOrderLifecycle(dt);
+    }
     (void)elapsed; // suppress unused-lambda warning
 
     // Age flash highlights every frame
@@ -583,23 +587,36 @@ void TradingWindow::SubmitOrder() {
     o.submittedAt = std::time(nullptr);
     o.updatedAt   = o.submittedAt;
 
-    // Market orders fill immediately (with slippage)
-    if (o.type == core::OrderType::Market) {
-        double slip    = (o.side == core::OrderSide::Buy ? 1 : -1) * 0.01;
-        o.filledQty    = o.quantity;
-        o.avgFillPrice = m_midPrice + slip;
-        o.status       = core::OrderStatus::Filled;
-        o.updatedAt    = std::time(nullptr);
+    if (OnOrderSubmit) {
+        // Real IB order — IB will send back status via OnOrderStatus / OnFill
+        const char* action = (o.side == core::OrderSide::Buy) ? "BUY" : "SELL";
+        const char* orderType = "MKT";
+        switch (o.type) {
+            case core::OrderType::Limit:     orderType = "LMT";    break;
+            case core::OrderType::Stop:      orderType = "STP";    break;
+            case core::OrderType::StopLimit: orderType = "STPLMT"; break;
+            default: break;
+        }
+        OnOrderSubmit(o.orderId, o.symbol, action, orderType, o.quantity, o.limitPrice);
+    } else {
+        // Simulation fallback
+        if (o.type == core::OrderType::Market) {
+            double slip    = (o.side == core::OrderSide::Buy ? 1 : -1) * 0.01;
+            o.filledQty    = o.quantity;
+            o.avgFillPrice = m_midPrice + slip;
+            o.status       = core::OrderStatus::Filled;
+            o.updatedAt    = std::time(nullptr);
 
-        core::Fill fill;
-        fill.orderId    = o.orderId;
-        fill.symbol     = o.symbol;
-        fill.side       = o.side;
-        fill.quantity   = o.quantity;
-        fill.price      = o.avgFillPrice;
-        fill.commission = std::max(1.0, o.quantity * 0.005);
-        fill.timestamp  = std::time(nullptr);
-        m_fills.insert(m_fills.begin(), fill);
+            core::Fill fill;
+            fill.orderId    = o.orderId;
+            fill.symbol     = o.symbol;
+            fill.side       = o.side;
+            fill.quantity   = o.quantity;
+            fill.price      = o.avgFillPrice;
+            fill.commission = std::max(1.0, o.quantity * 0.005);
+            fill.timestamp  = std::time(nullptr);
+            m_fills.insert(m_fills.begin(), fill);
+        }
     }
 
     m_openOrders.push_back(o);
@@ -617,12 +634,21 @@ void TradingWindow::CancelOrder(int orderId) {
         if (o.status == core::OrderStatus::Working ||
             o.status == core::OrderStatus::Pending  ||
             o.status == core::OrderStatus::PartialFill) {
-            o.status    = core::OrderStatus::Cancelled;
-            o.updatedAt = std::time(nullptr);
-            printf("[trade] Order #%d cancelled\n", orderId);
+            if (OnOrderCancel) {
+                OnOrderCancel(orderId);
+                // IB will confirm via OnOrderStatus; don't mutate locally yet
+            } else {
+                o.status    = core::OrderStatus::Cancelled;
+                o.updatedAt = std::time(nullptr);
+                printf("[trade] Order #%d cancelled\n", orderId);
+            }
         }
         break;
     }
+}
+
+void TradingWindow::SetNextOrderId(int id) {
+    m_nextOrderId = id;
 }
 
 // ============================================================================
