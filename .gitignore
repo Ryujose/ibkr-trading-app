@@ -162,3 +162,11 @@ CLAUDE.local.md
 .env.*
 *.key
 *.pem
+
+# =========================
+
+# IBKR api - Do not version it. LICENSE Agreements here
+
+# =========================
+external/tws-api
+twsapi*
