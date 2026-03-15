@@ -25,10 +25,12 @@ public:
 
     // ---- Pending order overlay -----------------------------------------------
     struct PendingOrderLine {
-        int    orderId = 0;
-        double price   = 0.0;
-        bool   isBuy   = true;
-        double qty     = 0.0;
+        int         orderId   = 0;
+        double      price     = 0.0;   // stop price for STP LMT; limit for LMT; stop for STP
+        double      auxPrice  = 0.0;   // limit price for STP LMT (0 for single-leg types)
+        bool        isBuy     = true;
+        double      qty       = 0.0;
+        std::string orderType;         // IB order-type string: "LMT", "STP", "STP LMT", …
     };
 
     // ---- Current position info (for the P&L strip) --------------------------
@@ -83,6 +85,12 @@ public:
 
     // Fired when user clicks the ✕ button on a pending order line in the chart.
     std::function<void(int orderId)> OnCancelOrder;
+
+    // Fired when user drags an existing order line to a new price.
+    // newPrice    = new stop/trigger price (or the only price for single-leg types).
+    // newAuxPrice = new limit price for STP LMT; 0.0 for single-leg types.
+    // Host must cancel the old order and re-submit a replacement.
+    std::function<void(int orderId, double newPrice, double newAuxPrice)> OnModifyOrder;
 
 private:
     // ---- Indicator settings -------------------------------------------------
@@ -171,6 +179,21 @@ private:
     std::string m_limitSide;              // "BUY" or "SELL"
     bool        m_ctrlClickPopup = false; // ctrl+click confirmation popup open
     double      m_pendingPrice   = 0.0;   // price from chart click, pending confirm
+
+    // ---- Placed order line (drag-and-send mode) ------------------------------
+    bool        m_limitPlaced    = false;  // line dropped on chart, awaiting send
+    double      m_placedPrice    = 0.0;   // current price of the placed/dragged line
+    bool        m_placedDragging = false; // user is currently dragging the placed line
+
+    // ---- Drag-to-modify existing pending order --------------------------------
+    int         m_dragPendingIdx    = -1;    // index in m_pendingOrders being dragged
+    double      m_dragPendingPrice  = 0.0;  // live price shown during drag
+    bool        m_dragPendingActive = false; // drag is in progress
+    bool        m_dragPendingIsAux  = false; // true = dragging the limit (aux) leg
+
+    // ---- Dual-price placement (STP LMT: click stop, then click limit) --------
+    bool        m_firstPricePlaced  = false; // stop price has been clicked, limit line active
+    double      m_firstPrice        = 0.0;  // the placed stop/trigger price
 
     // ---- Symbol history -----------------------------------------------------
     static constexpr int kMaxHistory = 10;

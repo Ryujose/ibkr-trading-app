@@ -128,7 +128,11 @@ public:
     //   4 = Delayed-Frozen
     void ReqMarketDataType(int type);
 
-    void ReqMarketData(int reqId, const std::string& symbol);
+    // genericTickList: pass "" for paper/delayed mode (type 3/4) — the gateway
+    // rejects ALL generic ticks for delayed data. Pass "165" for live mode to
+    // receive 52-week hi/lo (fields 79/80). Standard price/volume ticks always arrive.
+    void ReqMarketData(int reqId, const std::string& symbol,
+                       const std::string& genericTickList = "");
     void CancelMarketData(int reqId);
 
     void ReqMktDepth(int reqId, const std::string& symbol, int numRows = 10);

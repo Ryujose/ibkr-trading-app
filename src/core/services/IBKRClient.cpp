@@ -158,13 +158,11 @@ void IBKRClient::ReqHistoricalNews(int reqId, int conId, int totalResults,
 }
 
 void IBKRClient::SubscribeToNews(int reqId, const std::string& symbol) {
-    // "mdoff" suppresses quote data (avoids needing a market-data subscription).
-    // "292:PROVIDERS" requests news ticks only; providers use '+' separator here.
+    // "292" (Wide_news) is the only valid generic tick for news ticks on this gateway.
+    // "mdoff" and provider-list suffixes ("292:BRFUPDN+...") are rejected with error 321.
     Contract c = MakeStockContract(symbol);
     TagValueListSPtr empty;
-    m_client->reqMktData(reqId, c,
-        "mdoff;292:BRFUPDN+BRFG+DJ-N+DJNL+DJ-RTA+DJ-RTE+DJ-RTG+DJ-RTPRO",
-        false, false, empty);
+    m_client->reqMktData(reqId, c, "292", false, false, empty);
 }
 
 void IBKRClient::ReqNewsArticle(int reqId, const std::string& providerCode,
@@ -177,11 +175,11 @@ void IBKRClient::ReqMarketDataType(int type) {
     m_client->reqMarketDataType(type);
 }
 
-void IBKRClient::ReqMarketData(int reqId, const std::string& symbol) {
+void IBKRClient::ReqMarketData(int reqId, const std::string& symbol,
+                                const std::string& genericTickList) {
     Contract c = MakeStockContract(symbol);
     TagValueListSPtr empty;
-    // genericTickList "233" = RT Volume + news ticks
-    m_client->reqMktData(reqId, c, "233", false, false, empty);
+    m_client->reqMktData(reqId, c, genericTickList, false, false, empty);
 }
 
 void IBKRClient::CancelMarketData(int reqId) {
