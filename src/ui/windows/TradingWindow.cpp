@@ -6,8 +6,6 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <sstream>
-#include <iomanip>
 #include <numeric>
 
 namespace ui {
@@ -24,25 +22,43 @@ static constexpr ImVec4 kFlashYellow = {1.00f, 0.90f, 0.20f, 1.0f};
 // ============================================================================
 // Construction
 // ============================================================================
-TradingWindow::TradingWindow()
-    : m_rng(std::random_device{}())
-{
-    InitOrderBook();
-    // Seed price buffers with the current mid
-    std::snprintf(m_lmtBuf, sizeof(m_lmtBuf), "%.2f", m_midPrice);
-    std::snprintf(m_stpBuf, sizeof(m_stpBuf), "%.2f", m_midPrice);
-}
+TradingWindow::TradingWindow() {}
 
 // ============================================================================
-// Public API — IB Gateway callbacks (future)
+// Public API — IB Gateway callbacks
 // ============================================================================
-void TradingWindow::OnDepthUpdate(bool isBid, int pos, double price, double size) {
-    m_hasRealData = true;
+void TradingWindow::OnDepthUpdate(int /*reqId*/, bool isBid, int pos, int op,
+                                   double price, double size) {
+    m_depthStatus = SubStatus::Ok;
     auto& levels = isBid ? m_bids : m_asks;
-    if (pos < 0 || pos >= (int)levels.size()) return;
-    levels[pos].flashAge = 0.0f;
-    levels[pos].price    = price;
-    levels[pos].size     = size;
+
+    if (op == 0) {
+        // Insert
+        core::DepthLevel lvl;
+        lvl.price    = price;
+        lvl.size     = size;
+        lvl.flashAge = 0.0f;
+        if (pos >= (int)levels.size())
+            levels.push_back(lvl);
+        else
+            levels.insert(levels.begin() + pos, lvl);
+        if ((int)levels.size() > kDepthLevels)
+            levels.resize(kDepthLevels);
+    } else if (op == 1) {
+        // Update
+        if (pos < 0 || pos >= (int)levels.size()) return;
+        levels[pos].flashAge = 0.0f;
+        levels[pos].price    = price;
+        levels[pos].size     = size;
+    } else if (op == 2) {
+        // Delete
+        if (pos < 0 || pos >= (int)levels.size()) return;
+        levels.erase(levels.begin() + pos);
+    }
+
+    m_maxDepthSize = 100.0;
+    for (auto& l : m_asks) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
+    for (auto& l : m_bids) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
 }
 
 void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
@@ -55,6 +71,13 @@ void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
         o.updatedAt    = std::time(nullptr);
         break;
     }
+    for (auto& d : m_domOrders) {
+        if (d.orderId != orderId) continue;
+        d.status = status;
+        if (status == core::OrderStatus::Filled && d.fillAge < 0.0f)
+            d.fillAge = 0.0f;   // start fade-out timer
+        break;
+    }
 }
 
 void TradingWindow::OnFill(const core::Fill& fill) {
@@ -62,8 +85,31 @@ void TradingWindow::OnFill(const core::Fill& fill) {
     if (m_fills.size() > 200) m_fills.resize(200);
 }
 
+void TradingWindow::OnNBBO(double bid, double bidSz, double ask, double askSz) {
+    m_mktDataStatus = SubStatus::Ok;
+    if (bid   > 0) m_nbboBid   = bid;
+    if (bidSz > 0) m_nbboBidSz = bidSz;
+    if (ask   > 0) m_nbboAsk   = ask;
+    if (askSz > 0) m_nbboAskSz = askSz;
+}
+
+void TradingWindow::OnMktDataError(int code) {
+    // 354 = not subscribed (delayed available), 10090 = partially not subscribed
+    if (code == 354 || code == 10090)
+        m_mktDataStatus = SubStatus::NeedSubscription;
+    else
+        m_mktDataStatus = SubStatus::NotAllowed;
+}
+
+void TradingWindow::OnDepthError(int code) {
+    // 354 = no depth subscription, 10092 = deep book not allowed, 322 = no permissions
+    if (code == 354 || code == 10090)
+        m_depthStatus = SubStatus::NeedSubscription;
+    else  // 10092, 322 etc.
+        m_depthStatus = SubStatus::NotAllowed;
+}
+
 void TradingWindow::OnTick(double price, double size, bool isUptick) {
-    m_hasRealData = true;
     core::Tick t;
     t.price     = price;
     t.size      = size;
@@ -71,12 +117,36 @@ void TradingWindow::OnTick(double price, double size, bool isUptick) {
     t.timestamp = std::time(nullptr);
     m_ticks.push_front(t);
     if ((int)m_ticks.size() > kMaxTicks) m_ticks.pop_back();
+
+    // Accumulate volume profile
+    if (price > 0.0 && size > 0.0) {
+        int key = static_cast<int>(std::round(price / 0.01));
+        double& v = m_volAtPrice[key];
+        v += size;
+        if (v > m_maxVolAtPrice) m_maxVolAtPrice = v;
+    }
 }
 
 void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
     std::strncpy(m_symbol, symbol.c_str(), sizeof(m_symbol) - 1);
-    m_midPrice = midPrice;
-    InitOrderBook();
+    m_symbol[sizeof(m_symbol) - 1] = '\0';
+    m_prevMidPrice    = midPrice;
+    m_midPrice        = midPrice;
+    m_bids.clear();
+    m_asks.clear();
+    m_maxDepthSize    = 1.0;
+    m_mktDataStatus   = SubStatus::Unknown;
+    m_depthStatus     = SubStatus::Unknown;
+    m_nbboBid = m_nbboAsk = m_nbboBidSz = m_nbboAskSz = 0.0;
+    m_ticks.clear();
+    m_volAtPrice.clear();
+    m_maxVolAtPrice   = 1.0;
+    m_domOrders.clear();
+}
+
+void TradingWindow::UpdateMidPrice(double price) {
+    m_prevMidPrice = m_midPrice;
+    m_midPrice     = price;
 }
 
 // ============================================================================
@@ -85,61 +155,71 @@ void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
 bool TradingWindow::Render() {
     if (!m_open) return false;
 
-    ImGui::SetNextWindowSize(ImVec2(1100, 600), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(1100, 620), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin("Trading", &m_open, flags)) {
+    if (!ImGui::Begin("Book Trading", &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
 
-    // ---- Simulation ticks ---------------------------------------------------
-    auto now = Clock::now();
-    auto elapsed = [&](Clock::time_point& last, float interval) -> float {
-        float dt = std::chrono::duration<float>(now - last).count();
-        if (dt >= interval) { last = now; return dt; }
-        return 0.0f;
-    };
-
-    if (!m_hasRealData) {
-        if (float dt = elapsed(m_lastBookUpdate, m_bookUpdateIntervalSec))  SimulateBookTick(dt);
-        if (elapsed(m_lastTickUpdate,  m_tickIntervalSec) > 0)               SimulateNewTick();
-        if (float dt = elapsed(m_lastOrderCheck,  m_orderCheckIntervalSec)) SimulateOrderLifecycle(dt);
-    }
-    (void)elapsed; // suppress unused-lambda warning
-
-    // Age flash highlights every frame
     float frameDt = ImGui::GetIO().DeltaTime;
+    PruneFinishedOrders();
     for (auto& lvl : m_asks) lvl.flashAge += frameDt;
     for (auto& lvl : m_bids) lvl.flashAge += frameDt;
 
-    // ---- Top section: three panels side-by-side ----------------------------
-    float totalW  = ImGui::GetContentRegionAvail().x;
-    float totalH  = ImGui::GetContentRegionAvail().y;
-    float topH    = totalH * 0.62f;
-    float botH    = totalH - topH - ImGui::GetStyle().ItemSpacing.y;
+    // Age fill-flash on DOM orders; remove cancelled/rejected and expired fills
+    for (auto& d : m_domOrders)
+        if (d.fillAge >= 0.0f) d.fillAge += frameDt;
+    m_domOrders.erase(
+        std::remove_if(m_domOrders.begin(), m_domOrders.end(), [](const DOMOrder& d) {
+            return d.fillAge > 3.0f
+                || d.status == core::OrderStatus::Cancelled
+                || d.status == core::OrderStatus::Rejected;
+        }),
+        m_domOrders.end());
 
-    float bookW   = totalW * 0.30f;
-    float entryW  = totalW * 0.38f;
-    float tsW     = totalW - bookW - entryW - ImGui::GetStyle().ItemSpacing.x * 2;
+    float totalW = ImGui::GetContentRegionAvail().x;
+    float totalH = ImGui::GetContentRegionAvail().y;
+    float topH   = totalH * 0.65f;
+    float botH   = totalH - topH - ImGui::GetStyle().ItemSpacing.y;
 
-    ImGui::BeginChild("##book_panel",  ImVec2(bookW,  topH), true);
+    // Guard: if the content area is too small (window being dragged to an edge
+    // or squeezed by the OS), skip rendering child panels this frame.
+    // A BeginChild/BeginTable with zero or negative height corrupts ImGui state.
+    if (topH < 10.f || botH < 10.f) {
+        DrawConfirmationPopup();
+        ImGui::End();
+        return m_open;
+    }
+
+    float bookW  = totalW * 0.54f;
+    float entryW = totalW - bookW - ImGui::GetStyle().ItemSpacing.x;
+
+    // ---- Top: DOM ladder + order entry side by side -------------------------
+    // NoScrollbar + NoScrollWithMouse on the outer panel so that only the inner
+    // ##dom table (which has ImGuiTableFlags_ScrollY) owns scroll input.
+    // Without this the outer child window competes for mouse capture on every
+    // click, making the entire window appear frozen while the button is held.
+    ImGui::BeginChild("##book_panel", ImVec2(bookW, topH), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DrawOrderBook();
     ImGui::EndChild();
 
     ImGui::SameLine();
 
-    ImGui::BeginChild("##entry_panel", ImVec2(entryW, topH), true);
+    // Same rationale as ##book_panel: none of these outer panels need their own
+    // scroll — the inner tables and DOM ladder own scrolling.  Without this flag
+    // ImGui's child-window scroll logic captures the mouse on any click inside
+    // the panel, blocking title-bar drag, tab close, and every other interaction
+    // for as long as the mouse button is held.
+    ImGui::BeginChild("##entry_panel", ImVec2(entryW, topH), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DrawOrderEntry();
     ImGui::EndChild();
 
-    ImGui::SameLine();
-
-    ImGui::BeginChild("##ts_panel",   ImVec2(tsW,    topH), true);
-    DrawTimeSales();
-    ImGui::EndChild();
-
-    // ---- Bottom section: tabbed orders / log --------------------------------
-    ImGui::BeginChild("##bottom_panel", ImVec2(-1, botH), true);
+    // ---- Bottom: tabbed ─────────────────────────────────────────────────────
+    ImGui::BeginChild("##bottom_panel", ImVec2(-1, botH), ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     if (ImGui::BeginTabBar("##trade_tabs")) {
         if (ImGui::BeginTabItem("Open Orders")) {
             DrawOpenOrders();
@@ -149,11 +229,14 @@ bool TradingWindow::Render() {
             DrawExecutionLog();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Time & Sales")) {
+            DrawTimeSales();
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
 
-    // ---- Confirmation popup (opened from DrawOrderEntry) --------------------
     DrawConfirmationPopup();
 
     ImGui::End();
@@ -161,180 +244,477 @@ bool TradingWindow::Render() {
 }
 
 // ============================================================================
-// Order book — init
+// Click-to-trade helpers
 // ============================================================================
-void TradingWindow::InitOrderBook() {
-    double tick  = 0.01;
-    double spread = 0.02;                      // one cent spread
-    double askBase = RoundTick(m_midPrice + spread * 0.5);
-    double bidBase = RoundTick(m_midPrice - spread * 0.5);
+void TradingWindow::PlaceDomOrder(bool isBuy, double price) {
+    double qty = std::atof(m_qtyBuf);
+    if (qty <= 0.0 || price <= 0.0) return;
 
-    m_asks.resize(kDepthLevels);
-    m_bids.resize(kDepthLevels);
+    const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
+    int orderId = m_nextOrderId++;
 
-    for (int i = 0; i < kDepthLevels; i++) {
-        m_asks[i].price    = RoundTick(askBase + i * tick);
-        m_asks[i].size     = m_sizeDist(m_rng);
-        m_asks[i].flashAge = 999.0f;
+    DOMOrder dom;
+    dom.orderId = orderId;
+    dom.price   = price;
+    dom.isBuy   = isBuy;
+    dom.status  = core::OrderStatus::Working;
+    dom.fillAge = -1.0f;
+    m_domOrders.push_back(dom);
 
-        m_bids[i].price    = RoundTick(bidBase - i * tick);
-        m_bids[i].size     = m_sizeDist(m_rng);
-        m_bids[i].flashAge = 999.0f;
-    }
-    m_maxDepthSize = 1500.0;
+    core::Order o;
+    o.orderId     = orderId;
+    o.symbol      = m_symbol;
+    o.side        = isBuy ? core::OrderSide::Buy : core::OrderSide::Sell;
+    o.type        = core::OrderType::Limit;
+    o.tif         = static_cast<core::TimeInForce>(m_tifIdx);
+    o.quantity    = qty;
+    o.limitPrice  = price;
+    o.status      = core::OrderStatus::Working;
+    o.submittedAt = std::time(nullptr);
+    o.updatedAt   = o.submittedAt;
+    m_openOrders.push_back(o);
+
+    if (OnOrderSubmit)
+        OnOrderSubmit(orderId, std::string(m_symbol),
+                      isBuy ? "BUY" : "SELL",
+                      "LMT", qty, price, 0.0,
+                      tifs[m_tifIdx], m_outsideRth);
+}
+
+TradingWindow::DOMOrder* TradingWindow::FindDomOrder(double price) {
+    for (auto& d : m_domOrders)
+        if (std::abs(d.price - price) < 0.005)
+            return &d;
+    return nullptr;
 }
 
 // ============================================================================
-// Order book — simulation tick
-// ============================================================================
-void TradingWindow::SimulateBookTick(float /*dtSec*/) {
-    // Random walk the mid price
-    double move = m_priceDist(m_rng);
-    m_prevMidPrice = m_midPrice;
-    m_midPrice     = RoundTick(m_midPrice + move);
-
-    double tick    = 0.01;
-    double spread  = 0.02;
-    double askBase = RoundTick(m_midPrice + spread * 0.5);
-    double bidBase = RoundTick(m_midPrice - spread * 0.5);
-
-    for (int i = 0; i < kDepthLevels; i++) {
-        // Reprice — flash if the price actually changed
-        double newAskP = RoundTick(askBase + i * tick);
-        double newBidP = RoundTick(bidBase - i * tick);
-
-        if (std::abs(newAskP - m_asks[i].price) > 0.005) m_asks[i].flashAge = 0.0f;
-        if (std::abs(newBidP - m_bids[i].price) > 0.005) m_bids[i].flashAge = 0.0f;
-
-        m_asks[i].price = newAskP;
-        m_bids[i].price = newBidP;
-
-        // Randomly update sizes (simulate order placement / cancellation)
-        if (m_uniform(m_rng) < 0.40) {
-            m_asks[i].size = m_sizeDist(m_rng);
-            m_asks[i].flashAge = 0.0f;
-        }
-        if (m_uniform(m_rng) < 0.40) {
-            m_bids[i].size = m_sizeDist(m_rng);
-            m_bids[i].flashAge = 0.0f;
-        }
-    }
-
-    // Recalculate max size for bar normalisation
-    m_maxDepthSize = 100.0;
-    for (auto& l : m_asks) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
-    for (auto& l : m_bids) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
-
-    // Check if any limit orders are now fillable
-    for (auto& o : m_openOrders) {
-        if (o.status != core::OrderStatus::Working) continue;
-        bool fillable = false;
-        if (o.type == core::OrderType::Limit) {
-            fillable = (o.side == core::OrderSide::Buy  && m_midPrice <= o.limitPrice) ||
-                       (o.side == core::OrderSide::Sell && m_midPrice >= o.limitPrice);
-        }
-        if (o.type == core::OrderType::Stop) {
-            fillable = (o.side == core::OrderSide::Buy  && m_midPrice >= o.stopPrice) ||
-                       (o.side == core::OrderSide::Sell && m_midPrice <= o.stopPrice);
-        }
-        if (fillable) {
-            o.status       = core::OrderStatus::Filled;
-            o.filledQty    = o.quantity;
-            double slippage = (o.side == core::OrderSide::Buy ? 1 : -1) * 0.01;
-            o.avgFillPrice  = m_midPrice + slippage;
-            o.updatedAt     = std::time(nullptr);
-
-            core::Fill fill;
-            fill.orderId    = o.orderId;
-            fill.symbol     = o.symbol;
-            fill.side       = o.side;
-            fill.quantity   = o.quantity;
-            fill.price      = o.avgFillPrice;
-            fill.commission = std::max(1.0, o.quantity * 0.005);
-            fill.timestamp  = std::time(nullptr);
-            m_fills.insert(m_fills.begin(), fill);
-        }
-    }
-}
-
-// ============================================================================
-// Draw — Order Book
+// Draw — DOM Ladder (Book Trading)
 // ============================================================================
 void TradingWindow::DrawOrderBook() {
+    const float rowH  = ImGui::GetTextLineHeightWithSpacing();
+    // Only allow click-to-trade when the mouse is actually over this panel.
+    // MouseClicked[0] is a global frame flag — without this gate it would fire
+    // on the same frame the user clicks the bottom tabs.
+    const bool panelHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+
+    // ── Title + last price + click-to-trade toggle ────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.90f, 1.0f));
-    ImGui::Text("Order Book  %s", m_symbol);
+    ImGui::Text("DOM  %s", m_symbol);
     ImGui::PopStyleColor();
-    ImGui::Separator();
-
-    float panelW   = ImGui::GetContentRegionAvail().x;
-    float barMaxW  = panelW * 0.40f;  // max width of the depth bar
-
-    // Header row
-    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::Text("%-10s %-8s", "Price", "Size");
-    ImGui::PopStyleColor();
-
-    // ---- Asks (sell side) — drawn top-to-bottom from furthest to closest ----
+    ImGui::SameLine(0, 12);
     {
-        // Reverse so closest spread is at the bottom of the ask section
-        std::vector<core::DepthLevel> asksDisplay(m_asks.rbegin(), m_asks.rend());
-        for (auto& lvl : asksDisplay) {
-            float t = std::min(1.0f, lvl.flashAge / 0.6f);
-            ImVec4 col = ImVec4(
-                kSellRed.x + (kFlashYellow.x - kSellRed.x) * (1.0f - t),
-                kSellRed.y + (kFlashYellow.y - kSellRed.y) * (1.0f - t),
-                kSellRed.z + (kFlashYellow.z - kSellRed.z) * (1.0f - t),
-                1.0f);
-
-            // Bar background
-            float barW = (float)(lvl.size / m_maxDepthSize) * barMaxW;
-            ImVec2 rowMin = ImGui::GetCursorScreenPos();
-            rowMin.x += panelW - barW;
-            ImVec2 rowMax = ImVec2(rowMin.x + barW,
-                                   rowMin.y + ImGui::GetTextLineHeight());
-            ImGui::GetWindowDrawList()->AddRectFilled(
-                rowMin, rowMax, IM_COL32(180, 30, 30, 40));
-
-            ImGui::PushStyleColor(ImGuiCol_Text, col);
-            ImGui::Text("%-10.2f %-8.0f", lvl.price, lvl.size);
-            ImGui::PopStyleColor();
-        }
+        bool priceUp = (m_midPrice >= m_prevMidPrice);
+        ImGui::PushStyleColor(ImGuiCol_Text, priceUp ? kBuyGreen : kSellRed);
+        ImGui::Text("%s $%.2f", priceUp ? "▲" : "▼", m_midPrice);
+        ImGui::PopStyleColor();
     }
+    ImGui::SameLine(0, 20);
+    ImGui::Checkbox("Click-to-Trade", &m_clickToTrade);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Click any ask row → BUY limit order at that price.\n"
+            "Click any bid row → SELL limit order at that price.\n"
+            "Uses Quantity and TIF from the Order Entry panel.");
+    ImGui::SameLine(0, 16);
+    ImGui::TextDisabled("Levels:");
+    ImGui::SameLine(0, 4);
+    ImGui::SetNextItemWidth(52);
+    ImGui::InputInt("##ladder_rows", &m_ladderRows, 0, 0);
+    if (m_ladderRows < 1)   m_ladderRows = 1;
+    if (m_ladderRows > 200) m_ladderRows = 200;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Virtual price rows shown above ask and below bid\nwhen no Level II subscription is active (1–200).");
 
-    // ---- Spread row ---------------------------------------------------------
-    double spread = m_asks.empty() || m_bids.empty() ? 0.0
-                  : m_asks[0].price - m_bids[0].price;
-    ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
-    ImGui::Text("── sprd $%.2f ──", spread);
-    ImGui::PopStyleColor();
-
-    // ---- Bids (buy side) — closest spread at top ----------------------------
-    for (auto& lvl : m_bids) {
-        float t = std::min(1.0f, lvl.flashAge / 0.6f);
-        ImVec4 col = ImVec4(
-            kBuyGreen.x + (kFlashYellow.x - kBuyGreen.x) * (1.0f - t),
-            kBuyGreen.y + (kFlashYellow.y - kBuyGreen.y) * (1.0f - t),
-            kBuyGreen.z + (kFlashYellow.z - kBuyGreen.z) * (1.0f - t),
-            1.0f);
-
-        float barW = (float)(lvl.size / m_maxDepthSize) * barMaxW;
-        ImVec2 rowMin = ImGui::GetCursorScreenPos();
-        ImVec2 rowMax = ImVec2(rowMin.x + barW,
-                               rowMin.y + ImGui::GetTextLineHeight());
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            rowMin, rowMax, IM_COL32(30, 160, 60, 40));
-
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::Text("%-10.2f %-8.0f", lvl.price, lvl.size);
+    // ── Subscription banners ──────────────────────────────────────────────────
+    if (m_mktDataStatus == SubStatus::NeedSubscription) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.75f, 0.1f, 1.f));
+        ImGui::TextUnformatted("⚠ Market data subscription required — prices may be delayed");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Enable market data in IB Account Management\n"
+                "→ Market Data Subscriptions → US Stocks (e.g. OPRA, NBBO).");
+    } else if (m_mktDataStatus == SubStatus::NotAllowed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
+        ImGui::TextUnformatted("✗ Market data not permitted for this instrument");
+        ImGui::PopStyleColor();
+    }
+    if (m_depthStatus == SubStatus::NeedSubscription) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.75f, 0.1f, 1.f));
+        ImGui::TextUnformatted("⚠ Level II subscription required — showing NBBO only");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Subscribe to NYSE/NASDAQ TotalView (or equivalent)\n"
+                "in IB Account Management → Market Data Subscriptions.");
+    } else if (m_depthStatus == SubStatus::NotAllowed) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.4f, 0.4f, 1.f));
+        ImGui::TextUnformatted("✗ Level II depth not permitted for this instrument");
         ImGui::PopStyleColor();
     }
 
-    // ---- Last price indicator at bottom -------------------------------------
+    // ── NBBO compact bar ──────────────────────────────────────────────────────
     ImGui::Separator();
-    bool priceUp = (m_midPrice >= m_prevMidPrice);
-    ImGui::PushStyleColor(ImGuiCol_Text, priceUp ? kBuyGreen : kSellRed);
-    ImGui::Text("%s $%.2f", priceUp ? "▲" : "▼", m_midPrice);
-    ImGui::PopStyleColor();
+    if (m_mktDataStatus == SubStatus::Ok) {
+        ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
+        ImGui::Text("BID $%.2f x %.0f", m_nbboBid, m_nbboBidSz);
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 20);
+        ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
+        ImGui::Text("ASK $%.2f x %.0f", m_nbboAsk, m_nbboAskSz);
+        ImGui::PopStyleColor();
+        if (m_nbboAsk > 0 && m_nbboBid > 0) {
+            ImGui::SameLine(0, 20);
+            ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+            ImGui::Text("sprd $%.2f", m_nbboAsk - m_nbboBid);
+            ImGui::PopStyleColor();
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("BID  —      ASK  —");
+        ImGui::PopStyleColor();
+    }
+    ImGui::Separator();
+
+    // ── Pre-compute cumulative sizes ─────────────────────────────────────────
+    const int nAsks  = (int)m_asks.size();
+    const int nBids  = (int)m_bids.size();
+    const bool noL2  = (nAsks == 0 && nBids == 0);
+    const bool hasNBBO = (m_nbboBid > 0.0 || m_nbboAsk > 0.0);
+
+    std::vector<double> askCum(nAsks, 0.0);
+    for (int i = 0; i < nAsks; ++i)
+        askCum[i] = (i == 0 ? 0.0 : askCum[i - 1]) + m_asks[i].size;
+
+    std::vector<double> bidCum(nBids, 0.0);
+    for (int i = 0; i < nBids; ++i)
+        bidCum[i] = (i == 0 ? 0.0 : bidCum[i - 1]) + m_bids[i].size;
+
+    // ── Flash-interpolated colour ─────────────────────────────────────────────
+    auto FlashCol = [](const ImVec4& base, float age) -> ImVec4 {
+        float t = std::min(1.0f, age / 0.5f);
+        return ImVec4(
+            base.x + (kFlashYellow.x - base.x) * (1.0f - t),
+            base.y + (kFlashYellow.y - base.y) * (1.0f - t),
+            base.z + (kFlashYellow.z - base.z) * (1.0f - t),
+            1.0f);
+    };
+
+    // ── Two-layer histogram bar ───────────────────────────────────────────────
+    // Layer 1 (dim): accumulated volume at this price level (trade history).
+    // Layer 2 (bright): current depth size (live order book).
+    auto DrawBar = [&](double depthSz, double price, ImU32 brightCol) {
+        ImDrawList* ldl = ImGui::GetWindowDrawList();
+        ImVec2 p  = ImGui::GetCursorScreenPos();
+        float  cw = ImGui::GetContentRegionAvail().x - 2.f;
+        float  bh = ImGui::GetTextLineHeight();
+        // Volume profile background
+        int key = static_cast<int>(std::round(price / 0.01));
+        auto it = m_volAtPrice.find(key);
+        if (it != m_volAtPrice.end() && m_maxVolAtPrice > 0.0) {
+            float vw = (float)(it->second / m_maxVolAtPrice) * cw;
+            ldl->AddRectFilled(p, ImVec2(p.x + vw, p.y + bh), IM_COL32(80, 80, 110, 90));
+        }
+        // Depth size foreground
+        if (depthSz > 0.0 && m_maxDepthSize > 0.0) {
+            float bw = (float)(depthSz / m_maxDepthSize) * cw;
+            ldl->AddRectFilled(p, ImVec2(p.x + bw, p.y + bh), brightCol);
+        }
+        ImGui::Dummy(ImVec2(cw, bh));
+    };
+
+    // ── Per-row overlay: hover highlight, click-to-trade, DOM order tint ──────
+    // Call at column 0 before rendering any text in that row.
+    auto RowOverlay = [&](double rowPrice, bool isAskRow) {
+        ImDrawList* ldl = ImGui::GetWindowDrawList();
+        float ry = ImGui::GetCursorScreenPos().y;
+        ImVec2 wMin = ImGui::GetWindowPos();
+        float  wW   = ImGui::GetWindowSize().x;
+        // IsMouseHoveringRect respects the current clip rect, so rows that have
+        // scrolled outside the ##dom table viewport correctly return false even
+        // when their absolute Y happens to coincide with a header widget (e.g.
+        // the Click-to-Trade checkbox).  The raw-coordinate check that was here
+        // before had no knowledge of the scroll clip rect and caused an accidental
+        // PlaceDomOrder when the checkbox was pressed while the table was scrolled.
+        bool hovered = panelHovered &&
+                       ImGui::IsMouseHoveringRect(ImVec2(wMin.x, ry),
+                                                  ImVec2(wMin.x + wW, ry + rowH));
+
+        if (m_clickToTrade && rowPrice > 0.0) {
+            if (hovered) {
+                ImU32 hCol = isAskRow ? IM_COL32(80, 20, 20, 70)
+                                       : IM_COL32(20, 80, 30, 70);
+                ldl->AddRectFilled(ImVec2(wMin.x, ry),
+                                   ImVec2(wMin.x + wW, ry + rowH), hCol);
+                // Guard with !IsAnyItemActive(): the Checkbox widget sets ActiveId on
+                // mouse-PRESS but toggles its bool on mouse-RELEASE (one frame later).
+                // Without this guard, unchecking the checkbox while the table is
+                // scrolled fires PlaceDomOrder on the same frame as the press.
+                if (ImGui::GetIO().MouseClicked[0] && !ImGui::IsAnyItemActive())
+                    PlaceDomOrder(!isAskRow, rowPrice);
+            }
+        }
+
+        // DOM order tint (amber = working, green/red fade = filled)
+        DOMOrder* dom = FindDomOrder(rowPrice);
+        if (dom) {
+            ImU32 tint = 0;
+            if (dom->status == core::OrderStatus::Working  ||
+                dom->status == core::OrderStatus::Pending  ||
+                dom->status == core::OrderStatus::PartialFill) {
+                tint = IM_COL32(200, 160, 10, 85);
+            } else if (dom->status == core::OrderStatus::Filled &&
+                       dom->fillAge >= 0.0f && dom->fillAge < 3.0f) {
+                auto a = (ImU32)(std::max(0.0f, 1.0f - dom->fillAge / 3.0f) * 100.f);
+                tint = dom->isBuy ? IM_COL32(30, 180, 60, a) : IM_COL32(200, 40, 40, a);
+            }
+            if (tint)
+                ldl->AddRectFilled(ImVec2(wMin.x, ry),
+                                   ImVec2(wMin.x + wW, ry + rowH), tint);
+        }
+    };
+
+    // ── DOM table ─────────────────────────────────────────────────────────────
+    ImGuiTableFlags tflags =
+        ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_ScrollY       |
+        ImGuiTableFlags_SizingFixedFit;
+
+    float availH = ImGui::GetContentRegionAvail().y;
+    if (availH < 10.f) return;   // guard: don't create a degenerate scroll table
+    if (!ImGui::BeginTable("##dom", 7, tflags, ImVec2(-1, availH)))
+        return;
+
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Bid Sz",  ImGuiTableColumnFlags_WidthFixed,   62);
+    ImGui::TableSetupColumn("Cum Bid", ImGuiTableColumnFlags_WidthFixed,   62);
+    ImGui::TableSetupColumn("Price",   ImGuiTableColumnFlags_WidthFixed,   72);
+    ImGui::TableSetupColumn("Cum Ask", ImGuiTableColumnFlags_WidthFixed,   62);
+    ImGui::TableSetupColumn("Ask Sz",  ImGuiTableColumnFlags_WidthFixed,   62);
+    ImGui::TableSetupColumn("P&L",     ImGuiTableColumnFlags_WidthFixed,   68);
+    ImGui::TableSetupColumn("Bar",     ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableHeadersRow();
+
+    // ── Ask rows: highest price first ────────────────────────────────────────
+    for (int i = nAsks - 1; i >= 0; --i) {
+        const auto& lvl  = m_asks[i];
+        const bool  best = (i == 0);
+        const ImVec4 col = FlashCol(kSellRed, lvl.flashAge);
+        const double pnl = (m_midPrice > 0.0) ? lvl.price - m_midPrice : 0.0;
+
+        ImGui::TableNextRow();
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+            best ? IM_COL32(100, 22, 22, 110) : IM_COL32(70, 18, 18, 70));
+
+        ImGui::TableSetColumnIndex(0);
+        RowOverlay(lvl.price, true);  // Col 0: empty on ask side; use for overlay
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+        ImGui::Text("%.2f", lvl.price);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(3);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.38f, 0.38f, 1.f));
+        ImGui::Text("%.0f", askCum[i]);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(4);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::Text("%.0f", lvl.size);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(5);
+        if (m_midPrice > 0.0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+            ImGui::Text("%+.2f", pnl);
+            ImGui::PopStyleColor();
+        } else { ImGui::TextDisabled("—"); }
+
+        ImGui::TableSetColumnIndex(6);
+        DrawBar(lvl.size, lvl.price, IM_COL32(190, 45, 45, 180));
+    }
+
+    // ── Mid section: spread or NBBO fallback or empty notice ─────────────────
+    if (!noL2) {
+        // L2 data present: show spread row
+        if (nAsks > 0 && nBids > 0) {
+            double spread = m_asks[0].price - m_bids[0].price;
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 50, 58, 140));
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+            ImGui::Text("─ $%.2f ─", spread);
+            ImGui::PopStyleColor();
+        }
+    } else if (hasNBBO) {
+        // No L2 — render a virtual price ladder: 25 rows above ask, NBBO rows,
+        // 25 rows below bid.  Sizes shown only on the actual NBBO best bid/ask.
+        const int    kLadderRows = m_ladderRows;
+        static constexpr double kTick = 0.01;
+
+        double askAnchor = (m_nbboAsk > 0.0) ? m_nbboAsk : m_midPrice;
+        double bidAnchor = (m_nbboBid > 0.0) ? m_nbboBid : m_midPrice;
+
+        // ── 25 virtual ask rows above the best ask (highest first) ───────────
+        for (int i = kLadderRows; i >= 1; --i) {
+            double price = RoundTick(askAnchor + i * kTick);
+            double pnl   = (m_midPrice > 0.0) ? price - m_midPrice : 0.0;
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 15, 15, 50));
+            ImGui::TableSetColumnIndex(0);
+            RowOverlay(price, true);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.35f, 0.35f, 1.f));
+            ImGui::Text("%.2f", price);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(5);
+            if (m_midPrice > 0.0) {
+                ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                ImGui::Text("%+.2f", pnl);
+                ImGui::PopStyleColor();
+            }
+            ImGui::TableSetColumnIndex(6);
+            DrawBar(0.0, price, IM_COL32(190, 45, 45, 100));
+        }
+
+        // ── Best ask row (NBBO) ───────────────────────────────────────────────
+        if (m_nbboAsk > 0.0) {
+            double pnl = (m_midPrice > 0.0) ? m_nbboAsk - m_midPrice : 0.0;
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(100, 22, 22, 110));
+            ImGui::TableSetColumnIndex(0);
+            RowOverlay(m_nbboAsk, true);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
+            ImGui::Text("%.2f *", m_nbboAsk);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(4);
+            ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
+            ImGui::Text("%.0f", m_nbboAskSz);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(5);
+            if (m_midPrice > 0.0) {
+                ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                ImGui::Text("%+.2f", pnl);
+                ImGui::PopStyleColor();
+            }
+            ImGui::TableSetColumnIndex(6);
+            DrawBar(m_nbboAskSz, m_nbboAsk, IM_COL32(190, 45, 45, 180));
+        }
+
+        // ── Spread separator ─────────────────────────────────────────────────
+        if (m_nbboAsk > 0.0 && m_nbboBid > 0.0) {
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 50, 58, 140));
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+            ImGui::Text("─ %.2f ─", m_nbboAsk - m_nbboBid);
+            ImGui::PopStyleColor();
+        }
+
+        // ── Best bid row (NBBO) ───────────────────────────────────────────────
+        if (m_nbboBid > 0.0) {
+            double pnl = (m_midPrice > 0.0) ? m_nbboBid - m_midPrice : 0.0;
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(18, 90, 32, 110));
+            ImGui::TableSetColumnIndex(0);
+            RowOverlay(m_nbboBid, false);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
+            ImGui::Text("%.0f", m_nbboBidSz);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
+            ImGui::Text("%.2f *", m_nbboBid);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(5);
+            if (m_midPrice > 0.0) {
+                ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                ImGui::Text("%+.2f", pnl);
+                ImGui::PopStyleColor();
+            }
+            ImGui::TableSetColumnIndex(6);
+            DrawBar(m_nbboBidSz, m_nbboBid, IM_COL32(35, 170, 65, 180));
+        }
+
+        // ── 25 virtual bid rows below the best bid ────────────────────────────
+        for (int i = 1; i <= kLadderRows; ++i) {
+            double price = RoundTick(bidAnchor - i * kTick);
+            double pnl   = (m_midPrice > 0.0) ? price - m_midPrice : 0.0;
+            ImGui::TableNextRow();
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(15, 50, 18, 50));
+            ImGui::TableSetColumnIndex(0);
+            RowOverlay(price, false);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.55f, 0.38f, 1.f));
+            ImGui::Text("%.2f", price);
+            ImGui::PopStyleColor();
+            ImGui::TableSetColumnIndex(5);
+            if (m_midPrice > 0.0) {
+                ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                ImGui::Text("%+.2f", pnl);
+                ImGui::PopStyleColor();
+            }
+            ImGui::TableSetColumnIndex(6);
+            DrawBar(0.0, price, IM_COL32(35, 170, 65, 100));
+        }
+    } else if (m_depthStatus != SubStatus::NeedSubscription &&
+               m_depthStatus != SubStatus::NotAllowed) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(1);
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("No depth —");
+        ImGui::PopStyleColor();
+        ImGui::TableSetColumnIndex(2);
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("outside RTH");
+        ImGui::PopStyleColor();
+        ImGui::TableSetColumnIndex(3);
+        ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+        ImGui::TextUnformatted("or no L2 sub");
+        ImGui::PopStyleColor();
+    }
+
+    // ── Bid rows: best bid first ──────────────────────────────────────────────
+    for (int i = 0; i < nBids; ++i) {
+        const auto& lvl  = m_bids[i];
+        const bool  best = (i == 0);
+        const ImVec4 col = FlashCol(kBuyGreen, lvl.flashAge);
+        const double pnl = (m_midPrice > 0.0) ? lvl.price - m_midPrice : 0.0;
+
+        ImGui::TableNextRow();
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+            best ? IM_COL32(18, 90, 32, 110) : IM_COL32(15, 60, 22, 70));
+
+        ImGui::TableSetColumnIndex(0);
+        RowOverlay(lvl.price, false);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::Text("%.0f", lvl.size);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.38f, 0.72f, 0.42f, 1.f));
+        ImGui::Text("%.0f", bidCum[i]);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+        ImGui::Text("%.2f", lvl.price);
+        ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(5);
+        if (m_midPrice > 0.0) {
+            ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+            ImGui::Text("%+.2f", pnl);
+            ImGui::PopStyleColor();
+        } else { ImGui::TextDisabled("—"); }
+
+        ImGui::TableSetColumnIndex(6);
+        DrawBar(lvl.size, lvl.price, IM_COL32(35, 170, 65, 180));
+    }
+
+    ImGui::EndTable();
 }
 
 // ============================================================================
@@ -426,6 +806,16 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::SetNextItemWidth(80);
     ImGui::Combo("##tif", &m_tifIdx, tifs, IM_ARRAYSIZE(tifs));
 
+    // ---- Outside RTH --------------------------------------------------------
+    ImGui::Spacing();
+    ImGui::Checkbox("Outside RTH", &m_outsideRth);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Allow order to be active and fill during pre-market\n"
+            "and after-hours sessions.\n"
+            "Requires a limit price — market orders are rejected\n"
+            "outside regular trading hours by IB.");
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -499,13 +889,17 @@ void TradingWindow::DrawConfirmationPopup() {
         m_showConfirm = false;
     }
 
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    // Use GetWindowViewport() (the Book Trading window's own viewport) instead of
+    // GetMainViewport().  When the window is undocked into a separate OS window
+    // (ImGuiConfigFlags_ViewportsEnable), GetMainViewport() returns the primary
+    // GLFW window — the modal appears there, invisible to the user, and blocks
+    // all ImGui input so the window appears permanently frozen.
+    ImVec2 center = ImGui::GetWindowViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Always);
 
     if (ImGui::BeginPopupModal("Confirm Order", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoMove)) {
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
         const char* types[] = {"Market", "Limit", "Stop", "Stop Limit"};
         const char* tifs[]  = {"DAY", "GTC", "IOC", "FOK"};
         double qty  = std::atof(m_qtyBuf);
@@ -525,6 +919,11 @@ void TradingWindow::DrawConfirmationPopup() {
         if (m_typeIdx >= 1) ImGui::Text("Limit:     $%.2f", lmt);
         if (m_typeIdx >= 2) ImGui::Text("Stop:      $%.2f", stp);
         ImGui::Text("TIF:       %s",           tifs[m_tifIdx]);
+        if (m_outsideRth) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
+            ImGui::TextUnformatted("Outside RTH: YES");
+            ImGui::PopStyleColor();
+        }
 
         double refP   = (m_typeIdx >= 1 && lmt > 0) ? lmt : m_midPrice;
         double estVal = qty * refP;
@@ -588,35 +987,29 @@ void TradingWindow::SubmitOrder() {
     o.updatedAt   = o.submittedAt;
 
     if (OnOrderSubmit) {
-        // Real IB order — IB will send back status via OnOrderStatus / OnFill
         const char* action = (o.side == core::OrderSide::Buy) ? "BUY" : "SELL";
         const char* orderType = "MKT";
+        double price    = 0.0;  // lmt price for LMT; stop trigger for STP / STP LMT
+        double auxPrice = 0.0;  // limit price for STP LMT
         switch (o.type) {
-            case core::OrderType::Limit:     orderType = "LMT";    break;
-            case core::OrderType::Stop:      orderType = "STP";    break;
-            case core::OrderType::StopLimit: orderType = "STPLMT"; break;
+            case core::OrderType::Limit:
+                orderType = "LMT";
+                price     = o.limitPrice;
+                break;
+            case core::OrderType::Stop:
+                orderType = "STP";
+                price     = o.stopPrice;
+                break;
+            case core::OrderType::StopLimit:
+                orderType = "STP LMT";
+                price     = o.stopPrice;   // stop trigger
+                auxPrice  = o.limitPrice;  // limit price
+                break;
             default: break;
         }
-        OnOrderSubmit(o.orderId, o.symbol, action, orderType, o.quantity, o.limitPrice);
-    } else {
-        // Simulation fallback
-        if (o.type == core::OrderType::Market) {
-            double slip    = (o.side == core::OrderSide::Buy ? 1 : -1) * 0.01;
-            o.filledQty    = o.quantity;
-            o.avgFillPrice = m_midPrice + slip;
-            o.status       = core::OrderStatus::Filled;
-            o.updatedAt    = std::time(nullptr);
-
-            core::Fill fill;
-            fill.orderId    = o.orderId;
-            fill.symbol     = o.symbol;
-            fill.side       = o.side;
-            fill.quantity   = o.quantity;
-            fill.price      = o.avgFillPrice;
-            fill.commission = std::max(1.0, o.quantity * 0.005);
-            fill.timestamp  = std::time(nullptr);
-            m_fills.insert(m_fills.begin(), fill);
-        }
+        const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
+        OnOrderSubmit(o.orderId, o.symbol, action, orderType, o.quantity, price, auxPrice,
+                      tifs[m_tifIdx], m_outsideRth);
     }
 
     m_openOrders.push_back(o);
@@ -652,18 +1045,14 @@ void TradingWindow::SetNextOrderId(int id) {
 }
 
 // ============================================================================
-// Order lifecycle simulation
+// Prune old terminal orders so the list doesn't grow unbounded
 // ============================================================================
-void TradingWindow::SimulateOrderLifecycle(float /*dtSec*/) {
-    // Already handled in SimulateBookTick (limit/stop orders)
-    // Here we just prune very old filled/cancelled orders from the active list
-    // (keep them for display, but limit list size)
+void TradingWindow::PruneFinishedOrders() {
     auto isDone = [](const core::Order& o) {
         return (o.status == core::OrderStatus::Filled    ||
                 o.status == core::OrderStatus::Cancelled ||
                 o.status == core::OrderStatus::Rejected);
     };
-    // Keep done orders visible — only prune when list exceeds 50 terminal entries
     int doneCount = (int)std::count_if(m_openOrders.begin(), m_openOrders.end(), isDone);
     while (doneCount > 30) {
         auto it = std::find_if(m_openOrders.begin(), m_openOrders.end(), isDone);
@@ -828,21 +1217,6 @@ void TradingWindow::DrawExecutionLog() {
 // ============================================================================
 // Time & Sales simulation
 // ============================================================================
-void TradingWindow::SimulateNewTick() {
-    double move    = m_priceDist(m_rng) * 0.5;
-    double price   = RoundTick(m_midPrice + move);
-    double size    = 50.0 + m_uniform(m_rng) * 950.0;
-    bool   isUp    = (price >= (m_ticks.empty() ? m_midPrice : m_ticks.front().price));
-
-    core::Tick t;
-    t.price     = price;
-    t.size      = size;
-    t.isUptick  = isUp;
-    t.timestamp = std::time(nullptr);
-    m_ticks.push_front(t);
-    if ((int)m_ticks.size() > kMaxTicks) m_ticks.pop_back();
-}
-
 // ============================================================================
 // Draw — Time & Sales
 // ============================================================================
@@ -877,12 +1251,6 @@ std::string TradingWindow::FmtTime(std::time_t t) {
     std::tm* tm = std::localtime(&t);
     char buf[16];
     std::strftime(buf, sizeof(buf), "%H:%M:%S", tm);
-    return buf;
-}
-
-std::string TradingWindow::FmtPrice(double p) {
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "$%.2f", p);
     return buf;
 }
 

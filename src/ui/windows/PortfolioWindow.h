@@ -4,8 +4,6 @@
 #include "imgui.h"
 #include <vector>
 #include <string>
-#include <chrono>
-#include <random>
 
 namespace ui {
 
@@ -50,7 +48,6 @@ public:
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;
-    bool m_hasRealData = false;
 
     // ---- Account data -------------------------------------------------------
     core::AccountValues              m_account;
@@ -78,15 +75,6 @@ private:
     // ---- Trade history filter -----------------------------------------------
     char m_tradeFilterBuf[32] = "";
 
-    // ---- Refresh / simulation timing ----------------------------------------
-    using Clock = std::chrono::steady_clock;
-    Clock::time_point m_lastQuoteUpdate;
-    float m_quoteUpdateIntervalSec = 0.5f;
-
-    // ---- RNG ----------------------------------------------------------------
-    std::mt19937                           m_rng;
-    std::normal_distribution<double>       m_drift{0.0, 0.004};
-
     // ---- Sub-renderers ------------------------------------------------------
     void DrawSummaryCards();
     void DrawMainArea();
@@ -102,14 +90,8 @@ private:
 
     // ---- Helpers ------------------------------------------------------------
     void SortPositions();
-    void UpdateQuotes();
     void RecalcAccountTotals();
-
-    // ---- Simulation helpers -------------------------------------------------
-    void SimulatePortfolio();
-    void SimulateEquityCurve(int days = 90);
-    void SimulateTradeHistory(int count = 40);
-    void SimulatePerformanceMetrics();
+    void RecalcPerformanceMetrics();
 
     // ---- Formatting ---------------------------------------------------------
     static std::string FmtDollar(double v, bool sign = false);

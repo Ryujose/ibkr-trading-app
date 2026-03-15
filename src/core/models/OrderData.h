@@ -41,23 +41,27 @@ struct Order {
     double      quantity    = 0.0;
     double      limitPrice  = 0.0;
     double      stopPrice   = 0.0;
-    double      filledQty   = 0.0;
+    double      filledQty    = 0.0;
     double      avgFillPrice = 0.0;
-    OrderStatus status      = OrderStatus::Pending;
-    std::time_t submittedAt = 0;
-    std::time_t updatedAt   = 0;
+    double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)
+    OrderStatus status       = OrderStatus::Pending;
+    std::string rejectReason;        // IB error message when status == Rejected
+    std::time_t submittedAt  = 0;
+    std::time_t updatedAt    = 0;
 };
 
 // ---- Fill (execution report) ------------------------------------------------
 
 struct Fill {
-    int         orderId   = 0;
+    int         orderId     = 0;
+    std::string execId;       // IB execution ID — correlates execDetails ↔ commissionReport
     std::string symbol;
-    OrderSide   side      = OrderSide::Buy;
-    double      quantity  = 0.0;
-    double      price     = 0.0;
-    double      commission = 0.0;
-    std::time_t timestamp = 0;
+    OrderSide   side        = OrderSide::Buy;
+    double      quantity    = 0.0;
+    double      price       = 0.0;
+    double      commission  = 0.0;
+    double      realizedPnL = 0.0;  // populated by commissionReport callback
+    std::time_t timestamp   = 0;
 };
 
 // ---- String helpers ---------------------------------------------------------

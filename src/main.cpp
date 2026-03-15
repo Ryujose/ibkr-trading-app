@@ -29,6 +29,7 @@
 #include "ui/windows/TradingWindow.h"
 #include "ui/windows/ScannerWindow.h"
 #include "ui/windows/PortfolioWindow.h"
+#include "ui/windows/OrdersWindow.h"
 
 #include "core/services/IBKRClient.h"
 
@@ -40,6 +41,7 @@ static ui::NewsWindow*     g_NewsWindow     = nullptr;
 static ui::TradingWindow*  g_TradingWindow  = nullptr;
 static ui::ScannerWindow*  g_ScannerWindow  = nullptr;
 static ui::PortfolioWindow* g_PortfolioWindow = nullptr;
+static ui::OrdersWindow*   g_OrdersWindow   = nullptr;
 
 // IB API client (created on Connect, deleted on Disconnect)
 static core::services::IBKRClient* g_IBClient = nullptr;
@@ -53,13 +55,92 @@ static std::vector<core::ScanResult> g_pendingScanResults;
 // tickerId → symbol mapping (for routing tick data to windows)
 static std::unordered_map<int, std::string> g_tickerSymbols;
 
-static int g_nextOrderId = 1;
+static int g_nextOrderId   = 1;
+
+// Current chart symbol (kept in sync with ChartWindow)
+static std::string g_chartSymbol = "AAPL";
+
+// Live orders for chart overlay (orderId → Order; refreshed on every status change)
+static std::unordered_map<int, core::Order> g_liveOrders;
+
+// Per-symbol positions and commissions for the chart P&L strip
+static std::unordered_map<std::string, core::Position> g_positions;
+static std::unordered_map<std::string, double>          g_symbolCommissions;
+
+static bool IsTerminalOrderStatus(core::OrderStatus s) {
+    return s == core::OrderStatus::Filled   ||
+           s == core::OrderStatus::Cancelled ||
+           s == core::OrderStatus::Rejected;
+}
+
+// Push pending order lines for the current chart symbol into the ChartWindow
+static void UpdateChartPendingOrders() {
+    if (!g_ChartWindow) return;
+    std::vector<ui::ChartWindow::PendingOrderLine> lines;
+    for (const auto& [id, o] : g_liveOrders) {
+        if (o.symbol != g_chartSymbol) continue;
+        if (IsTerminalOrderStatus(o.status)) continue;
+        double price = o.limitPrice > 0.0 ? o.limitPrice : o.stopPrice;
+        if (price <= 0.0) continue;  // market order — nothing to draw
+        ui::ChartWindow::PendingOrderLine ln;
+        ln.orderId = id;
+        ln.price   = price;
+        ln.isBuy   = (o.side == core::OrderSide::Buy);
+        ln.qty     = o.quantity;
+        lines.push_back(ln);
+    }
+    g_ChartWindow->SetPendingOrders(lines);
+}
+
+// Push position info for the current chart symbol into the ChartWindow
+static void UpdateChartPosition() {
+    if (!g_ChartWindow) return;
+    ui::ChartWindow::PositionInfo info;
+    auto it = g_positions.find(g_chartSymbol);
+    if (it != g_positions.end() && std::abs(it->second.quantity) > 1e-9) {
+        info.hasPosition = true;
+        info.qty         = it->second.quantity;
+        info.avgCost     = it->second.avgCost;
+        info.lastPrice   = it->second.marketPrice;
+        info.unrealPnL   = it->second.unrealizedPnL;
+        auto cit = g_symbolCommissions.find(g_chartSymbol);
+        info.commission  = (cit != g_symbolCommissions.end()) ? cit->second : 0.0;
+    }
+    g_ChartWindow->SetPosition(info);
+}
+static int g_newsItemId    = 10000;  // unique IDs for real-time market news items
+static int g_histNewsId    = 20000;  // unique IDs for historical news items
+static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 
 // Request IDs (reserved ranges)
-static constexpr int HIST_REQID   = 1;    // historical data for the chart
-static constexpr int DEPTH_REQID  = 200;  // market depth
-static constexpr int SCAN_REQID   = 300;  // scanner
-static constexpr int MKT_REQID_BASE = 100; // market data per-symbol offset
+static constexpr int HIST_REQID          = 1;    // historical data for the chart
+static constexpr int DEPTH_REQID         = 200;  // market depth
+static constexpr int NEWS_RT_REQID       = 201;  // real-time news subscription (mdoff;292)
+static constexpr int SCAN_REQID          = 300;  // scanner
+static constexpr int MKT_REQID_BASE      = 100;  // market data per-symbol offset
+
+// News reqId layout:
+//   400        — contract-details lookup for stock tab
+//   401..420   — contract-details lookup for portfolio symbols (up to 20)
+//   500        — historical news for stock tab
+//   501..520   — historical news for portfolio symbols
+//   600..699   — article body fetches (rolling counter)
+//   750..759   — contract-details lookup for Market-tab seed symbols (up to 10)
+//   700..709   — historical news for Market tab (seeded on connection)
+static constexpr int NEWS_CONID_STOCK    = 400;
+static constexpr int NEWS_CONID_PORT     = 401;  // base; +i per portfolio symbol
+static constexpr int NEWS_HIST_STOCK     = 500;
+static constexpr int NEWS_HIST_PORT      = 501;  // base; +i per portfolio symbol
+static constexpr int NEWS_ART_BASE       = 600;
+static constexpr int NEWS_ART_END        = 699;
+static constexpr int NEWS_HIST_MKT       = 700;  // base; +i per seed symbol
+static constexpr int NEWS_CONID_MKT      = 750;  // base; +i per seed symbol
+
+// Symbols fetched on connection to seed the Market-tab news feed.
+static const char* kMktSeedSymbols[] = { "AAPL", "SPY", "MSFT", "TSLA", "NVDA" };
+static constexpr int kMktSeedCount   = 5;
+static int           g_nextArtReqId      = NEWS_ART_BASE;
+static std::unordered_map<int,int> g_artReqToItemId;  // reqId → NewsItem.id
 
 // ============================================================================
 // Connection / Login state
@@ -305,27 +386,104 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 // Window lifecycle helpers
 // ============================================================================
 static void CreateTradingWindows() {
-    delete g_ChartWindow;    g_ChartWindow    = new ui::ChartWindow();
-    delete g_NewsWindow;     g_NewsWindow     = new ui::NewsWindow();
-    delete g_TradingWindow;  g_TradingWindow  = new ui::TradingWindow();
-    delete g_ScannerWindow;  g_ScannerWindow  = new ui::ScannerWindow();
+    delete g_ChartWindow;     g_ChartWindow     = new ui::ChartWindow();
+    delete g_NewsWindow;      g_NewsWindow      = new ui::NewsWindow();
+    delete g_TradingWindow;   g_TradingWindow   = new ui::TradingWindow();
+    delete g_ScannerWindow;   g_ScannerWindow   = new ui::ScannerWindow();
     delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
+    delete g_OrdersWindow;    g_OrdersWindow    = new ui::OrdersWindow();
 
-    // Scanner row double-click → switch chart symbol + request new data
-    g_ScannerWindow->OnSymbolSelected = [](const std::string& sym) {
-        if (g_ChartWindow) g_ChartWindow->SetSymbol(sym);
-        if (g_IBClient) {
-            g_IBClient->CancelHistoricalData(HIST_REQID);
+    // Helper: cancel existing historical request and issue a new one
+    // useRTH=false → include pre/post-market bars
+    auto ReqChartData = [](const std::string& sym, core::Timeframe tf, bool useRTH) {
+        if (!g_IBClient) return;
+        g_IBClient->CancelHistoricalData(HIST_REQID);
+        g_pendingBars             = core::BarSeries{};
+        g_pendingBars.symbol      = sym;
+        g_pendingBars.timeframe   = tf;
+        g_IBClient->ReqHistoricalData(HIST_REQID, sym,
+                                      core::TimeframeIBDuration(tf),
+                                      core::TimeframeIBBarSize(tf),
+                                      useRTH);
+        // Re-subscribe market data ticks so OnLastPrice / OnDayTick receive
+        // live prices for the new symbol.
+        if (g_tickerSymbols[MKT_REQID_BASE] != sym) {
             g_IBClient->CancelMarketData(MKT_REQID_BASE);
-            g_IBClient->CancelMktDepth(DEPTH_REQID);
-            g_pendingBars = core::BarSeries{};
-            g_pendingBars.symbol    = sym;
-            g_pendingBars.timeframe = core::Timeframe::D1;
-            g_IBClient->ReqHistoricalData(HIST_REQID, sym);
             g_tickerSymbols[MKT_REQID_BASE] = sym;
             g_IBClient->ReqMarketData(MKT_REQID_BASE, sym);
-            g_IBClient->ReqMktDepth(DEPTH_REQID, sym);
         }
+    };
+
+    // Chart toolbar: symbol/timeframe/rth changed by the user
+    g_ChartWindow->OnDataRequest = [ReqChartData](const std::string& sym,
+                                                   core::Timeframe tf, bool useRTH) {
+        g_chartSymbol = sym;
+        ReqChartData(sym, tf, useRTH);
+        UpdateChartPendingOrders();
+        UpdateChartPosition();
+    };
+
+    // Chart trade panel: place orders directly from the chart
+    g_ChartWindow->OnOrderSubmit = [](const std::string& sym, const std::string& side,
+                                      const std::string& orderType, double qty, double price,
+                                      const std::string& tif, bool outsideRth, double auxPrice) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        int id = g_nextOrderId++;
+        // Keep TradingWindow counter in sync so no duplicate IDs
+        if (g_TradingWindow) g_TradingWindow->SetNextOrderId(g_nextOrderId);
+
+        // Optimistic insert: show order immediately in OrdersWindow / chart overlay
+        core::Order pending;
+        pending.orderId    = id;
+        pending.symbol     = sym;
+        pending.side       = (side == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+        pending.quantity   = qty;
+        pending.status     = core::OrderStatus::Pending;
+        pending.submittedAt = std::time(nullptr);
+        pending.updatedAt   = pending.submittedAt;
+
+        // Map IB order type string → core::OrderType so OrdersWindow shows the right label.
+        if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
+            pending.type = core::OrderType::Limit;
+        else if (orderType == "STP")
+            pending.type = core::OrderType::Stop;
+        else if (orderType == "STP LMT")
+            pending.type = core::OrderType::StopLimit;
+        else
+            pending.type = core::OrderType::Market;
+
+        if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
+            pending.limitPrice = price;
+        if (orderType == "STP" || orderType == "STP LMT" || orderType == "MIT")
+            pending.stopPrice  = price;
+
+        g_liveOrders[id] = pending;
+        if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(pending);
+        UpdateChartPendingOrders();
+
+        g_IBClient->PlaceOrder(id, sym, side, orderType, qty, price, tif, outsideRth, auxPrice);
+    };
+
+    // Cancel order directly from the chart overlay
+    g_ChartWindow->OnCancelOrder = [](int orderId) {
+        if (g_IBClient) g_IBClient->CancelOrder(orderId);
+    };
+
+    // Scanner row double-click → switch chart + trading window symbol + request new data
+    g_ScannerWindow->OnSymbolSelected = [ReqChartData](const std::string& sym) {
+        g_chartSymbol = sym;
+        if (g_ChartWindow)   g_ChartWindow->SetSymbol(sym);
+        if (g_TradingWindow) g_TradingWindow->SetSymbol(sym, 0.0);
+        if (g_IBClient) {
+            g_IBClient->CancelMarketData(MKT_REQID_BASE);
+            g_IBClient->CancelMktDepth(DEPTH_REQID);
+            ReqChartData(sym, core::Timeframe::D1, true);  // D1 always RTH
+            g_tickerSymbols[MKT_REQID_BASE] = sym;
+            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym);
+            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
+        }
+        UpdateChartPendingOrders();
+        UpdateChartPosition();
     };
 
     // Wire order submission / cancellation to IB
@@ -333,9 +491,12 @@ static void CreateTradingWindows() {
     g_TradingWindow->OnOrderSubmit = [](int orderId, const std::string& sym,
                                         const std::string& action,
                                         const std::string& orderType,
-                                        double qty, double limitPrice) {
-        if (g_IBClient)
-            g_IBClient->PlaceOrder(orderId, sym, action, orderType, qty, limitPrice);
+                                        double qty, double price, double auxPrice,
+                                        const std::string& tif, bool outsideRth) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        g_IBClient->PlaceOrder(orderId, sym, action, orderType, qty, price,
+                               tif, outsideRth, auxPrice);
+        if (orderId >= g_nextOrderId) g_nextOrderId = orderId + 1;
     };
     g_TradingWindow->OnOrderCancel = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
@@ -348,14 +509,29 @@ static void CreateTradingWindows() {
         if (g_IBClient)
             g_IBClient->ReqScannerData(SCAN_REQID, scanCode, instrument, location);
     };
+
+    // Wire OrdersWindow actions
+    g_OrdersWindow->OnCancelOrder = [](int orderId) {
+        if (g_IBClient) g_IBClient->CancelOrder(orderId);
+    };
+    g_OrdersWindow->OnRefresh = []() {
+        if (g_IBClient) g_IBClient->ReqOpenOrders();
+    };
 }
 
 static void DestroyTradingWindows() {
-    delete g_ChartWindow;    g_ChartWindow    = nullptr;
-    delete g_NewsWindow;     g_NewsWindow     = nullptr;
-    delete g_TradingWindow;  g_TradingWindow  = nullptr;
-    delete g_ScannerWindow;  g_ScannerWindow  = nullptr;
+    delete g_ChartWindow;     g_ChartWindow     = nullptr;
+    delete g_NewsWindow;      g_NewsWindow      = nullptr;
+    delete g_TradingWindow;   g_TradingWindow   = nullptr;
+    delete g_ScannerWindow;   g_ScannerWindow   = nullptr;
     delete g_PortfolioWindow; g_PortfolioWindow = nullptr;
+    delete g_OrdersWindow;    g_OrdersWindow    = nullptr;
+    g_portfolioSymbols.clear();
+    g_artReqToItemId.clear();
+    g_nextArtReqId = NEWS_ART_BASE;
+    g_liveOrders.clear();
+    g_positions.clear();
+    g_symbolCommissions.clear();
 }
 
 // ============================================================================
@@ -373,12 +549,14 @@ static void WireIBCallbacks() {
 
             // Set market data type before any subscriptions.
             // Live:  type 1 (real-time, requires active data subscriptions).
-            // Paper: type 3 (delayed 15-20 min, free on all paper accounts).
-            g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 3);
+            // Paper: type 4 (delayed-frozen — 15-20 min delayed during RTH, shows
+            //        last known price outside RTH so NBBO doesn't go blank after hours).
+            g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 4);
 
             // Start subscriptions
             g_IBClient->ReqAccountUpdates(true);
             g_IBClient->ReqPositions();
+            g_IBClient->ReqOpenOrders();
             g_IBClient->ReqScannerData(SCAN_REQID);
 
             // Chart — default AAPL
@@ -386,9 +564,21 @@ static void WireIBCallbacks() {
             g_pendingBars.symbol    = sym;
             g_pendingBars.timeframe = core::Timeframe::D1;
             g_tickerSymbols[MKT_REQID_BASE] = sym;
-            g_IBClient->ReqHistoricalData(HIST_REQID, sym);
+            g_IBClient->ReqHistoricalData(HIST_REQID, sym,
+                                          core::TimeframeIBDuration(core::Timeframe::D1),
+                                          core::TimeframeIBBarSize(core::Timeframe::D1),
+                                          true); // D1 default: RTH only
             g_IBClient->ReqMarketData(MKT_REQID_BASE, sym);
-            g_IBClient->ReqMktDepth(DEPTH_REQID, sym);
+            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
+
+            // Real-time news subscription (fires tickNews → onNewsItem).
+            // "mdoff;292:PROVIDERS" bypasses market-data subscription requirement.
+            g_IBClient->SubscribeToNews(NEWS_RT_REQID);
+
+            // Seed Market-tab with recent historical headlines from major symbols.
+            // Each reqContractDetails fires onContractConId → ReqHistoricalNews.
+            for (int i = 0; i < kMktSeedCount; ++i)
+                g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
         } else {
             if (g_Login.state == ConnectionState::Connecting) {
                 g_Login.state    = ConnectionState::Error;
@@ -402,8 +592,11 @@ static void WireIBCallbacks() {
     };
 
     // ── Historical bars (chart) ───────────────────────────────────────────
-    g_IBClient->onBarData = [](int /*reqId*/, const core::Bar& bar, bool done) {
-        if (!done) {
+    g_IBClient->onBarData = [](int /*reqId*/, const core::Bar& bar, bool done, bool isLive) {
+        if (isLive) {
+            // keepUpToDate=true live update — update the forming bar in the chart
+            if (g_ChartWindow) g_ChartWindow->UpdateLiveBar(bar);
+        } else if (!done) {
             g_pendingBars.bars.push_back(bar);
         } else if (g_ChartWindow) {
             g_ChartWindow->SetHistoricalData(g_pendingBars);
@@ -412,22 +605,121 @@ static void WireIBCallbacks() {
     };
 
     // ── Market data ticks ─────────────────────────────────────────────────
+    // Cached tick values — combined when the relevant price tick fires
+    static double g_lastTickSize  = 0.0;
+    static double g_lastTickPrice = 0.0;
+    static double g_nbboBid = 0.0, g_nbboBidSz = 0.0;
+    static double g_nbboAsk = 0.0, g_nbboAskSz = 0.0;
+
+    g_IBClient->onTickSize = [](int tickerId, int field, double size) {
+        if (tickerId != MKT_REQID_BASE) return;
+        // Normalise delayed-data variants (paper / reqMarketDataType(3)) to standard fields.
+        // DELAYED_BID_SIZE=69, DELAYED_ASK_SIZE=70, DELAYED_LAST_SIZE=71
+        switch (field) {
+            case 69: field = 0; break;
+            case 70: field = 3; break;
+            case 71: field = 5; break;
+            default: break;
+        }
+        switch (field) {
+            case 5:  // LAST_SIZE
+                g_lastTickSize = size;
+                break;
+            case 0:  // BID_SIZE — fire NBBO update
+                g_nbboBidSz = size;
+                if (g_TradingWindow)
+                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
+                                            g_nbboAsk, g_nbboAskSz);
+                break;
+            case 3:  // ASK_SIZE — fire NBBO update
+                g_nbboAskSz = size;
+                if (g_TradingWindow)
+                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
+                                            g_nbboAsk, g_nbboAskSz);
+                break;
+            default: break;
+        }
+    };
+
     g_IBClient->onTickPrice = [](int tickerId, int field, double price) {
         auto it = g_tickerSymbols.find(tickerId);
         if (it == g_tickerSymbols.end()) return;
         const std::string& sym = it->second;
-        // field 4 = LAST
-        if (field == 4 && g_TradingWindow) {
-            g_TradingWindow->OnTick(price, 1.0, true);
-            g_TradingWindow->SetSymbol(sym, price);
+
+        // Normalise delayed-data tick fields (paper / reqMarketDataType(3)) to their
+        // standard equivalents so the switch below handles both live and paper accounts.
+        // DELAYED_BID=66, DELAYED_ASK=67, DELAYED_LAST=68,
+        // DELAYED_HIGH=72, DELAYED_LOW=73, DELAYED_OPEN=76
+        switch (field) {
+            case 66: field = 1;  break;
+            case 67: field = 2;  break;
+            case 68: field = 4;  break;
+            case 72: field = 6;  break;
+            case 73: field = 7;  break;
+            case 76: field = 14; break;
+            default: break;
         }
-        // Update scanner quote
-        if (field == 4 && g_ScannerWindow)
-            g_ScannerWindow->OnQuoteUpdate(sym, price, 0.0, 0.0, 0.0);
+
+        switch (field) {
+            case 1:  // BID price — fire NBBO update
+                g_nbboBid = price;
+                if (g_TradingWindow)
+                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
+                                            g_nbboAsk, g_nbboAskSz);
+                break;
+            case 2:  // ASK price — fire NBBO update
+                g_nbboAsk = price;
+                if (g_TradingWindow)
+                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
+                                            g_nbboAsk, g_nbboAskSz);
+                break;
+            case 4: {  // LAST price
+                bool isUp = (price >= g_lastTickPrice);
+                g_lastTickPrice = price;
+                if (g_TradingWindow) {
+                    g_TradingWindow->UpdateMidPrice(price);
+                    g_TradingWindow->OnTick(price, g_lastTickSize, isUp);
+                }
+                if (g_ScannerWindow)
+                    g_ScannerWindow->OnQuoteUpdate(sym, price, 0.0, 0.0, 0.0);
+                if (g_ChartWindow && sym == g_chartSymbol) {
+                    g_ChartWindow->OnLastPrice(price);   // intraday: update forming bar
+                    g_ChartWindow->OnDayTick(4, price);  // D1/W1/MN: update/create today's bar
+                }
+                // Keep chart position lastPrice fresh
+                {
+                    auto pit = g_positions.find(sym);
+                    if (pit != g_positions.end()) {
+                        pit->second.marketPrice = price;
+                        if (sym == g_chartSymbol) UpdateChartPosition();
+                    }
+                }
+                break;
+            }
+            case 6: {  // HIGH — today's session high (HIGH=6, not 12)
+                if (g_ChartWindow && sym == g_chartSymbol)
+                    g_ChartWindow->OnDayTick(6, price);
+                break;
+            }
+            case 7: {  // LOW — today's session low (LOW=7, not 13)
+                if (g_ChartWindow && sym == g_chartSymbol)
+                    g_ChartWindow->OnDayTick(7, price);
+                break;
+            }
+            case 14: {  // OPEN — today's opening price
+                if (g_ChartWindow && sym == g_chartSymbol)
+                    g_ChartWindow->OnDayTick(14, price);
+                break;
+            }
+            default: break;
+        }
     };
 
-    g_IBClient->onTickSize = [](int /*tickerId*/, int /*field*/, double /*size*/) {
-        // Could feed volume/size data here
+    // ── Market depth (Level II order book) ───────────────────────────────
+    g_IBClient->onDepthUpdate = [](int id, bool isBid, int pos, int op,
+                                   double price, double size) {
+        if (g_TradingWindow)
+            g_TradingWindow->OnDepthUpdate(id, isBid, pos, op, price, size);
     };
 
     // ── Account values ────────────────────────────────────────────────────
@@ -446,17 +738,33 @@ static void WireIBCallbacks() {
             else
                 g_PortfolioWindow->OnAccountEnd();
         }
-        // Keep scanner aware of held positions
-        if (!done && g_ScannerWindow) {
-            static std::vector<std::string> held;
-            held.push_back(pos.symbol);
-            g_ScannerWindow->SetPortfolioSymbols(held);
+        // Accumulate symbols; on done push to scanner and news window
+        if (!done) {
+            auto it = std::find(g_portfolioSymbols.begin(),
+                                g_portfolioSymbols.end(), pos.symbol);
+            if (it == g_portfolioSymbols.end())
+                g_portfolioSymbols.push_back(pos.symbol);
+        } else {
+            if (g_ScannerWindow) g_ScannerWindow->SetPortfolioSymbols(g_portfolioSymbols);
+            if (g_NewsWindow)    g_NewsWindow->SetPortfolioSymbols(g_portfolioSymbols);
         }
     };
 
     // ── Portfolio updates (P&L etc.) ──────────────────────────────────────
     g_IBClient->onPortfolioUpdate = [](const core::Position& pos) {
         if (g_PortfolioWindow) g_PortfolioWindow->OnPositionUpdate(pos);
+        g_positions[pos.symbol] = pos;
+        UpdateChartPosition();
+    };
+
+    // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
+    g_IBClient->onOpenOrder = [](const core::Order& order) {
+        g_liveOrders[order.orderId] = order;
+        if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
+        UpdateChartPendingOrders();
+    };
+    g_IBClient->onOpenOrderEnd = []() {
+        // nothing extra needed — data already pushed via onOpenOrder
     };
 
     // ── Order status ──────────────────────────────────────────────────────
@@ -464,29 +772,39 @@ static void WireIBCallbacks() {
                                           double filled, double avgPrice) {
         if (g_TradingWindow)
             g_TradingWindow->OnOrderStatus(orderId, status, filled, avgPrice);
+        if (g_OrdersWindow)
+            g_OrdersWindow->OnOrderStatus(orderId, status, filled, avgPrice);
+        // Keep our local order map in sync for the chart overlay
+        auto it = g_liveOrders.find(orderId);
+        if (it != g_liveOrders.end()) {
+            it->second.status       = status;
+            it->second.filledQty    = filled;
+            it->second.avgFillPrice = avgPrice;
+        }
+        UpdateChartPendingOrders();
     };
 
     // ── Fills ─────────────────────────────────────────────────────────────
     g_IBClient->onFillReceived = [](const core::Fill& fill) {
         if (g_TradingWindow) g_TradingWindow->OnFill(fill);
+        if (g_OrdersWindow)  g_OrdersWindow->OnFill(fill);
+        // Accumulate commission per symbol for the P&L strip
+        g_symbolCommissions[fill.symbol] += fill.commission;
         if (g_PortfolioWindow) {
             core::TradeRecord tr;
-            tr.tradeId   = fill.orderId;
-            tr.symbol    = fill.symbol;
-            tr.side      = fill.side == core::OrderSide::Buy ? "BUY" : "SELL";
-            tr.quantity  = fill.quantity;
-            tr.price     = fill.price;
+            tr.tradeId    = fill.orderId;
+            tr.symbol     = fill.symbol;
+            tr.side       = fill.side == core::OrderSide::Buy ? "BUY" : "SELL";
+            tr.quantity   = fill.quantity;
+            tr.price      = fill.price;
             tr.commission = fill.commission;
+            tr.realizedPnL = fill.realizedPnL;
+            tr.executedAt  = fill.timestamp;
             g_PortfolioWindow->OnTradeExecuted(tr);
         }
+        UpdateChartPosition();
     };
 
-    // ── Market depth ──────────────────────────────────────────────────────
-    g_IBClient->onDepthUpdate = [](int /*id*/, bool isBid, int pos, int /*op*/,
-                                   double price, double size) {
-        if (g_TradingWindow)
-            g_TradingWindow->OnDepthUpdate(isBid, pos, price, size);
-    };
 
     // ── Scanner ───────────────────────────────────────────────────────────
     g_IBClient->onScanItem = [](int reqId, const core::ScanResult& result) {
@@ -499,28 +817,138 @@ static void WireIBCallbacks() {
         }
     };
 
-    // ── News ──────────────────────────────────────────────────────────────
+    // ── News — real-time (tickNews fires for subscribed market data) ──────
     g_IBClient->onNewsItem = [](std::time_t ts, const std::string& provider,
                                 const std::string& articleId,
                                 const std::string& headline) {
         if (!g_NewsWindow) return;
         core::NewsItem item;
-        item.id        = static_cast<int>(ts);
+        item.id        = ++g_newsItemId;
         item.headline  = headline;
         item.source    = provider;
-        item.summary   = articleId;
+        item.summary   = articleId;   // transport: window extracts → m_itemArticleIds
         item.timestamp = ts;
         item.sentiment = core::NewsSentiment::Neutral;
         item.category  = core::NewsCategory::Market;
         g_NewsWindow->OnMarketNewsItem(item);
     };
 
+    // ── News — contract details → historical news chain ───────────────────
+    g_IBClient->onContractConId = [](int reqId, long conId) {
+        if (!g_IBClient) return;
+        if (reqId == NEWS_CONID_STOCK) {
+            g_IBClient->ReqHistoricalNews(NEWS_HIST_STOCK, (int)conId, 30);
+        } else if (reqId >= NEWS_CONID_PORT && reqId < NEWS_CONID_PORT + 20) {
+            int i = reqId - NEWS_CONID_PORT;
+            g_IBClient->ReqHistoricalNews(NEWS_HIST_PORT + i, (int)conId, 10);
+        } else if (reqId >= NEWS_CONID_MKT && reqId < NEWS_CONID_MKT + kMktSeedCount) {
+            int i = reqId - NEWS_CONID_MKT;
+            g_IBClient->ReqHistoricalNews(NEWS_HIST_MKT + i, (int)conId, 20);
+        }
+    };
+
+    g_IBClient->onHistoricalNews = [](int reqId, std::time_t ts,
+                                      const std::string& provider,
+                                      const std::string& articleId,
+                                      const std::string& headline) {
+        if (!g_NewsWindow) return;
+        core::NewsItem item;
+        item.id        = ++g_histNewsId;
+        item.headline  = headline;
+        item.source    = provider;    // providerCode needed for reqNewsArticle
+        item.summary   = articleId;   // transport: window extracts → m_itemArticleIds
+        item.timestamp = ts;
+        item.sentiment = core::NewsSentiment::Neutral;
+        if (reqId == NEWS_HIST_STOCK)
+            item.category = core::NewsCategory::Stock;
+        else if (reqId >= NEWS_HIST_MKT && reqId < NEWS_HIST_MKT + kMktSeedCount)
+            item.category = core::NewsCategory::Market;
+        else
+            item.category = core::NewsCategory::Portfolio;
+        g_NewsWindow->OnHistoricalNewsItem(reqId, item);
+    };
+
+    g_IBClient->onHistoricalNewsEnd = [](int reqId) {
+        if (g_NewsWindow) g_NewsWindow->OnHistoricalNewsEnd(reqId);
+    };
+
+    g_IBClient->onNewsArticle = [](int reqId, int /*articleType*/,
+                                   const std::string& text) {
+        auto it = g_artReqToItemId.find(reqId);
+        if (it == g_artReqToItemId.end()) return;
+        int itemId = it->second;
+        g_artReqToItemId.erase(it);
+        if (g_NewsWindow) g_NewsWindow->OnArticleReceived(itemId, text);
+    };
+
+    // ── News window callbacks (fire when user interacts) ──────────────────
+    if (g_NewsWindow) {
+        // Inform window which reqIds belong to which tab
+        g_NewsWindow->SetStockNewsReqId(NEWS_HIST_STOCK);
+        g_NewsWindow->SetPortNewsReqIdBase(NEWS_HIST_PORT);
+        g_NewsWindow->SetMktNewsReqIdBase(NEWS_HIST_MKT);
+
+        // Stock news: user typed a symbol → look up conId, then fetch news
+        g_NewsWindow->OnStockNewsRequested = [](const std::string& symbol) {
+            if (g_IBClient && g_IBClient->IsConnected())
+                g_IBClient->ReqContractDetails(NEWS_CONID_STOCK, symbol);
+        };
+
+        // Portfolio news: symbols updated → fetch for each
+        g_NewsWindow->OnPortfolioNewsRequested = [](const std::vector<std::string>& syms) {
+            if (!g_IBClient || !g_IBClient->IsConnected()) return;
+            for (int i = 0; i < (int)syms.size() && i < 20; ++i)
+                g_IBClient->ReqContractDetails(NEWS_CONID_PORT + i, syms[i]);
+        };
+
+        // Article body: user expanded an item → fetch full text
+        g_NewsWindow->OnArticleRequested = [](int itemId, const std::string& provider,
+                                              const std::string& articleId) {
+            if (!g_IBClient || !g_IBClient->IsConnected()) return;
+            int reqId = g_nextArtReqId++;
+            if (g_nextArtReqId > NEWS_ART_END) g_nextArtReqId = NEWS_ART_BASE;
+            g_artReqToItemId[reqId] = itemId;
+            g_IBClient->ReqNewsArticle(reqId, provider, articleId);
+        };
+    }
+
     // ── Errors ────────────────────────────────────────────────────────────
-    g_IBClient->onError = [](int code, const std::string& msg) {
-        fprintf(stderr, "[IB Error %d] %s\n", code, msg.c_str());
-        // Surface critical errors in the UI
-        if (code == 162 || code == 200 || code == 321) {
-            // Ignore common benign errors (no data/historical, invalid contract)
+    g_IBClient->onError = [](int reqId, int code, const std::string& msg) {
+        fprintf(stderr, "[IB Error reqId=%d code=%d] %s\n", reqId, code, msg.c_str());
+
+        // Order-related error: mark the order as Rejected in all windows.
+        // IB sends error() for rejections alongside (or instead of) orderStatus().
+        // We act on Pending OR Working orders — outside-RTH rejections arrive after
+        // IB has already set the order to Working state.
+        auto it = g_liveOrders.find(reqId);
+        if (it != g_liveOrders.end() &&
+            (it->second.status == core::OrderStatus::Pending ||
+             it->second.status == core::OrderStatus::Working)) {
+            char reason[512];
+            std::snprintf(reason, sizeof(reason), "[%d] %s", code, msg.c_str());
+            it->second.status       = core::OrderStatus::Rejected;
+            it->second.rejectReason = reason;
+            if (g_OrdersWindow)
+                g_OrdersWindow->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0, reason);
+            if (g_TradingWindow)
+                g_TradingWindow->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0);
+            UpdateChartPendingOrders();
+        }
+
+        if (!g_TradingWindow) return;
+
+        // Subscription errors for market data (NBBO)
+        // 354 = not subscribed, 10090 = partial subscription
+        if (reqId == MKT_REQID_BASE) {
+            if (code == 354 || code == 10090)
+                g_TradingWindow->OnMktDataError(code);
+        }
+
+        // Subscription / permission errors for Level II depth
+        // 354 = not subscribed, 10092 = deep book not allowed, 322 = no permissions
+        if (reqId == DEPTH_REQID) {
+            if (code == 354 || code == 10090 || code == 10092 || code == 322)
+                g_TradingWindow->OnDepthError(code);
         }
     };
 
@@ -762,6 +1190,7 @@ static void RenderTradingUI() {
             if (ImGui::BeginMenu("Windows")) {
                 ImGui::MenuItem("Chart",      nullptr, nullptr, false);
                 ImGui::MenuItem("Order Book", nullptr, nullptr, false);
+                ImGui::MenuItem("Orders",     nullptr, nullptr, false);
                 ImGui::MenuItem("Portfolio",  nullptr, nullptr, false);
                 ImGui::MenuItem("News",       nullptr, nullptr, false);
                 ImGui::MenuItem("Scanner",    nullptr, nullptr, false);
@@ -791,6 +1220,7 @@ static void RenderTradingUI() {
     if (g_TradingWindow)  g_TradingWindow->Render();
     if (g_ScannerWindow)  g_ScannerWindow->Render();
     if (g_PortfolioWindow) g_PortfolioWindow->Render();
+    if (g_OrdersWindow)   g_OrdersWindow->Render();
 }
 
 // ============================================================================

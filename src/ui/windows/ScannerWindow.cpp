@@ -328,7 +328,8 @@ void ScannerWindow::DrawResultsTable()
         ImGuiTableFlags_Resizable      |
         ImGuiTableFlags_Sortable       |
         ImGuiTableFlags_SortTristate   |
-        ImGuiTableFlags_Hideable;
+        ImGuiTableFlags_Hideable       |
+        ImGuiTableFlags_SizingFixedFit;
 
     if (!ImGui::BeginTable("##scanner", colCount, tflags,
                             ImVec2(0, tableHeight)))
@@ -337,6 +338,11 @@ void ScannerWindow::DrawResultsTable()
     // --- Column headers ---
     auto ColHdr = [](const char* label, ImGuiTableColumnFlags flags = 0,
                      float width = 0.f) {
+        constexpr ImGuiTableColumnFlags kSizingMask =
+            ImGuiTableColumnFlags_WidthFixed  |
+            ImGuiTableColumnFlags_WidthStretch;
+        if (width > 0.f && !(flags & kSizingMask))
+            flags |= ImGuiTableColumnFlags_WidthFixed;
         ImGui::TableSetupColumn(label,
             ImGuiTableColumnFlags_DefaultSort | flags,
             width);

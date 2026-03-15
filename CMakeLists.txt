@@ -208,6 +208,7 @@ set(APPLICATION_SOURCES
     src/ui/windows/TradingWindow.cpp
     src/ui/windows/ScannerWindow.cpp
     src/ui/windows/PortfolioWindow.cpp
+    src/ui/windows/OrdersWindow.cpp
 )
 
 # Find GLFW3 library (use system installed)
