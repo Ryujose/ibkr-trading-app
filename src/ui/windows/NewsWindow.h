@@ -3,15 +3,20 @@
 #include "core/models/NewsData.h"
 #include <vector>
 #include <string>
-#include <chrono>
+#include <functional>
+#include <unordered_map>
 
 namespace ui {
 
 // ============================================================================
-// NewsWindow
-// Three-tab news feed: Market / Portfolio / Stock.
-// Data is simulated; the public RefreshXxx() methods will be wired to the
-// IB Gateway EWrapper::newsArticle callbacks in a future task.
+// NewsWindow — Three-tab IB news feed: Market / Portfolio / Stock.
+//
+// Market tab  : populated from IB tickNews (real-time push, no manual refresh).
+// Portfolio tab: populated from reqHistoricalNews for each held symbol.
+// Stock tab   : populated from reqHistoricalNews for a user-chosen symbol.
+//
+// Article bodies are fetched on demand (reqNewsArticle) when the user expands
+// an item.  All data comes from IB — there is no simulation fallback.
 // ============================================================================
 class NewsWindow {
 public:
@@ -21,24 +26,40 @@ public:
     // Returns false if the window was closed.
     bool Render();
 
-    // --- Called by IB Gateway integration (future task) ---
+    // ── IB data push-ins (called by main.cpp callbacks) ──────────────────
+    // Real-time headline from tickNews; item.summary carries articleId as
+    // transport (main.cpp convention); window extracts and clears it.
     void OnMarketNewsItem(const core::NewsItem& item);
-    void OnPortfolioNewsItem(const core::NewsItem& item);
-    void OnStockNewsItem(const core::NewsItem& item);
 
-    // Symbols considered part of the portfolio (set by portfolio manager later)
+    // Historical headline from reqHistoricalNews; item.summary carries
+    // articleId as transport; reqId decides which tab receives the item.
+    void OnHistoricalNewsItem(int reqId, const core::NewsItem& item);
+    void OnHistoricalNewsEnd(int reqId);
+
+    // Full article body arrived for a previously expanded item.
+    void OnArticleReceived(int itemId, const std::string& text);
+
+    // Called when portfolio positions are known (drives Portfolio tab fetch).
     void SetPortfolioSymbols(std::vector<std::string> symbols);
+
+    // ── Callbacks wired by main.cpp after connection ──────────────────────
+    std::function<void(const std::string& symbol)>              OnStockNewsRequested;
+    std::function<void(const std::vector<std::string>& symbols)> OnPortfolioNewsRequested;
+    std::function<void(int itemId, const std::string& providerCode,
+                       const std::string& articleId)>            OnArticleRequested;
+
+    // reqId ranges set by main.cpp so the window can route responses correctly.
+    void SetStockNewsReqId(int reqId)   { m_stockHistReqId    = reqId; }
+    void SetPortNewsReqIdBase(int base) { m_portHistReqIdBase = base;  }
+    void SetMktNewsReqIdBase(int base)  { m_mktHistReqIdBase  = base;  }
 
 private:
     // ---- UI state -----------------------------------------------------------
-    bool m_open              = true;
-    bool m_hasRealData       = false;
-    int  m_activeTab         = 0;          // 0=Market, 1=Portfolio, 2=Stock
-    char m_stockSymbol[16]   = "AAPL";
-    char m_stockSymbolPrev[16] = "";       // detect symbol change
-    bool m_autoRefresh       = true;
-    int  m_expandedId        = -1;         // which item is expanded (-1=none)
-    char m_filterText[64]    = "";         // keyword search/filter
+    bool m_open            = true;
+    int  m_activeTab       = 0;       // 0=Market, 1=Portfolio, 2=Stock
+    char m_stockSymbol[16] = "AAPL";
+    int  m_expandedId      = -1;      // which item is expanded (-1=none)
+    char m_filterText[64]  = "";
 
     // ---- Data ---------------------------------------------------------------
     std::vector<core::NewsItem> m_marketNews;
@@ -46,12 +67,18 @@ private:
     std::vector<core::NewsItem> m_stockNews;
     std::vector<std::string>    m_portfolioSymbols;
 
-    // ---- Refresh timing -----------------------------------------------------
-    using Clock = std::chrono::steady_clock;
-    Clock::time_point m_lastRefreshMarket;
-    Clock::time_point m_lastRefreshPortfolio;
-    Clock::time_point m_lastRefreshStock;
-    float m_refreshIntervalSec = 30.0f;
+    // ---- Loading state ------------------------------------------------------
+    bool m_loadingStock     = false;
+    bool m_loadingPortfolio = false;
+
+    // ---- reqId routing (set by main.cpp) ------------------------------------
+    int  m_stockHistReqId    = -1;
+    int  m_portHistReqIdBase = -1;
+    int  m_mktHistReqIdBase  = -1;
+
+    // ---- Article fetch tracking: itemId → providerCode / articleId ----------
+    std::unordered_map<int, std::string> m_itemProviders;   // itemId → provider
+    std::unordered_map<int, std::string> m_itemArticleIds;  // itemId → articleId
 
     // ---- Private helpers ----------------------------------------------------
     void DrawToolbar();
@@ -64,15 +91,8 @@ private:
     void DrawBreakingBanner(const std::vector<core::NewsItem>& items);
 
     void RefreshAll();
-    void RefreshMarket();
     void RefreshPortfolio();
     void RefreshStock(const std::string& symbol);
-
-    // ---- Simulation ---------------------------------------------------------
-    static std::vector<core::NewsItem> SimulateMarketNews();
-    static std::vector<core::NewsItem> SimulatePortfolioNews(
-        const std::vector<std::string>& symbols);
-    static std::vector<core::NewsItem> SimulateStockNews(const std::string& symbol);
 
     static std::string FormatTimeAgo(std::time_t ts);
     static bool        MatchesFilter(const core::NewsItem& item, const char* filter);

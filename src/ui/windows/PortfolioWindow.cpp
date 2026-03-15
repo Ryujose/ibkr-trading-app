@@ -19,17 +19,30 @@
 namespace ui {
 
 // ============================================================================
+// Currency symbol helper — maps IB base-currency code to display prefix
+// ============================================================================
+static const char* CurrSym(const std::string& bc) {
+    if (bc == "USD") return "$";
+    if (bc == "EUR") return "\xe2\x82\xac";  // €
+    if (bc == "GBP") return "\xc2\xa3";      // £
+    if (bc == "JPY") return "\xc2\xa5";      // ¥
+    if (bc == "CAD") return "C$";
+    if (bc == "AUD") return "A$";
+    if (bc == "HKD") return "HK$";
+    if (bc == "SGD") return "S$";
+    if (bc.empty())  return "$";
+    // For any other currency (CHF, MXN, …) use the 3-letter code as prefix
+    static thread_local char buf[8];
+    std::snprintf(buf, sizeof(buf), "%.3s ", bc.c_str());
+    return buf;
+}
+
+// ============================================================================
 // Constructor
 // ============================================================================
 
 PortfolioWindow::PortfolioWindow()
-    : m_rng(std::random_device{}())
 {
-    m_lastQuoteUpdate = Clock::now();
-    SimulatePortfolio();
-    SimulateEquityCurve();
-    SimulateTradeHistory();
-    SimulatePerformanceMetrics();
     RecalcAccountTotals();
     SortPositions();
 }
@@ -39,28 +52,34 @@ PortfolioWindow::PortfolioWindow()
 // ============================================================================
 
 void PortfolioWindow::OnAccountValue(const std::string& key, const std::string& val,
-                                     const std::string& /*currency*/,
+                                     const std::string& currency,
                                      const std::string& /*accountName*/)
 {
-    m_hasRealData = true;
     double d = std::atof(val.c_str());
-    if      (key == "NetLiquidation")    m_account.netLiquidation  = d;
-    else if (key == "TotalCashValue")    m_account.totalCashValue  = d;
-    else if (key == "BuyingPower")       m_account.buyingPower     = d;
-    else if (key == "UnrealizedPnL")     m_account.unrealizedPnL   = d;
-    else if (key == "RealizedPnL")       m_account.realizedPnL     = d;
-    else if (key == "InitMarginReq")     m_account.initMarginReq   = d;
-    else if (key == "MaintMarginReq")    m_account.maintMarginReq  = d;
-    else if (key == "ExcessLiquidity")   m_account.excessLiquidity = d;
+    if      (key == "NetLiquidation")      m_account.netLiquidation  = d;
+    else if (key == "TotalCashValue")      m_account.totalCashValue  = d;
+    else if (key == "BuyingPower")         m_account.buyingPower     = d;
+    else if (key == "UnrealizedPnL")       m_account.unrealizedPnL   = d;
+    else if (key == "RealizedPnL")         m_account.realizedPnL     = d;
+    else if (key == "InitMarginReq")       m_account.initMarginReq   = d;
+    else if (key == "MaintMarginReq")      m_account.maintMarginReq  = d;
+    else if (key == "ExcessLiquidity")     m_account.excessLiquidity = d;
+    // Day P&L — IB sends either the combined key OR the two component keys.
+    // "DailyPnL" is the authoritative total; components only accumulate when
+    // it is absent (the first one seen resets, the second adds).
+    else if (key == "DailyPnL")          m_account.dayPnL  = d;
+    else if (key == "UnrealizedDayPnL")  m_account.dayPnL += d;
+    else if (key == "RealizedDayPnL")    m_account.dayPnL += d;
+    // IB sends key="Currency" with the account's base currency code (USD, EUR…)
+    else if (key == "Currency" && !val.empty())  m_account.baseCurrency = val;
+    // Some IB versions send it in the currency param on the AccountType key
+    if (m_account.baseCurrency.empty() && !currency.empty() && currency != "BASE")
+        m_account.baseCurrency = currency;
     m_account.updatedAt = std::time(nullptr);
 }
 
 void PortfolioWindow::OnPositionUpdate(const core::Position& pos)
 {
-    if (!m_hasRealData) {
-        m_hasRealData = true;
-        m_positions.clear();
-    }
     for (auto& p : m_positions) {
         if (p.symbol == pos.symbol) { p = pos; return; }
     }
@@ -72,12 +91,30 @@ void PortfolioWindow::OnPositionUpdate(const core::Position& pos)
 void PortfolioWindow::OnTradeExecuted(const core::TradeRecord& trade)
 {
     m_trades.insert(m_trades.begin(), trade);
+    RecalcPerformanceMetrics();
 }
 
 void PortfolioWindow::OnAccountEnd()
 {
     RecalcAccountTotals();
     SortPositions();
+
+    // dayPnLPct = dayPnL as % of prior day's net liq (≈ netLiq - dayPnL)
+    double priorNetLiq = m_account.netLiquidation - m_account.dayPnL;
+    m_account.dayPnLPct = (priorNetLiq > 1e-9)
+                          ? (m_account.dayPnL / priorNetLiq) * 100.0
+                          : 0.0;
+
+    // Snapshot equity for the live equity curve
+    if (m_account.netLiquidation > 0) {
+        core::EquityPoint ep;
+        ep.date      = std::time(nullptr);
+        ep.equity    = m_account.netLiquidation;
+        ep.cash      = m_account.totalCashValue;
+        ep.positions = m_account.netLiquidation - m_account.totalCashValue;
+        m_equityCurve.push_back(ep);
+        if (m_equityCurve.size() > 10000) m_equityCurve.erase(m_equityCurve.begin());
+    }
 }
 
 // ============================================================================
@@ -87,16 +124,6 @@ void PortfolioWindow::OnAccountEnd()
 bool PortfolioWindow::Render()
 {
     if (!m_open) return false;
-
-    // Periodic quote drift — only when no real IB data
-    if (!m_hasRealData) {
-        auto now = Clock::now();
-        float dt = std::chrono::duration<float>(now - m_lastQuoteUpdate).count();
-        if (dt >= m_quoteUpdateIntervalSec) {
-            UpdateQuotes();
-            m_lastQuoteUpdate = now;
-        }
-    }
 
     ImGui::SetNextWindowSize(ImVec2(1200, 700), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar |
@@ -130,38 +157,40 @@ void PortfolioWindow::DrawSummaryCards()
     float cardW   = (availW - gap * (nCards - 1)) / nCards;
 
     // Precompute display strings
+    const char* cs = CurrSym(m_account.baseCurrency);
+
     char netLiqVal[32], netLiqSub[32];
-    std::snprintf(netLiqVal, sizeof(netLiqVal), "$%s",
-                  FmtDollar(m_account.netLiquidation).c_str());
+    std::snprintf(netLiqVal, sizeof(netLiqVal), "%s%s",
+                  cs, FmtDollar(m_account.netLiquidation).c_str());
     std::snprintf(netLiqSub, sizeof(netLiqSub), "Net Liquidation");
 
     char cashVal[32], cashSub[32];
-    std::snprintf(cashVal, sizeof(cashVal), "$%s",
-                  FmtDollar(m_account.totalCashValue).c_str());
+    std::snprintf(cashVal, sizeof(cashVal), "%s%s",
+                  cs, FmtDollar(m_account.totalCashValue).c_str());
     std::snprintf(cashSub, sizeof(cashSub), "Cash Available");
 
     char dayPnlVal[32], dayPnlSub[32];
-    std::snprintf(dayPnlVal, sizeof(dayPnlVal), "%s%s",
-                  m_account.dayPnL >= 0 ? "+" : "",
-                  FmtDollar(m_account.dayPnL, true).c_str());
+    std::snprintf(dayPnlVal, sizeof(dayPnlVal), "%s%s%s",
+                  m_account.dayPnL >= 0 ? "+" : "-",
+                  cs, FmtDollar(std::abs(m_account.dayPnL)).c_str());
     std::snprintf(dayPnlSub, sizeof(dayPnlSub), "%.2f%% today",
                   m_account.dayPnLPct);
 
     char uPnlVal[32], uPnlSub[32];
-    std::snprintf(uPnlVal, sizeof(uPnlVal), "%s%s",
-                  m_account.unrealizedPnL >= 0 ? "+" : "",
-                  FmtDollar(m_account.unrealizedPnL, true).c_str());
+    std::snprintf(uPnlVal, sizeof(uPnlVal), "%s%s%s",
+                  m_account.unrealizedPnL >= 0 ? "+" : "-",
+                  cs, FmtDollar(std::abs(m_account.unrealizedPnL)).c_str());
     std::snprintf(uPnlSub, sizeof(uPnlSub), "Unrealized P&L");
 
     char rPnlVal[32], rPnlSub[32];
-    std::snprintf(rPnlVal, sizeof(rPnlVal), "%s%s",
-                  m_account.realizedPnL >= 0 ? "+" : "",
-                  FmtDollar(m_account.realizedPnL, true).c_str());
+    std::snprintf(rPnlVal, sizeof(rPnlVal), "%s%s%s",
+                  m_account.realizedPnL >= 0 ? "+" : "-",
+                  cs, FmtDollar(std::abs(m_account.realizedPnL)).c_str());
     std::snprintf(rPnlSub, sizeof(rPnlSub), "Realized P&L");
 
     char bpVal[32], bpSub[32];
-    std::snprintf(bpVal, sizeof(bpVal), "$%s",
-                  FmtDollar(m_account.buyingPower).c_str());
+    std::snprintf(bpVal, sizeof(bpVal), "%s%s",
+                  cs, FmtDollar(m_account.buyingPower).c_str());
     std::snprintf(bpSub, sizeof(bpSub), "Leverage: %.2fx", m_account.leverage);
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(gap, 4));
@@ -265,24 +294,25 @@ void PortfolioWindow::DrawPositionsTable()
         ImGuiTableFlags_BordersOuter |
         ImGuiTableFlags_BordersV     |
         ImGuiTableFlags_Resizable    |
-        ImGuiTableFlags_Sortable;
+        ImGuiTableFlags_Sortable     |
+        ImGuiTableFlags_SizingFixedFit;
 
     if (!ImGui::BeginTable("##positions", colCount, tflags, ImVec2(0, tableH)))
         return;
 
     // Headers
-    ImGui::TableSetupColumn("Symbol",     ImGuiTableColumnFlags_DefaultSort, 72.f);
+    ImGui::TableSetupColumn("Symbol",     ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 72.f);
     if (m_showDesc)      ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Qty",        0, 60.f);
-    if (m_showAvgCost)   ImGui::TableSetupColumn("Avg Cost",    0, 72.f);
-    ImGui::TableSetupColumn("Price",      0, 72.f);
-    ImGui::TableSetupColumn("Mkt Value",  0, 88.f);
-    if (m_showCostBasis) ImGui::TableSetupColumn("Cost Basis",  0, 88.f);
-    ImGui::TableSetupColumn("Unreal P&L", 0, 88.f);
-    ImGui::TableSetupColumn("Unreal %",   0, 68.f);
-    if (m_showRealPnL)   ImGui::TableSetupColumn("Real P&L",    0, 88.f);
-    if (m_showDayChg)    ImGui::TableSetupColumn("Day Chg%",    0, 68.f);
-    if (m_showWeight)    ImGui::TableSetupColumn("Weight",      0, 58.f);
+    ImGui::TableSetupColumn("Qty",        ImGuiTableColumnFlags_WidthFixed, 60.f);
+    if (m_showAvgCost)   ImGui::TableSetupColumn("Avg Cost",    ImGuiTableColumnFlags_WidthFixed, 72.f);
+    ImGui::TableSetupColumn("Price",      ImGuiTableColumnFlags_WidthFixed, 72.f);
+    ImGui::TableSetupColumn("Mkt Value",  ImGuiTableColumnFlags_WidthFixed, 88.f);
+    if (m_showCostBasis) ImGui::TableSetupColumn("Cost Basis",  ImGuiTableColumnFlags_WidthFixed, 88.f);
+    ImGui::TableSetupColumn("Unreal P&L", ImGuiTableColumnFlags_WidthFixed, 88.f);
+    ImGui::TableSetupColumn("Unreal %",   ImGuiTableColumnFlags_WidthFixed, 68.f);
+    if (m_showRealPnL)   ImGui::TableSetupColumn("Real P&L",    ImGuiTableColumnFlags_WidthFixed, 88.f);
+    if (m_showDayChg)    ImGui::TableSetupColumn("Day Chg%",    ImGuiTableColumnFlags_WidthFixed, 68.f);
+    if (m_showWeight)    ImGui::TableSetupColumn("Weight",      ImGuiTableColumnFlags_WidthFixed, 58.f);
 
     ImGui::TableHeadersRow();
 
@@ -362,18 +392,19 @@ void PortfolioWindow::DrawPositionsTable()
 
         // Market Value
         ImGui::TableSetColumnIndex(col++);
-        ImGui::Text("$%s", FmtDollar(p.marketValue).c_str());
+        ImGui::Text("%s%s", CurrSym(m_account.baseCurrency), FmtDollar(p.marketValue).c_str());
 
         // Cost Basis
         if (m_showCostBasis) {
             ImGui::TableSetColumnIndex(col++);
-            ImGui::Text("$%s", FmtDollar(p.costBasis).c_str());
+            ImGui::Text("%s%s", CurrSym(m_account.baseCurrency), FmtDollar(p.costBasis).c_str());
         }
 
         // Unrealized P&L
         ImGui::TableSetColumnIndex(col++);
-        ImGui::TextColored(PnLColor(p.unrealizedPnL), "%s$%s",
+        ImGui::TextColored(PnLColor(p.unrealizedPnL), "%s%s%s",
                            p.unrealizedPnL >= 0 ? "+" : "-",
+                           CurrSym(m_account.baseCurrency),
                            FmtDollar(std::abs(p.unrealizedPnL)).c_str());
 
         // Unrealized %
@@ -383,8 +414,9 @@ void PortfolioWindow::DrawPositionsTable()
         // Realized P&L
         if (m_showRealPnL) {
             ImGui::TableSetColumnIndex(col++);
-            ImGui::TextColored(PnLColor(p.realizedPnL), "%s$%s",
+            ImGui::TextColored(PnLColor(p.realizedPnL), "%s%s%s",
                                p.realizedPnL >= 0 ? "+" : "-",
+                               CurrSym(m_account.baseCurrency),
                                FmtDollar(std::abs(p.realizedPnL)).c_str());
         }
 
@@ -450,7 +482,14 @@ void PortfolioWindow::DrawSideCharts()
 
 void PortfolioWindow::DrawEquityCurve()
 {
-    if (m_equityCurve.empty()) return;
+    if (m_equityCurve.empty()) {
+        float h = ImGui::GetContentRegionAvail().y;
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + h * 0.4f);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+            (ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Equity history builds as account updates arrive").x) * 0.5f);
+        ImGui::TextDisabled("Equity history builds as account updates arrive");
+        return;
+    }
 
     int n = static_cast<int>(m_equityCurve.size());
 
@@ -596,7 +635,8 @@ void PortfolioWindow::DrawAllocationDonut()
     // Center label
     {
         char buf1[32], buf2[32];
-        std::snprintf(buf1, sizeof(buf1), "$%s",
+        std::snprintf(buf1, sizeof(buf1), "%s%s",
+                      CurrSym(m_account.baseCurrency),
                       FmtDollar(m_account.netLiquidation).c_str());
         std::snprintf(buf2, sizeof(buf2), "Net Liq");
         ImVec2 sz1 = ImGui::CalcTextSize(buf1);
@@ -612,10 +652,11 @@ void PortfolioWindow::DrawAllocationDonut()
         const core::Position& hp = m_positions[hovered];
         ImGui::BeginTooltip();
         ImGui::Text("%s — %.1f%%", hp.symbol.c_str(), hp.portfolioWeight * 100.0);
-        ImGui::Text("Mkt Value: $%s", FmtDollar(hp.marketValue).c_str());
+        ImGui::Text("Mkt Value: %s%s", CurrSym(m_account.baseCurrency), FmtDollar(hp.marketValue).c_str());
         ImGui::TextColored(PnLColor(hp.unrealizedPnL),
-                           "Unreal P&L: %s$%s",
+                           "Unreal P&L: %s%s%s",
                            hp.unrealizedPnL >= 0 ? "+" : "-",
+                           CurrSym(m_account.baseCurrency),
                            FmtDollar(std::abs(hp.unrealizedPnL)).c_str());
         ImGui::EndTooltip();
     }
@@ -687,16 +728,17 @@ void PortfolioWindow::DrawTradeHistory()
 
     float tableH = ImGui::GetContentRegionAvail().y;
     ImGuiTableFlags tf = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg |
-                         ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV;
+                         ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV |
+                         ImGuiTableFlags_SizingFixedFit;
     if (!ImGui::BeginTable("##tradeHist", 7, tf, ImVec2(0, tableH))) return;
 
-    ImGui::TableSetupColumn("Date/Time", 0, 140.f);
-    ImGui::TableSetupColumn("Symbol",    0,  70.f);
-    ImGui::TableSetupColumn("Side",      0,  50.f);
-    ImGui::TableSetupColumn("Qty",       0,  60.f);
-    ImGui::TableSetupColumn("Price",     0,  72.f);
-    ImGui::TableSetupColumn("Comm.",     0,  60.f);
-    ImGui::TableSetupColumn("Real. P&L", 0,  88.f);
+    ImGui::TableSetupColumn("Date/Time", ImGuiTableColumnFlags_WidthFixed, 140.f);
+    ImGui::TableSetupColumn("Symbol",    ImGuiTableColumnFlags_WidthFixed,  70.f);
+    ImGui::TableSetupColumn("Side",      ImGuiTableColumnFlags_WidthFixed,  50.f);
+    ImGui::TableSetupColumn("Qty",       ImGuiTableColumnFlags_WidthFixed,  60.f);
+    ImGui::TableSetupColumn("Price",     ImGuiTableColumnFlags_WidthFixed,  72.f);
+    ImGui::TableSetupColumn("Comm.",     ImGuiTableColumnFlags_WidthFixed,  60.f);
+    ImGui::TableSetupColumn("Real. P&L", ImGuiTableColumnFlags_WidthFixed,  88.f);
     ImGui::TableHeadersRow();
 
     for (auto& t : m_trades) {
@@ -828,21 +870,23 @@ void PortfolioWindow::DrawRiskTab()
         else           ImGui::TextUnformatted(val);
     };
 
-    ImGuiTableFlags tf = ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersInnerH;
+    ImGuiTableFlags tf = ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersInnerH |
+                         ImGuiTableFlags_SizingFixedFit;
     if (!ImGui::BeginTable("##risk", 2, tf, ImVec2(380, 0))) return;
-    ImGui::TableSetupColumn("Metric", 0, 200.f);
+    ImGui::TableSetupColumn("Metric", ImGuiTableColumnFlags_WidthFixed, 200.f);
     ImGui::TableSetupColumn("Value",  ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableHeadersRow();
 
     char buf[64];
+    const char* cs2 = CurrSym(m_account.baseCurrency);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.netLiquidation).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.netLiquidation).c_str());
     Row("Net Liquidation", buf);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.totalCashValue).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.totalCashValue).c_str());
     Row("Total Cash Value", buf);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.grossPosValue).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.grossPosValue).c_str());
     Row("Gross Position Value", buf);
 
     std::snprintf(buf, sizeof(buf), "%.2fx", a.leverage);
@@ -851,19 +895,19 @@ void PortfolioWindow::DrawRiskTab()
                 :                    ImVec4(0.3f,0.9f,0.3f,1.f);
     Row("Leverage", buf, levC);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.initMarginReq).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.initMarginReq).c_str());
     Row("Initial Margin Req.", buf);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.maintMarginReq).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.maintMarginReq).c_str());
     Row("Maintenance Margin Req.", buf);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.excessLiquidity).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.excessLiquidity).c_str());
     ImVec4 exLiqC = a.excessLiquidity < a.maintMarginReq * 0.1
                     ? ImVec4(0.9f,0.3f,0.3f,1.f)
                     : ImVec4(0.3f,0.9f,0.3f,1.f);
     Row("Excess Liquidity", buf, exLiqC);
 
-    std::snprintf(buf, sizeof(buf), "$%s", FmtDollar(a.buyingPower).c_str());
+    std::snprintf(buf, sizeof(buf), "%s%s", cs2, FmtDollar(a.buyingPower).c_str());
     Row("Buying Power", buf);
 
     ImGui::EndTable();
@@ -891,8 +935,13 @@ void PortfolioWindow::RecalcAccountTotals()
         real     += p.realizedPnL;
     }
 
-    m_account.unrealizedPnL = unreal;
-    m_account.realizedPnL   = real;
+    // Only overwrite IB-provided account-level P&L when positions carry the data
+    // (updatePortfolio fills unrealizedPnL/realizedPnL per position; position()
+    // does not, so when positions arrived via reqPositions the sum is 0)
+    if (unreal != 0.0 || real != 0.0) {
+        m_account.unrealizedPnL = unreal;
+        m_account.realizedPnL   = real;
+    }
     m_account.grossPosValue = grossPos;
     m_account.leverage      = m_account.netLiquidation > 1e-9
                               ? grossPos / m_account.netLiquidation
@@ -940,194 +989,67 @@ void PortfolioWindow::SortPositions()
 }
 
 // ============================================================================
-// UpdateQuotes  (simulated live drift)
+// RecalcPerformanceMetrics  — computed from real trade records
 // ============================================================================
 
-void PortfolioWindow::UpdateQuotes()
+void PortfolioWindow::RecalcPerformanceMetrics()
 {
-    for (auto& p : m_positions) {
-        double d   = m_drift(m_rng);
-        double prev = p.marketPrice;
-        p.marketPrice += p.marketPrice * d;
-        p.marketPrice  = std::round(p.marketPrice * 100.0) / 100.0;
-        p.dayChange    += (p.marketPrice - prev);
-        p.dayChangePct  = p.avgCost > 0
-                          ? (p.marketPrice - p.avgCost) / p.avgCost * 100.0
-                          : 0.0;
+    m_perf = core::PerformanceMetrics{};
+    m_perf.dayReturn = m_account.dayPnLPct;
+
+    if (m_trades.empty()) return;
+
+    // Win rate, avg win, avg loss, profit factor from closed trades (SELL side)
+    double grossWin = 0.0, grossLoss = 0.0;
+    int wins = 0, losses = 0;
+    for (const auto& t : m_trades) {
+        if (t.side != "SELL") continue;
+        if (t.realizedPnL > 0) { grossWin  += t.realizedPnL; ++wins;   }
+        else if (t.realizedPnL < 0) { grossLoss += std::abs(t.realizedPnL); ++losses; }
+    }
+    int total = wins + losses;
+    if (total > 0) {
+        m_perf.winRate      = 100.0 * wins / total;
+        m_perf.avgWin       = wins   > 0 ? grossWin  / wins   : 0.0;
+        m_perf.avgLoss      = losses > 0 ? grossLoss / losses : 0.0;
+        m_perf.profitFactor = grossLoss > 1e-9 ? grossWin / grossLoss : 0.0;
     }
 
-    RecalcAccountTotals();
+    // Total realized P&L
+    double totalReal = 0.0;
+    for (const auto& t : m_trades) totalReal += t.realizedPnL;
+    m_perf.totalReturn = m_account.netLiquidation > 1e-9
+        ? (m_account.unrealizedPnL + totalReal) / (m_account.netLiquidation - m_account.unrealizedPnL - totalReal) * 100.0
+        : 0.0;
 
-    // Also push last equity curve point forward
-    if (!m_equityCurve.empty()) {
-        m_equityCurve.back().equity    = m_account.netLiquidation;
-        m_equityCurve.back().positions = m_account.grossPosValue;
+    // Equity-curve-based metrics (max drawdown, volatility) when we have data
+    if (m_equityCurve.size() >= 2) {
+        double peak = m_equityCurve[0].equity;
+        double maxDD = 0.0;
+        std::vector<double> dailyRets;
+        dailyRets.reserve(m_equityCurve.size());
+        for (size_t i = 1; i < m_equityCurve.size(); ++i) {
+            double prev = m_equityCurve[i-1].equity;
+            double cur  = m_equityCurve[i].equity;
+            if (cur > peak) peak = cur;
+            double dd = peak > 1e-9 ? (peak - cur) / peak * 100.0 : 0.0;
+            if (dd > maxDD) maxDD = dd;
+            if (prev > 1e-9) dailyRets.push_back((cur - prev) / prev);
+        }
+        m_perf.maxDrawdown = -maxDD;
+
+        if (!dailyRets.empty()) {
+            double mean = std::accumulate(dailyRets.begin(), dailyRets.end(), 0.0) / dailyRets.size();
+            double var  = 0.0;
+            for (double r : dailyRets) var += (r - mean) * (r - mean);
+            var /= dailyRets.size();
+            m_perf.volatility = std::sqrt(var) * std::sqrt(252.0) * 100.0;
+            // Annualized Sharpe (risk-free ≈ 5%)
+            double annRet = mean * 252.0;
+            double annStd = std::sqrt(var) * std::sqrt(252.0);
+            m_perf.sharpeRatio = annStd > 1e-9 ? (annRet - 0.05) / annStd : 0.0;
+        }
     }
-
-    // Day P&L vs previous close
-    double prevNetLiq = m_equityCurve.size() >= 2
-                        ? m_equityCurve[m_equityCurve.size()-2].equity
-                        : m_account.netLiquidation;
-    m_account.dayPnL    = m_account.netLiquidation - prevNetLiq;
-    m_account.dayPnLPct = prevNetLiq > 1e-9
-                          ? m_account.dayPnL / prevNetLiq * 100.0
-                          : 0.0;
-}
-
-// ============================================================================
-// Simulation helpers
-// ============================================================================
-
-void PortfolioWindow::SimulatePortfolio()
-{
-    // Seed account
-    m_account.accountId      = "U1234567";
-    m_account.accountType    = "INDIVIDUAL";
-    m_account.baseCurrency   = "USD";
-    m_account.totalCashValue = 42320.0;
-    m_account.settledCash    = 40100.0;
-    m_account.buyingPower    = 84640.0;        // 2x margin
-    m_account.initMarginReq  = 18500.0;
-    m_account.maintMarginReq = 14800.0;
-    m_account.excessLiquidity = 95000.0;
-
-    // Positions
-    struct Seed {
-        const char* sym; const char* desc; const char* cls;
-        double qty; double avgCost; double price; double realPnL;
-        double dayChgPct;
-    };
-    static const Seed kPos[] = {
-        {"AAPL",  "Apple Inc.",          "STK",  100, 155.40, 184.20, 320.00,  1.34},
-        {"MSFT",  "Microsoft Corp.",     "STK",   50, 380.20, 415.30, 820.00,  0.78},
-        {"NVDA",  "NVIDIA Corp.",        "STK",   30, 640.00, 876.50, 520.00,  4.32},
-        {"GOOGL", "Alphabet Inc.",       "STK",   20, 148.00, 172.63,  80.00,  1.48},
-        {"TSLA",  "Tesla Inc.",          "STK",  -50, 270.00, 247.10, 460.00, -5.09},
-        {"JPM",   "JPMorgan Chase",      "STK",   80, 195.00, 207.30, 120.00,  0.83},
-        {"GLD",   "SPDR Gold Shares",    "ETF",   40, 215.00, 237.80,  90.00,  0.93},
-        {"SPY",   "SPDR S&P 500 ETF",   "ETF",   25, 490.00, 530.50, 210.00,  0.52},
-    };
-
-    std::normal_distribution<double> startNoise{0.0, 0.002};
-    for (const auto& s : kPos) {
-        core::Position p;
-        p.symbol      = s.sym;
-        p.description = s.desc;
-        p.assetClass  = s.cls;
-        p.exchange    = "SMART";
-        p.currency    = "USD";
-        p.quantity    = s.qty;
-        p.avgCost     = s.avgCost;
-        p.marketPrice = s.price * (1.0 + startNoise(m_rng));
-        p.marketValue = p.quantity * p.marketPrice;
-        p.costBasis   = p.quantity * p.avgCost;
-        p.unrealizedPnL = p.marketValue - p.costBasis;
-        p.unrealizedPct = std::abs(p.costBasis) > 1e-9
-                          ? p.unrealizedPnL / std::abs(p.costBasis) * 100.0 : 0.0;
-        p.realizedPnL   = s.realPnL;
-        p.dayChangePct  = s.dayChgPct;
-        p.dayChange     = p.marketPrice * s.dayChgPct / 100.0;
-        p.updatedAt     = std::time(nullptr);
-        m_positions.push_back(std::move(p));
-    }
-
-    // Net liquidation = cash + market value of positions
-    double totalMktVal = 0.0;
-    for (auto& p : m_positions) totalMktVal += p.marketValue;
-    m_account.netLiquidation = m_account.totalCashValue + totalMktVal;
-    m_account.updatedAt = std::time(nullptr);
-}
-
-void PortfolioWindow::SimulateEquityCurve(int days)
-{
-    m_equityCurve.clear();
-    m_equityCurve.reserve(days);
-
-    // Start 'days' ago with ~80% of current equity
-    double equity = m_account.netLiquidation * 0.82;
-    double cash   = m_account.totalCashValue  * 0.75;
-
-    std::normal_distribution<double> nd{0.0008, 0.011}; // slight upward drift
-
-    std::time_t now = std::time(nullptr);
-    // Go back 'days' days (86400 seconds each)
-    std::time_t startT = now - (std::time_t)days * 86400;
-
-    // Skip to next weekday
-    struct tm* tmPtr;
-    std::tm   tmBuf;
-
-    for (int i = 0; i < days; ++i) {
-        std::time_t t = startT + (std::time_t)i * 86400;
-        tmPtr = std::localtime(&t);
-        if (!tmPtr) continue;
-        tmBuf = *tmPtr;
-        int wday = tmBuf.tm_wday;
-        if (wday == 0 || wday == 6) continue; // skip weekends
-
-        double r   = nd(m_rng);
-        equity    *= (1.0 + r);
-        cash      *= (1.0 + r * 0.05); // cash grows slowly
-
-        core::EquityPoint ep;
-        ep.date      = t;
-        ep.equity    = equity;
-        ep.cash      = cash;
-        ep.positions = equity - cash;
-        m_equityCurve.push_back(ep);
-    }
-
-    // Force last point to current values
-    if (!m_equityCurve.empty()) {
-        m_equityCurve.back().equity    = m_account.netLiquidation;
-        m_equityCurve.back().cash      = m_account.totalCashValue;
-        m_equityCurve.back().positions = m_account.grossPosValue;
-        m_equityCurve.back().date      = now;
-    }
-}
-
-void PortfolioWindow::SimulateTradeHistory(int count)
-{
-    static const char* syms[]  = {"AAPL","MSFT","NVDA","TSLA","GOOGL","META","AMZN","JPM","SPY","GLD"};
-    static const char* sides[] = {"BUY","SELL"};
-
-    std::uniform_int_distribution<int> symDist(0, 9);
-    std::uniform_int_distribution<int> sideDist(0, 1);
-    std::uniform_real_distribution<double> qtyDist(10, 200);
-    std::uniform_real_distribution<double> commDist(0.35, 4.50);
-    std::uniform_real_distribution<double> pnlDist(-800, 1200);
-
-    std::time_t now = std::time(nullptr);
-
-    for (int i = 0; i < count; ++i) {
-        core::TradeRecord t;
-        t.tradeId    = 10000 + i;
-        t.symbol     = syms[symDist(m_rng)];
-        t.side       = sides[sideDist(m_rng)];
-        t.quantity   = std::round(qtyDist(m_rng));
-        t.price      = 100.0 + m_rng() % 800;
-        t.commission = commDist(m_rng);
-        t.realizedPnL = t.side == "SELL" ? pnlDist(m_rng) : 0.0;
-        t.executedAt = now - (std::time_t)(i * 3600 + m_rng() % 1800);
-        m_trades.push_back(std::move(t));
-    }
-}
-
-void PortfolioWindow::SimulatePerformanceMetrics()
-{
-    m_perf.totalReturn  =  18.42;
-    m_perf.ytdReturn    =   7.81;
-    m_perf.mtdReturn    =   1.23;
-    m_perf.dayReturn    =   m_account.dayPnLPct;
-    m_perf.sharpeRatio  =   1.34;
-    m_perf.maxDrawdown  = -12.80;
-    m_perf.winRate      =  58.40;
-    m_perf.avgWin       = 412.50;
-    m_perf.avgLoss      = 278.30;
-    m_perf.profitFactor =   1.72;
-    m_perf.beta         =   0.91;
-    m_perf.alpha        =   4.20;
-    m_perf.volatility   =  14.30;
 }
 
 // ============================================================================

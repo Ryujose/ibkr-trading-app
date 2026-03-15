@@ -5,6 +5,7 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <atomic>
 #include <variant>
@@ -29,14 +30,17 @@ struct Bar;
 struct Contract;
 struct ContractDetails;
 struct Execution;
+struct Order;
 struct OrderCancel;
+struct OrderState;
+struct NewsProvider;
 
 namespace core::services {
 
 // ── Thread-safe message types (EReader thread → UI thread) ─────────────────
 
 struct MsgConnection  { bool connected; std::string info; };
-struct MsgBar         { int reqId; ::core::Bar bar; bool done; };
+struct MsgBar         { int reqId; ::core::Bar bar; bool done; bool isLive; };
 struct MsgTickPrice   { int tickerId; int field; double price; };
 struct MsgTickSize    { int tickerId; int field; double size; };
 struct MsgAccountVal  { std::string key, val, currency, account; };
@@ -51,14 +55,23 @@ struct MsgScanItem    { int reqId; ::core::ScanResult result; };
 struct MsgScanEnd     { int reqId; };
 struct MsgNews        { std::time_t ts; std::string provider;
                         std::string articleId; std::string headline; };
-struct MsgError       { int code; std::string msg; };
+struct MsgError       { int reqId; int code; std::string msg; };
 struct MsgNextOrderId { int orderId; };
+struct MsgOpenOrder      { ::core::Order order; };
+struct MsgOpenOrderEnd   {};
+struct MsgContractConId  { int reqId; long conId; };
+struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
+                           std::string articleId; std::string headline; };
+struct MsgHistoricalNewsEnd { int reqId; };
+struct MsgNewsArticle    { int reqId; std::string text; };
 
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
     MsgAccountVal, MsgPosition, MsgPortfolio, MsgOrderStatus,
     MsgFill, MsgDepth, MsgScanItem, MsgScanEnd, MsgNews,
-    MsgError, MsgNextOrderId
+    MsgError, MsgNextOrderId,
+    MsgOpenOrder, MsgOpenOrderEnd,
+    MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle
 >;
 
 // ============================================================================
@@ -81,8 +94,32 @@ public:
     // ── Outgoing requests ─────────────────────────────────────────────────
     void ReqHistoricalData(int reqId, const std::string& symbol,
                            const std::string& duration = "6 M",
-                           const std::string& barSize  = "1 day");
+                           const std::string& barSize  = "1 day",
+                           bool useRTH = true);
     void CancelHistoricalData(int reqId);
+
+    // Contract lookup (needed for reqHistoricalNews which takes conId, not symbol)
+    void ReqContractDetails(int reqId, const std::string& symbol);
+
+    // Historical news headlines for a specific contract.
+    // providerCodes: colon-separated, e.g. "BRFUPDN:BRFG:DJ-N"
+    //   empty → falls back to kFreeNewsProviders (all free providers)
+    void ReqHistoricalNews(int reqId, int conId, int totalResults = 25,
+                           const std::string& providerCodes = "");
+
+    // Subscribe to real-time news ticks (fires tickNews / onNewsItem).
+    // Uses "mdoff;292:PROVIDERS" so no market-data subscription is required.
+    // Call once after connection; cancel with CancelMarketData(reqId).
+    void SubscribeToNews(int reqId, const std::string& symbol = "AAPL");
+
+    // News provider codes available without a paid subscription.
+    // Used as default for both real-time and historical requests.
+    static constexpr const char* kFreeNewsProviders =
+        "BRFUPDN:BRFG:DJ-N:DJNL:DJ-RTA:DJ-RTE:DJ-RTG:DJ-RTPRO";
+
+    // Full article body for an articleId returned by historicalNews / tickNews
+    void ReqNewsArticle(int reqId, const std::string& providerCode,
+                        const std::string& articleId);
 
     // Market data type:
     //   1 = Live (requires active subscription)
@@ -107,9 +144,13 @@ public:
     void CancelScannerData(int reqId);
 
     void PlaceOrder(int orderId, const std::string& symbol,
-                    const std::string& action,     // "BUY" | "SELL"
-                    const std::string& orderType,  // "MKT" | "LMT"
-                    double qty, double limitPrice = 0.0);
+                    const std::string& action,       // "BUY" | "SELL"
+                    const std::string& orderType,    // "MKT","LMT","STP","STP LMT","TRAIL",…
+                    double qty,
+                    double price      = 0.0,         // lmt price or stop price for STP
+                    const std::string& tif = "DAY",  // "DAY","GTC","GTD"
+                    bool outsideRth   = false,
+                    double auxPrice   = 0.0);        // stop for STP LMT, trail amt for TRAIL*
     void CancelOrder(int orderId);
     void ReqOpenOrders();
 
@@ -119,7 +160,7 @@ public:
 
     // ── Callbacks (set once before/after Connect) ─────────────────────────
     std::function<void(bool connected, const std::string& info)>            onConnectionChanged;
-    std::function<void(int reqId, const ::core::Bar&, bool done)>           onBarData;
+    std::function<void(int reqId, const ::core::Bar&, bool done, bool isLive)> onBarData;
     std::function<void(int tickerId, int field, double price)>              onTickPrice;
     std::function<void(int tickerId, int field, double size)>               onTickSize;
     std::function<void(const std::string& key, const std::string& val,
@@ -137,8 +178,25 @@ public:
     std::function<void(std::time_t, const std::string& provider,
                        const std::string& id,
                        const std::string& headline)>                        onNewsItem;
-    std::function<void(int code, const std::string& msg)>                  onError;
+    std::function<void(int reqId, int code, const std::string& msg)>        onError;
     std::function<void(int nextOrderId)>                                    onNextValidId;
+
+    // Open orders (fired by reqOpenOrders and on submission confirmation)
+    std::function<void(const ::core::Order&)>                               onOpenOrder;
+    std::function<void()>                                                   onOpenOrderEnd;
+
+    // Contract details (fired once per request, carries the IB conId needed for news)
+    std::function<void(int reqId, long conId)>                              onContractConId;
+
+    // Historical news headlines
+    std::function<void(int reqId, std::time_t ts, const std::string& provider,
+                       const std::string& articleId,
+                       const std::string& headline)>                        onHistoricalNews;
+    std::function<void(int reqId)>                                          onHistoricalNewsEnd;
+
+    // Full article body (articleType 0 = plain text, 1 = HTML)
+    std::function<void(int reqId, int articleType,
+                       const std::string& text)>                            onNewsArticle;
 
 private:
     // ── IB API handles ────────────────────────────────────────────────────
@@ -148,7 +206,7 @@ private:
     std::thread              m_readerThread;
     std::atomic<bool>        m_running{false};
 
-    // ── Thread-safe queue ─────────────────────────────────────────────────
+    // ── Incoming message queue (EReader thread → UI thread) ──────────────
     std::mutex             m_queueMutex;
     std::vector<IBMessage> m_queue;
 
@@ -156,6 +214,22 @@ private:
         std::lock_guard<std::mutex> lk(m_queueMutex);
         m_queue.push_back(std::move(msg));
     }
+
+    // ── Outgoing send thread (prevents PlaceOrder blocking the UI thread) ─
+    // EClientSocket is not thread-safe for concurrent sends, so all outgoing
+    // IB calls go through a single dedicated send thread via this queue.
+    std::mutex                             m_sendMutex;
+    std::condition_variable                m_sendCv;
+    std::vector<std::function<void()>>     m_sendQueue;
+    std::thread                            m_sendThread;
+    std::atomic<bool>                      m_sendRunning{false};
+
+    void PostSend(std::function<void()> cmd);
+    void SendLoop();
+
+    // Fills cached by execId until commissionReport arrives to complete them
+    std::mutex                                       m_fillsMutex;
+    std::unordered_map<std::string, ::core::Fill>    m_pendingFills;
 
     // ── Helpers ───────────────────────────────────────────────────────────
     Contract MakeStockContract(const std::string& symbol) const;
@@ -209,6 +283,7 @@ private:
 
     void execDetails(int reqId, const Contract& contract,
                      const Execution& execution) override;
+    void commissionAndFeesReport(const CommissionAndFeesReport& report) override;
 
     void scannerData(int reqId, int rank,
                      const ContractDetails& contractDetails,
@@ -223,6 +298,22 @@ private:
                   const std::string& articleId,
                   const std::string& headline,
                   const std::string& extraData) override;
+
+    void openOrder(OrderId orderId, const Contract&,
+                   const ::Order&, const ::OrderState&) override;
+    void openOrderEnd() override;
+
+    void contractDetails(int reqId, const ContractDetails& cd) override;
+    void contractDetailsEnd(int reqId) override;
+
+    void historicalNews(int requestId, const std::string& time,
+                        const std::string& providerCode,
+                        const std::string& articleId,
+                        const std::string& headline) override;
+    void historicalNewsEnd(int requestId, bool hasMore) override;
+
+    void newsArticle(int requestId, int articleType,
+                     const std::string& articleText) override;
 };
 
 } // namespace core::services
