@@ -51,6 +51,16 @@ public:
     // Called when user double-clicks a row — host wires this to ChartWindow
     std::function<void(const std::string& symbol)> OnSymbolSelected;
 
+    // IB 52-week high/low tick (field 79/80 from generic tick list 165)
+    void Set52WHigh(const std::string& symbol, double high52);
+    void Set52WLow (const std::string& symbol, double low52);
+
+    // IB average volume tick (field 87 from generic tick list 221)
+    void SetAvgVolume(const std::string& symbol, double avgVol);
+
+    // IB previous-close tick (field 9 / 75→9 delayed) — recomputes change/% immediately
+    void SetPrevClose(const std::string& symbol, double prevClose);
+
     // Called by main once IB is connected — triggers a real IB scanner request
     std::function<void(const std::string& scanCode,
                        const std::string& instrument,

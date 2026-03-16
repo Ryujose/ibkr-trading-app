@@ -4,6 +4,7 @@
 #include "implot.h"
 
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
@@ -17,6 +18,30 @@
 namespace ui {
 
 static constexpr const char* kHistoryFile = "symbol_history.txt";
+
+// ============================================================================
+// Order type table — shared by DrawTradePanel and DrawOverlays
+// ============================================================================
+struct OrderTypeDef {
+    const char* label;
+    const char* ibStr;
+    bool needsPrice;    // arms chart-click price placement
+    bool needsTrail;    // show trail-amount input
+    bool isDualPrice;   // needs two interactive chart lines (stop + limit)
+};
+static constexpr OrderTypeDef kOrderTypes[] = {
+    { "Market",                    "MKT",         false, false, false },
+    { "Limit",                     "LMT",         true,  false, false },
+    { "Stop",                      "STP",         true,  false, false },
+    { "Stop Limit",                "STP LMT",     true,  false, true  },
+    { "Market to Limit",           "MTL",         false, false, false },
+    { "Adjustable Stop",           "STP",         true,  false, false },
+    { "Trailing",                  "TRAIL",       false, true,  false },
+    { "Trailing Limit",            "TRAIL LIMIT", false, true,  false },
+    { "Trailing Limit If Touched", "LIT",         true,  true,  false },
+    { "Trailing Market If Touched","MIT",         true,  true,  false },
+};
+static constexpr int kNumOrderTypes = (int)std::size(kOrderTypes);
 
 static constexpr core::Timeframe kAllTimeframes[] = {
     core::Timeframe::M1,  core::Timeframe::M5,  core::Timeframe::M15,
@@ -82,11 +107,19 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     if (symbol.empty() || symbol.size() >= sizeof(m_symbol)) return;
     std::memcpy(m_symbol, symbol.c_str(), symbol.size() + 1);
     m_viewInitialized = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
     // Reset drawing / order state so NoInputs is never left armed on the new symbol
     m_drawTool    = DrawTool::Cursor;
     m_drawPending = false;
     m_limitArmed  = false;
     m_ctrlClickPopup = false;
+    m_limitPlaced    = false;
+    m_placedDragging = false;
+    m_dragPendingIdx    = -1;
+    m_dragPendingActive = false;
+    m_dragPendingIsAux  = false;
+    m_firstPricePlaced  = false;
     AddToHistory(symbol);
     RequestNewData();
 }
@@ -114,9 +147,45 @@ void ChartWindow::SetHistoricalData(const core::BarSeries& series) {
     m_hasRealData     = true;
     m_needsRefresh    = false;
     m_loading         = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
     m_viewInitialized = false;
     RebuildFlatArrays();
     ComputeIndicators();
+}
+
+void ChartWindow::PrependHistoricalData(const core::BarSeries& older) {
+    m_loadingMore = false;
+    if (older.bars.empty()) {
+        m_historyAtStart = true;   // IB returned nothing — we're at the oldest data
+        return;
+    }
+
+    // Only keep bars strictly older than our current first bar to avoid duplicates
+    double firstTs = m_xs.empty() ? 1e18 : m_xs[0];
+    core::BarSeries merged;
+    merged.symbol    = m_series.symbol;
+    merged.timeframe = m_series.timeframe;
+    for (const auto& b : older.bars)
+        if (b.timestamp < firstTs) merged.bars.push_back(b);
+
+    if (merged.bars.empty()) {
+        m_historyAtStart = true;
+        return;
+    }
+
+    int prependCount = (int)merged.bars.size();
+
+    // Append existing bars after the older ones
+    for (const auto& b : m_series.bars) merged.bars.push_back(b);
+    m_series = std::move(merged);
+
+    RebuildFlatArrays();
+    ComputeIndicators();
+
+    // Shift the X axis links right so the visible window stays on the same candles
+    m_xMin += prependCount;
+    m_xMax += prependCount;
 }
 
 void ChartWindow::UpdateLiveBar(const core::Bar& bar) {
@@ -174,28 +243,29 @@ void ChartWindow::OnLastPrice(double price) {
 }
 
 void ChartWindow::EnsureTodayBar(double price) {
-    // Compute today's date in local time
+    // Use UTC for date comparisons so the result agrees with ParseIBTime's noon-UTC
+    // convention and with XTickFormatter which uses gmtime() for D1+ labels.
     std::time_t now = std::time(nullptr);
     struct tm nowTm{};
-    localtime_r(&now, &nowTm);
+    gmtime_r(&now, &nowTm);
 
-    // No bars on weekends — IB won't send ticks either, but guard anyway
+    // No bars on weekends
     if (nowTm.tm_wday == 0 || nowTm.tm_wday == 6) return;
 
     // Check if today's bar is already the last bar
     if (!m_xs.empty()) {
         std::time_t lastTs = static_cast<std::time_t>(m_xs.back());
         struct tm lastTm{};
-        localtime_r(&lastTs, &lastTm);
+        gmtime_r(&lastTs, &lastTm);
         if (nowTm.tm_year == lastTm.tm_year && nowTm.tm_yday == lastTm.tm_yday)
             return;  // already have today
     }
 
-    // Build today's bar at local midnight
-    struct tm midnight = nowTm;
-    midnight.tm_hour = midnight.tm_min = midnight.tm_sec = 0;
-    midnight.tm_isdst = -1;
-    auto todayTs = static_cast<double>(mktime(&midnight));
+    // Build today's bar at noon UTC — same convention as ParseIBTime("YYYYMMDD").
+    struct tm noon = nowTm;
+    noon.tm_hour = 12; noon.tm_min = noon.tm_sec = 0;
+    noon.tm_isdst = 0;
+    auto todayTs = static_cast<double>(timegm(&noon));
 
     core::Bar today{};
     today.timestamp = todayTs;
@@ -285,6 +355,11 @@ bool ChartWindow::Render() {
     if (!m_open) return false;
 
     ImGui::SetNextWindowSize(ImVec2(1000, 720), ImGuiCond_FirstUseEver);
+    // Enforce a minimum height so Volume / RSI sub-plots are never clipped out of view.
+    float minH = 460.0f;
+    if (m_ind.volume) minH += 90.0f;
+    if (m_ind.rsi)    minH += 90.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, minH), ImVec2(FLT_MAX, FLT_MAX));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (!ImGui::Begin("Chart", &m_open, flags)) {
         ImGui::End();
@@ -498,26 +573,7 @@ void ChartWindow::DrawAnalysisToolbar() {
 // Toolbar row 3 — trade panel
 // ============================================================================
 void ChartWindow::DrawTradePanel() {
-    // ── Order type definitions ──────────────────────────────────────────────
-    struct OrderTypeDef {
-        const char* label;   // displayed in combo
-        const char* ibStr;   // IB API string
-        bool needsPrice;     // arm chart-click mode
-        bool needsTrail;     // show trail amount input
-    };
-    static constexpr OrderTypeDef kOrderTypes[] = {
-        { "Market",                    "MKT",        false, false },
-        { "Limit",                     "LMT",        true,  false },
-        { "Stop",                      "STP",        true,  false },
-        { "Stop Limit",                "STP LMT",    true,  false },
-        { "Market to Limit",           "MTL",        false, false },
-        { "Adjustable Stop",           "STP",        true,  false },
-        { "Trailing",                  "TRAIL",      false, true  },
-        { "Trailing Limit",            "TRAIL LIMIT",false, true  },
-        { "Trailing Limit If Touched", "LIT",        true,  true  },
-        { "Trailing Market If Touched","MIT",        true,  true  },
-    };
-    static constexpr int kNumOrderTypes = (int)std::size(kOrderTypes);
+    // kOrderTypes, kNumOrderTypes defined at file scope above.
 
     static constexpr const char* kSessions[] = {
         "Regular", "Pre-Market", "After Hours", "Overnight"
@@ -539,8 +595,11 @@ void ChartWindow::DrawTradePanel() {
         for (int i = 0; i < kNumOrderTypes; i++) {
             bool sel = (i == m_orderTypeIdx);
             if (ImGui::Selectable(kOrderTypes[i].label, sel)) {
-                m_orderTypeIdx = i;
-                m_limitArmed   = false; // cancel any pending placement
+                m_orderTypeIdx     = i;
+                m_limitArmed       = false;
+                m_firstPricePlaced = false;
+                m_limitPlaced      = false;
+                m_placedDragging   = false;
             }
             if (sel) ImGui::SetItemDefaultFocus();
         }
@@ -552,18 +611,9 @@ void ChartWindow::DrawTradePanel() {
         ImGui::SameLine(0, 6);
         ImGui::TextDisabled("Trail $:");
         ImGui::SameLine(0, 4);
-        ImGui::SetNextItemWidth(58);
-        ImGui::InputDouble("##trail", &m_trailAmount, 0.01, 0.10, "%.2f");
+        ImGui::SetNextItemWidth(72);
+        ImGui::InputDouble("##trail", &m_trailAmount, 0.0, 0.0, "%.2f");
         if (m_trailAmount <= 0.0) m_trailAmount = 0.01;
-    }
-
-    // ── Stop-limit offset ────────────────────────────────────────────────
-    if (m_orderTypeIdx == 3) { // Stop Limit
-        ImGui::SameLine(0, 6);
-        ImGui::TextDisabled("Lmt offset $:");
-        ImGui::SameLine(0, 4);
-        ImGui::SetNextItemWidth(52);
-        ImGui::InputDouble("##lmtoff", &m_limitOffset, 0.01, 0.10, "%.2f");
     }
 
     // ── Session ─────────────────────────────────────────────────────────────
@@ -605,14 +655,21 @@ void ChartWindow::DrawTradePanel() {
     bool sellClicked = ImGui::Button(" SELL  ##ord", ImVec2(72, 26));
     ImGui::PopStyleColor(3);
 
-    // ── Status hint when armed ──────────────────────────────────────────────
+    // ── Status hint when armed ───────────────────────────────────────────────
     if (m_limitArmed) {
         ImGui::SameLine(0, 12);
         ImVec4 hintCol = (m_limitSide == "BUY")
                          ? ImVec4(0.4f, 0.7f, 1.f, 1.f)
                          : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-        ImGui::TextColored(hintCol,
-            "Hover chart → click [Ctrl+click to confirm]  [Esc=cancel]");
+        if (m_firstPricePlaced)
+            ImGui::TextColored(hintCol,
+                "Stop set — click chart to set limit price | Esc=cancel");
+        else if (kOrderTypes[m_orderTypeIdx].isDualPrice)
+            ImGui::TextColored(hintCol,
+                "Click chart to set STOP price | Esc=cancel");
+        else
+            ImGui::TextColored(hintCol,
+                "Click to send | Ctrl+click for confirmation | Esc=cancel");
     }
 
     // ── Ctrl+Click price confirmation popup ─────────────────────────────────
@@ -640,15 +697,15 @@ void ChartWindow::DrawTradePanel() {
         bool cancel = ImGui::Button("Cancel##cp",  ImVec2(80, 0));
         if (confirm) {
             if (OnOrderSubmit) {
-                const auto& ot = kOrderTypes[m_orderTypeIdx];
+                const auto& ot  = kOrderTypes[m_orderTypeIdx];
                 bool outsideRth = (m_sessionIdx != 0);
                 std::string tif = kTIFs[m_tifIdx];
-                double aux = ot.needsTrail ? m_trailAmount
-                           : (m_orderTypeIdx == 3 ? m_pendingPrice - m_limitOffset : 0.0);
+                double aux = ot.needsTrail ? m_trailAmount : 0.0;
                 OnOrderSubmit(m_symbol, m_limitSide, ot.ibStr,
                               m_orderQty, m_pendingPrice, tif, outsideRth, aux);
             }
-            m_limitArmed = false;
+            m_limitArmed       = false;
+            m_firstPricePlaced = false;
             ImGui::CloseCurrentPopup();
         }
         if (cancel) ImGui::CloseCurrentPopup();
@@ -676,9 +733,10 @@ void ChartWindow::DrawTradePanel() {
     if (buyClicked)  fireOrder("BUY");
     if (sellClicked) fireOrder("SELL");
 
-    // Escape cancels armed placement
+    // Escape cancels armed state (both phases)
     if (m_limitArmed && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        m_limitArmed = false;
+        m_limitArmed       = false;
+        m_firstPricePlaced = false;
     }
 }
 
@@ -816,6 +874,44 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     bool hovered   = ImGui::IsMouseHoveringRect(pMin, pMax, false);
     ImPlotPoint mp = hovered ? ImPlot::GetPlotMousePos() : ImPlotPoint{0, 0};
 
+    // ── Position break-even line ──────────────────────────────────────────────
+    // Shows the price at which net P&L = 0 after the commissions already paid.
+    // For long: be = avgCost + commission/qty.  For short: commission/qty is negative.
+    if (m_position.hasPosition && std::abs(m_position.qty) > 1e-9 &&
+        m_position.avgCost > 0.0) {
+        double qty  = m_position.qty;
+        double comm = m_position.commission;
+        double be   = m_position.avgCost + (comm > 1e-9 ? comm / qty : 0.0);
+
+        static constexpr ImU32 kBeCol = IM_COL32(255, 215,  50, 220);
+        static constexpr ImU32 kBeBg  = IM_COL32( 70,  55,   5, 235);
+
+        ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, be);
+        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, be);
+        DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, kBeCol, 1.5f, 5.f, 3.f);
+
+        // Centre label
+        char beBuf[80];
+        if (comm > 1e-9)
+            std::snprintf(beBuf, sizeof(beBuf),
+                          " B/E  $%.2f   (net 0 incl. $%.2f comm) ", be, comm);
+        else
+            std::snprintf(beBuf, sizeof(beBuf), " B/E  $%.2f ", be);
+        ImVec2 beSz = ImGui::CalcTextSize(beBuf);
+        float  beX  = lp0.x + 20.f;
+        dl->AddRectFilled(ImVec2(beX - 2, lp0.y - 8),
+                          ImVec2(beX + beSz.x + 2, lp0.y + 8), kBeBg, 2.f);
+        dl->AddText(ImVec2(beX, lp0.y - 7), kBeCol, beBuf);
+
+        // Right-edge price tag
+        char edgeBuf[24];
+        std::snprintf(edgeBuf, sizeof(edgeBuf), " B/E %.2f ", be);
+        ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
+        dl->AddRectFilled(ImVec2(lp1.x, lp0.y - 9),
+                          ImVec2(lp1.x + eSz.x + 4, lp0.y + 9), kBeBg, 2.f);
+        dl->AddText(ImVec2(lp1.x + 2, lp0.y - 7), kBeCol, edgeBuf);
+    }
+
     // ── Render stored drawings ─────────────────────────────────────────────
     for (const auto& dr : m_drawings) {
         switch (dr.type) {
@@ -877,7 +973,7 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     }
 
     // ── Handle drawing tool clicks ─────────────────────────────────────────
-    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (hovered && !m_limitArmed && !m_dragPendingActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         double yTol = (m_priceMax - m_priceMin) * 0.015;
         double xTol = (m_xMax - m_xMin) * 0.015;
 
@@ -920,101 +1016,328 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     }
 
     // ── Pending order lines (from live orders for this symbol) ────────────
-    for (const auto& order : m_pendingOrders) {
-        if (order.price <= 0.0) continue;
-        ImU32 lineCol = order.isBuy ? IM_COL32( 60, 140, 255, 200)
-                                    : IM_COL32(255,  80,  80, 200);
-        ImU32 txtCol  = order.isBuy ? IM_COL32(140, 190, 255, 255)
-                                    : IM_COL32(255, 140, 140, 255);
-
-        ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, order.price);
-        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, order.price);
-        DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol, 1.5f, 8.f, 5.f);
-
-        char lbl[64];
-        std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f ",
-                      order.isBuy ? "BUY" : "SELL", order.qty, order.price);
-        ImVec2 lblSz = ImGui::CalcTextSize(lbl);
-        float  lblX  = lp0.x + 6.f;
-        dl->AddRectFilled(ImVec2(lblX - 2, lp0.y - 8),
-                          ImVec2(lblX + lblSz.x + 2, lp0.y + 8),
-                          IM_COL32(20, 20, 30, 200));
-        dl->AddText(ImVec2(lblX, lp0.y - 7), txtCol, lbl);
-
-        // ✕ cancel button
-        float  btnX = lblX + lblSz.x + 4.f;
-        float  btnY = lp0.y - 7.f;
-        ImVec2 btnMin(btnX, btnY);
-        ImVec2 btnMax(btnX + 14.f, btnY + 14.f);
-        bool   hoverBtn = ImGui::IsMouseHoveringRect(btnMin, btnMax, false);
-        dl->AddRectFilled(btnMin, btnMax,
-                          hoverBtn ? IM_COL32(200, 50, 50, 220)
-                                   : IM_COL32(120, 30, 30, 180));
-        dl->AddText(ImVec2(btnX + 3, btnY), IM_COL32(255, 210, 210, 255), "x");
-        if (hoverBtn && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (OnCancelOrder) OnCancelOrder(order.orderId);
-        }
+    // Clear stale drag state if the dragged order was removed mid-frame
+    // (e.g. cancel fired during rendering and SetPendingOrders() shrank the vector).
+    if (m_dragPendingActive &&
+        m_dragPendingIdx >= (int)m_pendingOrders.size()) {
+        m_dragPendingActive = false;
+        m_dragPendingIdx    = -1;
+        m_dragPendingIsAux  = false;
     }
 
-    // ── Limit / Stop price line ────────────────────────────────────────────
-    if (m_limitArmed && hovered) {
-        // Snap to the minimum price variation (0.01 for US equities >= $1).
-        // IB rejects orders whose price doesn't conform (error 110).
-        double price  = std::round(mp.y / 0.01) * 0.01;
-        bool   isBuy  = (m_limitSide == "BUY");
-        ImU32  lineCol = isBuy ? IM_COL32( 80, 140, 255, 220)
-                               : IM_COL32(255,  80,  80, 220);
-        ImU32  txtCol  = isBuy ? IM_COL32(140, 180, 255, 255)
-                               : IM_COL32(255, 130, 130, 255);
+    // Cancel drag if Escape pressed
+    if (m_dragPendingActive && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        m_dragPendingActive = false;
+        m_dragPendingIdx    = -1;
+        m_dragPendingIsAux  = false;
+    }
 
-        ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, price);
-        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, price);
-        DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol, 1.5f, 8.f, 5.f);
+    // Helper: draw one draggable price line for a pending order leg
+    // Returns true when drag commits (caller updates the order).
+    // isAux=false → main (stop/trigger) leg; isAux=true → aux (limit) leg.
+    auto drawOrderLeg = [&](int oi, bool isAux) {
+        auto& order = m_pendingOrders[oi];
+        double legPrice = isAux ? order.auxPrice : order.price;
+        if (legPrice <= 0.0) return;
 
-        bool ctrlHeld = ImGui::GetIO().KeyCtrl;
+        bool isDragging = m_dragPendingActive && m_dragPendingIdx == oi
+                          && m_dragPendingIsAux == isAux;
+        double drawPrice = isDragging ? m_dragPendingPrice : legPrice;
 
-        // Price label at right edge (shows Ctrl hint)
-        char priceBuf[48];
-        if (ctrlHeld)
-            std::snprintf(priceBuf, sizeof(priceBuf), " %s  $%.2f  [Ctrl: confirm]",
-                          m_limitSide.c_str(), price);
-        else
-            std::snprintf(priceBuf, sizeof(priceBuf), " %s  $%.2f",
-                          m_limitSide.c_str(), price);
-        ImVec2 lblSz = ImGui::CalcTextSize(priceBuf);
-        dl->AddRectFilled(ImVec2(lp1.x, lp0.y - 9),
-                          ImVec2(lp1.x + lblSz.x + 6, lp0.y + 9),
-                          IM_COL32(30, 30, 30, 210));
-        dl->AddText(ImVec2(lp1.x + 3, lp0.y - 7), txtCol, priceBuf);
+        // Color: main leg uses side color; aux (limit) leg uses orange
+        ImU32 lineCol, txtCol, lblBg;
+        if (isAux) {
+            lineCol = isDragging ? IM_COL32(255, 180,  50, 255) : IM_COL32(220, 140,  30, 210);
+            txtCol  = IM_COL32(255, 230, 160, 255);
+            lblBg   = IM_COL32(100,  55,   5, 255);
+        } else {
+            lineCol = order.isBuy
+                      ? (isDragging ? IM_COL32(100,190,255,255) : IM_COL32( 60,140,255,200))
+                      : (isDragging ? IM_COL32(255,130,100,255) : IM_COL32(255, 80, 80,200));
+            txtCol  = order.isBuy ? IM_COL32(190,230,255,255) : IM_COL32(255,190,160,255);
+            lblBg   = order.isBuy ? IM_COL32(10,45,110,255)   : IM_COL32(110,20, 20,255);
+        }
 
-        // Click to place (or Ctrl+click to open confirmation popup)
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            if (ctrlHeld) {
-                // Open confirmation popup with price pre-filled
-                m_pendingPrice   = price;
-                m_ctrlClickPopup = true;
-                // popup is opened in DrawTradePanel next frame
+        ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, drawPrice);
+        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, drawPrice);
+
+        // ── Position-aware P&L helper ─────────────────────────────────────────
+        // Returns net P&L (gross minus entry commission) when this order closes the
+        // current position at the given price; returns NaN when not applicable.
+        auto calcOrderPnL = [&](double price) -> double {
+            if (isAux) return std::nan("");            // aux leg: P&L on main leg
+            if (!m_position.hasPosition) return std::nan("");
+            double posQty = m_position.qty;
+            bool closingLong  = !order.isBuy && posQty >  1e-9;
+            bool closingShort =  order.isBuy && posQty < -1e-9;
+            if (!closingLong && !closingShort) return std::nan("");
+            double closeQty = std::min((double)order.qty, std::abs(posQty));
+            double gross = closingLong
+                           ? (price - m_position.avgCost) * closeQty
+                           : (m_position.avgCost - price) * closeQty;
+            return gross - m_position.commission;
+        };
+
+        // Pre-compute label text and cancel-button rect so we can exclude the
+        // button area from the drag-start hit-test (same click must not do both).
+        char lbl[128];
+        const char* legTag = isAux ? "LMT" : (order.orderType == "STP LMT" ? "STP" : "");
+        {
+            double pnl = calcOrderPnL(drawPrice);
+            if (isDragging) {
+                if (!std::isnan(pnl))
+                    std::snprintf(lbl, sizeof(lbl),
+                                  " %s %.0f  $%.2f   P&L %+.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %s%.0f  $%.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL",
+                                  legTag[0] ? legTag : "", order.qty, drawPrice);
+            } else if (legTag[0]) {
+                std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f ",
+                              order.isBuy ? "BUY" : "SELL", legTag, drawPrice);
+            } else if (!std::isnan(pnl)) {
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
             } else {
-                // Immediate submit
-                struct OT { const char* ibStr; bool needsTrail; };
-                static constexpr OT kOT[] = {
-                    {"MKT",false},{"LMT",false},{"STP",false},{"STP LMT",false},
-                    {"MTL",false},{"STP",false},{"TRAIL",true},{"TRAIL LIMIT",true},
-                    {"LIT",true},{"MIT",true}
-                };
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice);
+            }
+        }
+
+        ImVec2 lblSz  = ImGui::CalcTextSize(lbl);
+        float  lblX   = lp0.x + 20.f;
+        float  btnX   = lblX + lblSz.x + 4.f;
+        float  btnY   = lp0.y - 7.f;
+        ImVec2 btnMin(btnX, btnY), btnMax(btnX + 14.f, btnY + 14.f);
+        bool   cancelBtnHovered = !isAux && !isDragging &&
+                                  ImGui::IsMouseHoveringRect(btnMin, btnMax, false);
+
+        // Proximity + interaction guard
+        bool canInteract = !m_limitArmed &&
+                           (!m_dragPendingActive || isDragging);
+        bool nearLine    = canInteract && hovered && !cancelBtnHovered &&
+                           std::abs(ImGui::GetIO().MousePos.y - lp0.y) < 8.f;
+
+        // Start drag (excluded when cursor is on the cancel button)
+        if (nearLine && !m_dragPendingActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            m_dragPendingIdx    = oi;
+            m_dragPendingActive = true;
+            m_dragPendingIsAux  = isAux;
+            m_dragPendingPrice  = legPrice;
+        }
+
+        // Update / commit drag
+        if (isDragging) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                m_dragPendingPrice = std::round(mp.y / 0.01) * 0.01;
+                lp0 = ImPlot::PlotToPixels(m_xMin, m_dragPendingPrice);
+                lp1 = ImPlot::PlotToPixels(m_xMax, m_dragPendingPrice);
+                drawPrice = m_dragPendingPrice;
+            } else {
+                // Released — optimistic update + callback
+                if (m_dragPendingPrice != legPrice) {
+                    double newMain = isAux ? order.price          : m_dragPendingPrice;
+                    double newAux  = isAux ? m_dragPendingPrice   : order.auxPrice;
+                    if (isAux) order.auxPrice = m_dragPendingPrice;
+                    else       order.price    = m_dragPendingPrice;
+                    if (OnModifyOrder)
+                        OnModifyOrder(order.orderId, newMain, newAux);
+                }
+                m_dragPendingActive = false;
+                m_dragPendingIdx    = -1;
+                m_dragPendingIsAux  = false;
+                isDragging = false;
+                drawPrice  = legPrice;  // already updated above
+            }
+        }
+
+        // Rebuild label with the live drawPrice (updated above during drag) so the
+        // displayed price and P&L always match where the line is actually drawn.
+        if (isDragging || !std::isnan(calcOrderPnL(drawPrice))) {
+            double pnl = calcOrderPnL(drawPrice);
+            if (isDragging) {
+                if (!std::isnan(pnl))
+                    std::snprintf(lbl, sizeof(lbl),
+                                  " %s %.0f  $%.2f   P&L %+.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %s%.0f  $%.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL",
+                                  legTag[0] ? legTag : "", order.qty, drawPrice);
+            } else if (!std::isnan(pnl)) {
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+            }
+            lblSz = ImGui::CalcTextSize(lbl);
+        }
+
+        float lineThick = (nearLine || isDragging) ? 2.5f : 1.5f;
+        DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol, lineThick, 8.f, 5.f);
+
+        // Grip dots
+        if (nearLine || isDragging) {
+            for (int gi = 0; gi < 3; gi++) {
+                float gy = lp0.y - 4.f + gi * 4.f;
+                dl->AddCircleFilled(ImVec2(lp0.x + 10.f, gy), 2.f,
+                                    IM_COL32(220,220,220,200));
+            }
+        }
+
+        // Label (text pre-computed above)
+        dl->AddRectFilled(ImVec2(lblX-2, lp0.y-8), ImVec2(lblX+lblSz.x+2, lp0.y+8),
+                          lblBg, 2.f);
+        dl->AddText(ImVec2(lblX, lp0.y-7), txtCol, lbl);
+
+        // ✕ cancel button on main leg only, not while dragging
+        if (!isAux && !isDragging) {
+            bool hoverBtn = cancelBtnHovered;
+            dl->AddRectFilled(btnMin, btnMax,
+                              hoverBtn ? IM_COL32(200,50,50,220) : IM_COL32(120,30,30,180));
+            dl->AddText(ImVec2(btnX+3, btnY), IM_COL32(255,210,210,255), "x");
+            if (hoverBtn && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                if (OnCancelOrder) OnCancelOrder(order.orderId);
+        }
+    };
+
+    for (int oi = 0; oi < (int)m_pendingOrders.size(); oi++) {
+        auto& order = m_pendingOrders[oi];
+        if (order.price <= 0.0) continue;
+        bool isDualOrder = (order.orderType == "STP LMT" && order.auxPrice > 0.0);
+        drawOrderLeg(oi, false);          // main (stop / limit) leg
+        // Guard: OnCancelOrder fired inside drawOrderLeg may have replaced
+        // m_pendingOrders (via SetPendingOrders). Check index is still valid.
+        if (isDualOrder && oi < (int)m_pendingOrders.size())
+            drawOrderLeg(oi, true);       // aux (limit) leg — orange
+    }
+
+    // ── Armed price line(s) ───────────────────────────────────────────────
+    if (m_limitArmed && hovered) {
+        static constexpr const char* kTIFs[] = {"DAY","GTC","GTD"};
+        bool isDual   = kOrderTypes[m_orderTypeIdx].isDualPrice;
+        bool isBuy    = (m_limitSide == "BUY");
+        double cursorPrice = std::round(mp.y / 0.01) * 0.01;
+
+        // Helper: draw a floating dashed line with a price bubble at the cursor.
+        // pnl=NaN → no P&L annotation.
+        auto drawArmedLine = [&](double linePrice, ImU32 lineCol, ImU32 bubBg,
+                                  const char* tag, bool followsCursor,
+                                  double pnl = std::numeric_limits<double>::quiet_NaN()) {
+            ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, linePrice);
+            ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, linePrice);
+            DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol,
+                            followsCursor ? 2.0f : 2.5f, 8.f, 5.f);
+
+            // Floating price bubble at cursor X (or center for fixed line)
+            char bubBuf[64];
+            if (!std::isnan(pnl))
+                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f   P&L %+.2f",
+                              tag[0] ? tag : m_limitSide.c_str(), linePrice, pnl);
+            else
+                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f",
+                              tag[0] ? tag : m_limitSide.c_str(), linePrice);
+            ImVec2 bubSz  = ImGui::CalcTextSize(bubBuf);
+            float  mouseX = followsCursor
+                            ? ImGui::GetIO().MousePos.x
+                            : (lp0.x + lp1.x) * 0.5f;
+            mouseX = std::max(pMin.x + 4.f,
+                              std::min(pMax.x - bubSz.x - 12.f, mouseX));
+            float bx = mouseX, by = lp0.y - bubSz.y - 6.f;
+            dl->AddRectFilled(ImVec2(bx-4, by), ImVec2(bx+bubSz.x+6, by+bubSz.y+4),
+                              bubBg, 3.f);
+            dl->AddText(ImVec2(bx, by+2), IM_COL32(255,255,255,255), bubBuf);
+            float midX = bx + bubSz.x * 0.5f;
+            dl->AddTriangleFilled(ImVec2(midX-4, by+bubSz.y+4),
+                                  ImVec2(midX+4, by+bubSz.y+4),
+                                  ImVec2(midX,   lp0.y), bubBg);
+
+            // Right-edge label (shows P&L when available)
+            char edgeBuf[64];
+            if (!std::isnan(pnl))
+                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f   %+.2f ",
+                              m_limitSide.c_str(), tag, linePrice, pnl);
+            else
+                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f ",
+                              m_limitSide.c_str(), tag, linePrice);
+            ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
+            dl->AddRectFilled(ImVec2(lp1.x, lp0.y-9),
+                              ImVec2(lp1.x+eSz.x+4, lp0.y+9), bubBg, 2.f);
+            dl->AddText(ImVec2(lp1.x+2, lp0.y-7), IM_COL32(255,255,255,255), edgeBuf);
+        };
+
+        // Compute P&L for an armed (new) order at the given price against the position.
+        auto calcArmedPnL = [&](double price) -> double {
+            if (!m_position.hasPosition || std::abs(m_position.qty) < 1e-9 ||
+                m_position.avgCost <= 0.0)
+                return std::numeric_limits<double>::quiet_NaN();
+            bool closingLong  = (m_limitSide == "SELL") && (m_position.qty >  1e-9);
+            bool closingShort = (m_limitSide == "BUY")  && (m_position.qty < -1e-9);
+            if (!closingLong && !closingShort)
+                return std::numeric_limits<double>::quiet_NaN();
+            double closeQty = std::min((double)m_orderQty, std::abs(m_position.qty));
+            double gross = closingLong
+                           ? (price - m_position.avgCost) * closeQty
+                           : (m_position.avgCost - price) * closeQty;
+            return gross - m_position.commission;
+        };
+
+        // Colors
+        ImU32 stopCol = isBuy ? IM_COL32( 80,140,255,220) : IM_COL32(255, 80, 80,220);
+        ImU32 stopBg  = isBuy ? IM_COL32( 15, 55,130,255) : IM_COL32(130, 25, 25,255);
+        ImU32 lmtCol  = IM_COL32(220,140, 30,220);
+        ImU32 lmtBg   = IM_COL32(100, 55,  5,255);
+
+        if (isDual && m_firstPricePlaced) {
+            // Phase 2: fixed stop line + moving limit line
+            // P&L shown on the limit leg (the fill price that determines profit)
+            drawArmedLine(m_firstPrice, stopCol, stopBg, "STOP", false);
+            drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
+                          calcArmedPnL(cursorPrice));
+
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (OnOrderSubmit) {
                     bool outsideRth = (m_sessionIdx != 0);
-                    static constexpr const char* kTIFs[] = {"DAY","GTC","GTD"};
-                    double rawAux = kOT[m_orderTypeIdx].needsTrail ? m_trailAmount
-                                 : (m_orderTypeIdx == 3 ? price - m_limitOffset : 0.0);
-                    double aux = (m_orderTypeIdx == 3)
-                                 ? std::round(rawAux / 0.01) * 0.01
-                                 : rawAux;
-                    OnOrderSubmit(m_symbol, m_limitSide, kOT[m_orderTypeIdx].ibStr,
-                                  m_orderQty, price,
-                                  kTIFs[m_tifIdx], outsideRth, aux);
+                    // STP LMT: price=stopTrigger, auxPrice=limitPrice
+                    OnOrderSubmit(m_symbol, m_limitSide,
+                                  kOrderTypes[m_orderTypeIdx].ibStr,
+                                  m_orderQty, m_firstPrice,
+                                  kTIFs[m_tifIdx], outsideRth, cursorPrice);
                 }
-                m_limitArmed = false;
+                m_limitArmed       = false;
+                m_firstPricePlaced = false;
+            }
+        } else {
+            // Phase 1: single moving line (stop/trigger for dual, price for single)
+            const char* tag = isDual ? "STOP" : "";
+            // For dual types the P&L is shown later (phase 2 limit leg); for single types
+            // show it now — a stop on a long position exits at the stop price.
+            double armedPnL = isDual ? std::numeric_limits<double>::quiet_NaN()
+                                     : calcArmedPnL(cursorPrice);
+            drawArmedLine(cursorPrice, stopCol, stopBg, tag, true, armedPnL);
+
+            bool ctrlHeld = ImGui::GetIO().KeyCtrl;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                if (isDual) {
+                    // Dual-price: lock stop price, arm limit line
+                    m_firstPrice       = cursorPrice;
+                    m_firstPricePlaced = true;
+                    // m_limitArmed stays true for phase 2
+                } else if (ctrlHeld) {
+                    m_pendingPrice   = cursorPrice;
+                    m_ctrlClickPopup = true;
+                } else {
+                    // Single-price: immediate send
+                    if (OnOrderSubmit) {
+                        bool outsideRth = (m_sessionIdx != 0);
+                        double aux = kOrderTypes[m_orderTypeIdx].needsTrail
+                                     ? m_trailAmount : 0.0;
+                        OnOrderSubmit(m_symbol, m_limitSide,
+                                      kOrderTypes[m_orderTypeIdx].ibStr,
+                                      m_orderQty, cursorPrice,
+                                      kTIFs[m_tifIdx], outsideRth, aux);
+                    }
+                    m_limitArmed = false;
+                }
             }
         }
     }
@@ -1097,13 +1420,16 @@ void ChartWindow::DrawCandleChart() {
     float chartH    = available - volumeH - rsiH
                       - (m_ind.volume ? spacing : 0.0f)
                       - (m_ind.rsi    ? spacing : 0.0f);
+    chartH  = std::max(chartH,  80.0f);
+    volumeH = std::max(volumeH, m_ind.volume ? 60.0f : 0.0f);
+    rsiH    = std::max(rsiH,    m_ind.rsi    ? 60.0f : 0.0f);
 
-    // Disable ImPlot panning for drawing tools.
+    // Disable ImPlot panning for drawing tools and while dragging an order line.
     // Do NOT add NoInputs for m_limitArmed: ImPlot must keep its mouse-position
     // state live so GetPlotMousePos() returns the correct price on click.
     bool drawingActive = (m_drawTool != DrawTool::Cursor);
     ImPlotFlags plotFlags = ImPlotFlags_NoMouseText;
-    if (drawingActive) plotFlags |= ImPlotFlags_NoInputs;
+    if (drawingActive || m_dragPendingActive) plotFlags |= ImPlotFlags_NoInputs;
 
     if (!ImPlot::BeginPlot("##candles", ImVec2(-1, chartH), plotFlags))
         return;
@@ -1115,6 +1441,21 @@ void ChartWindow::DrawCandleChart() {
     ImPlot::SetupAxisLinks(ImAxis_X1, &m_xMin, &m_xMax);
     ImPlot::SetupAxisLinks(ImAxis_Y1, &m_priceMin, &m_priceMax);
     ImPlot::SetupFinish();
+
+    // ── Pan-to-load-more: fire OnExtendHistory when user drags past first bar ──
+    // Trigger when the left edge of the view is 3+ bars before the start of data.
+    if (!m_loading && !m_loadingMore && !m_historyAtStart &&
+        !m_xs.empty() && m_xMin < -3.0 && OnExtendHistory) {
+        m_loadingMore = true;
+        // Format the timestamp of the first bar as IB endDateTime (1 second before
+        // so the new series ends strictly before what we already have).
+        std::time_t endTs = static_cast<std::time_t>(m_xs[0]) - 1;
+        struct tm   endTm{};
+        gmtime_r(&endTs, &endTm);
+        char endBuf[32];
+        std::strftime(endBuf, sizeof(endBuf), "%Y%m%d %H:%M:%S UTC", &endTm);
+        OnExtendHistory(m_symbol, m_timeframe, endBuf, m_useRTH);
+    }
 
     // Session background bands (pre/post/overnight shading)
     DrawSessionBands();
@@ -1373,6 +1714,8 @@ void ChartWindow::DrawVolumeChart() {
     float available = ImGui::GetContentRegionAvail().y;
     float rsiH      = m_ind.rsi ? available * (0.20f / (1.0f - m_volumeHeightRatio)) : 0.0f;
     float volH      = available - rsiH - (m_ind.rsi ? ImGui::GetStyle().ItemSpacing.y : 0.0f);
+    rsiH = std::max(rsiH, m_ind.rsi ? 60.0f : 0.0f);
+    volH = std::max(volH, 60.0f);
 
     double maxVol = 1.0;
     for (int i = 0; i < n; i++)
@@ -1411,7 +1754,8 @@ void ChartWindow::DrawRsiChart() {
     int n = (int)m_idxs.size();
     if (n == 0 || (int)m_rsi.size() != n) return;
 
-    if (!ImPlot::BeginPlot("##rsi", ImVec2(-1, -1),
+    float rsiAvail = std::max(60.0f, ImGui::GetContentRegionAvail().y);
+    if (!ImPlot::BeginPlot("##rsi", ImVec2(-1, rsiAvail),
                            ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
         return;
 

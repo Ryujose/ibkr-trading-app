@@ -37,8 +37,72 @@ static constexpr int kNumPresets = static_cast<int>(std::size(kPresets));
 ScannerWindow::ScannerWindow()
     : m_rng(std::random_device{}())
 {
-    m_lastScanTime   = Clock::now();
+    // Use epoch so the elapsed check in Render() fires on the very first frame,
+    // giving an immediate initial scan rather than waiting m_autoRefreshSec.
+    m_lastScanTime    = Clock::time_point{};
     m_lastQuoteUpdate = Clock::now();
+}
+
+// ============================================================================
+// Public: IB Gateway stubs
+// ============================================================================
+
+// ============================================================================
+// Technical indicator helpers (file-scope, no state needed)
+// ============================================================================
+
+// Compute RSI, approximate MACD and ATR from a sparkline of close prices.
+// Requires at least 2 data points; more points → more accurate.
+static void ComputeTechnicals(core::ScanResult& r)
+{
+    const auto& sp = r.sparkline;
+    int n = static_cast<int>(sp.size());
+    if (n < 2) return;
+
+    // ── RSI (Wilder, 14-period) ──────────────────────────────────────────
+    {
+        int period = std::min(14, n - 1);
+        double gain = 0.0, loss = 0.0;
+        int start = n - period;
+        for (int i = start; i < n; ++i) {
+            double d = sp[i] - sp[i - 1];
+            if (d > 0) gain += d; else loss -= d;
+        }
+        gain /= period;  loss /= period;
+        if (loss < 1e-12) r.rsi = 100.0;
+        else              r.rsi = 100.0 - 100.0 / (1.0 + gain / loss);
+    }
+
+    // ── MACD (EMA12 − EMA26, signal = EMA9 of macd) ─────────────────────
+    {
+        // Use however many points we have; clamp periods to available data
+        int p12 = std::min(12, n);
+        int p26 = std::min(26, n);
+        double k12 = 2.0 / (p12 + 1);
+        double k26 = 2.0 / (p26 + 1);
+        double e12 = sp[0], e26 = sp[0];
+        for (int i = 1; i < n; ++i) {
+            e12 = sp[i] * k12 + e12 * (1.0 - k12);
+            e26 = sp[i] * k26 + e26 * (1.0 - k26);
+        }
+        r.macdLine = e12 - e26;
+        // Signal: EMA9 of macd — approximate from the last few macd values
+        // by computing EMA9 over a synthetic series derived from EMA12-EMA26
+        // for each recent bar (backwards-compatible approximation)
+        int p9 = std::min(9, n);
+        double k9 = 2.0 / (p9 + 1);
+        r.macdSignal = r.macdLine * k9 + r.macdSignal * (1.0 - k9);
+    }
+
+    // ── ATR approximation (close-to-close true range, no H/L available) ──
+    {
+        int period = std::min(14, n - 1);
+        double sum = 0.0;
+        int start = n - period;
+        for (int i = start; i < n; ++i)
+            sum += std::abs(sp[i] - sp[i - 1]);
+        r.atr = sum / period;
+    }
 }
 
 // ============================================================================
@@ -48,6 +112,14 @@ ScannerWindow::ScannerWindow()
 void ScannerWindow::OnScanData(int /*reqId*/,
                                const std::vector<core::ScanResult>& results)
 {
+    m_scanning     = false;
+    m_lastScanTime = Clock::now();   // prevent immediate re-scan
+    // Update the displayed timestamp (only reachable via IB path; simulation
+    // updates it at the bottom of RunScan() which doesn't early-return).
+    std::time_t now2 = std::time(nullptr);
+    if (std::tm* tm2 = std::localtime(&now2))
+        std::strftime(m_lastScanTimeStr, sizeof(m_lastScanTimeStr), "%H:%M:%S", tm2);
+    if (results.empty()) return;     // scan failed (e.g. IND/FUT on paper) — don't wipe table
     m_hasRealData = true;
     m_results = results;
     SortResults();
@@ -57,14 +129,89 @@ void ScannerWindow::OnQuoteUpdate(const std::string& symbol, double price,
                                   double change, double changePct, double volume)
 {
     for (auto& r : m_results) {
-        if (r.symbol == symbol) {
+        if (r.symbol != symbol) continue;
+
+        if (price > 0.0) {
             r.price     = price;
             r.change    = change;
             r.changePct = changePct;
-            r.volume    = volume;
-            r.updatedAt = std::time(nullptr);
-            break;
+            // Derive prevClose from first tick if not already set
+            if (r.prevClose <= 0.0 && change != 0.0)
+                r.prevClose = price - change;
+            r.high = r.high > 0.0 ? std::max(r.high, price) : price;
+            r.low  = r.low  > 0.0 ? std::min(r.low,  price) : price;
+
+            // Update pctFrom52H / pctFrom52L whenever price changes
+            if (r.high52 > 0.0)
+                r.pctFrom52H = ((price - r.high52) / r.high52) * 100.0;
+            if (r.low52 > 0.0)
+                r.pctFrom52L = ((price - r.low52) / r.low52) * 100.0;
+
+            // Grow / slide sparkline (max 40 points so MACD has enough history)
+            static constexpr int kSparkLen = 40;
+            if ((int)r.sparkline.size() < kSparkLen)
+                r.sparkline.push_back(static_cast<float>(price));
+            else {
+                r.sparkline.erase(r.sparkline.begin());
+                r.sparkline.push_back(static_cast<float>(price));
+            }
+            ComputeTechnicals(r);
         }
+
+        if (volume > 0.0) {
+            r.volume    = volume;
+            r.relVolume = r.avgVolume > 0.0 ? volume / r.avgVolume : 0.0;
+        }
+
+        r.updatedAt = std::time(nullptr);
+        break;
+    }
+}
+
+void ScannerWindow::Set52WHigh(const std::string& symbol, double high52)
+{
+    for (auto& r : m_results) {
+        if (r.symbol != symbol) continue;
+        r.high52     = high52;
+        if (r.price > 0.0 && high52 > 0.0)
+            r.pctFrom52H = ((r.price - high52) / high52) * 100.0;
+        break;
+    }
+}
+
+void ScannerWindow::Set52WLow(const std::string& symbol, double low52)
+{
+    for (auto& r : m_results) {
+        if (r.symbol != symbol) continue;
+        r.low52      = low52;
+        if (r.price > 0.0 && low52 > 0.0)
+            r.pctFrom52L = ((r.price - low52) / low52) * 100.0;
+        break;
+    }
+}
+
+void ScannerWindow::SetAvgVolume(const std::string& symbol, double avgVol)
+{
+    for (auto& r : m_results) {
+        if (r.symbol != symbol) continue;
+        r.avgVolume  = avgVol;
+        r.relVolume  = avgVol > 0.0 ? r.volume / avgVol : 0.0;
+        break;
+    }
+}
+
+void ScannerWindow::SetPrevClose(const std::string& symbol, double prevClose)
+{
+    if (prevClose <= 0.0) return;
+    for (auto& r : m_results) {
+        if (r.symbol != symbol) continue;
+        r.prevClose = prevClose;
+        // Recompute change / changePct now that we have a reliable prevClose
+        if (r.price > 0.0) {
+            r.change    = r.price - prevClose;
+            r.changePct = (r.change / prevClose) * 100.0;
+        }
+        break;
     }
 }
 
@@ -81,12 +228,21 @@ bool ScannerWindow::Render()
 {
     if (!m_open) return false;
 
-    // Auto-refresh timer
+    // Auto-refresh timer.
+    // For IB connections (OnScanRequest set): re-subscribe to get a fresh server ranking.
+    // For simulation (no connection): skip regenerating from seeds — the 0.5s quote drift
+    // already keeps prices live; only run a full scan if we have no results yet.
     if (m_autoRefresh) {
         auto now = Clock::now();
         float elapsed = std::chrono::duration<float>(now - m_lastScanTime).count();
         if (elapsed >= m_autoRefreshSec) {
-            RunScan();
+            if (OnScanRequest || m_results.empty()) {
+                RunScan();
+            } else {
+                // Simulation with existing data: just reset the timer so columns
+                // keep drifting without a full seed-reset.
+                m_lastScanTime = now;
+            }
         }
     }
 
@@ -371,30 +527,32 @@ void ScannerWindow::DrawResultsTable()
     if (ImGuiTableSortSpecs* specs = ImGui::TableGetSortSpecs()) {
         if (specs->SpecsDirty && specs->SpecsCount > 0) {
             const auto& s = specs->Specs[0];
-            // Map column index to ScanColumn (order must match header setup)
-            int ci = s.ColumnIndex;
-            int offset = 0;
-            auto pick = [&](int col, core::ScanColumn sc) {
-                if (ci == offset + col) {
+            // Map column index → ScanColumn. Each pick() call consumes one column
+            // slot (via post-increment) and compares against ColumnIndex directly.
+            int ci  = s.ColumnIndex;
+            int col = 0;
+            auto pick = [&](core::ScanColumn sc) {
+                if (ci == col) {
                     m_sortCol       = sc;
                     m_sortAscending = (s.SortDirection == ImGuiSortDirection_Ascending);
                 }
+                ++col;
             };
-            pick(offset++, core::ScanColumn::Symbol);
-            if (m_showCompany)   pick(offset++, core::ScanColumn::Company);
-            pick(offset++, core::ScanColumn::Price);
-            if (m_showChange)    pick(offset++, core::ScanColumn::Change);
-            if (m_showChangePct) pick(offset++, core::ScanColumn::ChangePct);
-            if (m_showVolume)    pick(offset++, core::ScanColumn::Volume);
-            if (m_showRelVol)    pick(offset++, core::ScanColumn::RelVolume);
-            if (m_showMktCap)    pick(offset++, core::ScanColumn::MktCap);
-            if (m_showPE)        pick(offset++, core::ScanColumn::PE);
-            if (m_showHigh52)    pick(offset++, core::ScanColumn::High52);
-            if (m_showLow52)     pick(offset++, core::ScanColumn::Low52);
-            if (m_showPctH52)    pick(offset++, core::ScanColumn::PctFrom52H);
-            if (m_showRSI)       pick(offset++, core::ScanColumn::RSI);
-            if (m_showMACD)      pick(offset++, core::ScanColumn::MACD);
-            if (m_showATR)       pick(offset++, core::ScanColumn::ATR);
+            pick(core::ScanColumn::Symbol);
+            if (m_showCompany)   pick(core::ScanColumn::Company);
+            pick(core::ScanColumn::Price);
+            if (m_showChange)    pick(core::ScanColumn::Change);
+            if (m_showChangePct) pick(core::ScanColumn::ChangePct);
+            if (m_showVolume)    pick(core::ScanColumn::Volume);
+            if (m_showRelVol)    pick(core::ScanColumn::RelVolume);
+            if (m_showMktCap)    pick(core::ScanColumn::MktCap);
+            if (m_showPE)        pick(core::ScanColumn::PE);
+            if (m_showHigh52)    pick(core::ScanColumn::High52);
+            if (m_showLow52)     pick(core::ScanColumn::Low52);
+            if (m_showPctH52)    pick(core::ScanColumn::PctFrom52H);
+            if (m_showRSI)       pick(core::ScanColumn::RSI);
+            if (m_showMACD)      pick(core::ScanColumn::MACD);
+            if (m_showATR)       pick(core::ScanColumn::ATR);
             SortResults();
             specs->SpecsDirty = false;
         }
@@ -488,9 +646,13 @@ void ScannerWindow::DrawResultsTable()
         // Rel Volume
         if (m_showRelVol) {
             ImGui::TableSetColumnIndex(col++);
-            ImVec4 c = r.relVolume >= 1.5 ? ImVec4(0.9f,0.8f,0.1f,1.f)
-                                           : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-            ImGui::TextColored(c, "%.2fx", r.relVolume);
+            if (r.avgVolume > 0.0) {
+                ImVec4 c = r.relVolume >= 1.5 ? ImVec4(0.9f,0.8f,0.1f,1.f)
+                                               : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                ImGui::TextColored(c, "%.2fx", r.relVolume);
+            } else {
+                ImGui::TextDisabled("—");
+            }
         }
 
         // Mkt Cap
@@ -509,22 +671,28 @@ void ScannerWindow::DrawResultsTable()
         // 52W High
         if (m_showHigh52) {
             ImGui::TableSetColumnIndex(col++);
-            ImGui::Text("%.2f", r.high52);
+            if (r.high52 > 0.0) ImGui::Text("%.2f", r.high52);
+            else                 ImGui::TextDisabled("—");
         }
 
         // 52W Low
         if (m_showLow52) {
             ImGui::TableSetColumnIndex(col++);
-            ImGui::Text("%.2f", r.low52);
+            if (r.low52 > 0.0) ImGui::Text("%.2f", r.low52);
+            else                ImGui::TextDisabled("—");
         }
 
         // % from 52W High
         if (m_showPctH52) {
             ImGui::TableSetColumnIndex(col++);
-            ImVec4 c = r.pctFrom52H > -2.0 ? ImVec4(0.3f,0.9f,0.3f,1.f)
-                       : r.pctFrom52H < -20.0 ? ImVec4(0.9f,0.3f,0.3f,1.f)
-                       : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-            ImGui::TextColored(c, "%.1f%%", r.pctFrom52H);
+            if (r.high52 > 0.0) {
+                ImVec4 c = r.pctFrom52H > -2.0 ? ImVec4(0.3f,0.9f,0.3f,1.f)
+                           : r.pctFrom52H < -20.0 ? ImVec4(0.9f,0.3f,0.3f,1.f)
+                           : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+                ImGui::TextColored(c, "%.1f%%", r.pctFrom52H);
+            } else {
+                ImGui::TextDisabled("—");
+            }
         }
 
         // RSI
@@ -711,14 +879,15 @@ void ScannerWindow::RunScan()
         const char* location   = "STK.US.MAJOR";
         switch (m_activeClass) {
             case core::AssetClass::ETFs:
-                instrument = "STK"; location = "STK.US.MAJOR"; break;
+                instrument = "ETF"; location = "STK.US.MAJOR"; break;
             case core::AssetClass::Indexes:
                 instrument = "IND"; location = "IND.US";        break;
             case core::AssetClass::Futures:
                 instrument = "FUT"; location = "FUT.US";        break;
             default: break;
         }
-        m_results.clear();
+        // Keep existing results visible while the new scan is in progress;
+        // OnScanData() will replace them when the server responds.
         m_scanning = true;
         OnScanRequest(scanCode, instrument, location);
         return;
@@ -839,11 +1008,27 @@ void ScannerWindow::UpdateQuotes(float /*dtSec*/)
         r.changePct = (r.prevClose > 0) ? (r.change / r.prevClose) * 100.0 : 0.0;
         r.high      = std::max(r.high, r.price);
         r.low       = std::min(r.low, r.price);
-        // Push sparkline forward
+
+        // Update 52W distance
+        if (r.high52 > 0.0)
+            r.pctFrom52H = ((r.price - r.high52) / r.high52) * 100.0;
+        if (r.low52 > 0.0)
+            r.pctFrom52L = ((r.price - r.low52) / r.low52) * 100.0;
+
+        // Drift volume slightly and keep relVolume live
+        double volDrift = std::abs(m_noise(m_rng)) * 2.0;
+        r.volume = std::round(r.volume * (1.0 + volDrift));
+        if (r.avgVolume > 0.0)
+            r.relVolume = r.volume / r.avgVolume;
+
+        // Slide sparkline forward
         if (!r.sparkline.empty()) {
             r.sparkline.erase(r.sparkline.begin());
             r.sparkline.push_back(static_cast<float>(r.price));
         }
+
+        // Recompute RSI, MACD, ATR from updated sparkline
+        ComputeTechnicals(r);
     }
 }
 
@@ -896,6 +1081,17 @@ std::vector<float> ScannerWindow::GenerateSparkline(double startPrice,
         sp.push_back(static_cast<float>(p));
     }
     return sp;
+}
+
+// Seed the sparkline then compute initial technicals for a freshly-built ScanResult.
+static void SeedTechnicals(core::ScanResult& r)
+{
+    ComputeTechnicals(r);
+    // pctFrom52H / pctFrom52L
+    if (r.high52 > 0.0)
+        r.pctFrom52H = ((r.price - r.high52) / r.high52) * 100.0;
+    if (r.low52 > 0.0)
+        r.pctFrom52L = ((r.price - r.low52) / r.low52) * 100.0;
 }
 
 // Helper to build a result with computed fields
@@ -976,21 +1172,19 @@ void ScannerWindow::SimulateStocks()
 
     for (const auto& s : kSeeds) {
         bool upTrend = s.px > s.prevC;
-        auto spark = GenerateSparkline(s.lo52, 0.012, upTrend);
-        // normalise sparkline to recent price
+        // 40-point sparkline starting near the 52W low, ending at current price
+        auto spark = GenerateSparkline(s.lo52, 0.012, upTrend, 40);
         if (!spark.empty()) spark.back() = static_cast<float>(s.px);
 
-        double macdLine   = s.rsi > 50 ? 0.42 : -0.35;
-        double macdSignal = s.rsi > 50 ? 0.28 : -0.18;
-        double atr        = s.px * 0.018;
-
-        m_results.push_back(MakeResult(
+        auto r = MakeResult(
             s.sym, s.co, s.sector, s.exch,
             s.px, s.prevC,
             s.px * 1.003, s.px * 0.997,
             s.vol, s.avgVol, s.mktCapM, s.pe,
             s.hi52, s.lo52, s.rsi,
-            macdLine, macdSignal, atr, std::move(spark)));
+            0.0, 0.0, 0.0, std::move(spark));
+        SeedTechnicals(r);
+        m_results.push_back(std::move(r));
     }
 }
 
@@ -1010,7 +1204,7 @@ void ScannerWindow::SimulateIndexes()
 
     for (const auto& s : kIdx) {
         bool up = s.px > s.prevC;
-        auto spark = GenerateSparkline(s.lo52, 0.008, up);
+        auto spark = GenerateSparkline(s.lo52, 0.008, up, 40);
         if (!spark.empty()) spark.back() = static_cast<float>(s.px);
 
         core::ScanResult r = MakeResult(
@@ -1020,6 +1214,7 @@ void ScannerWindow::SimulateIndexes()
             0, 0, 0, 0,
             s.hi52, s.lo52, 50.0, 0.0, 0.0, 0.0, std::move(spark));
         r.isIndex = true;
+        SeedTechnicals(r);
         m_results.push_back(std::move(r));
     }
 }
@@ -1044,21 +1239,17 @@ void ScannerWindow::SimulateETFs()
 
     for (const auto& s : kETF) {
         bool up = s.px > s.prevC;
-        auto spark = GenerateSparkline(s.lo52, 0.010, up);
+        auto spark = GenerateSparkline(s.lo52, 0.010, up, 40);
         if (!spark.empty()) spark.back() = static_cast<float>(s.px);
 
-        double rsi = up ? (55.0 + m_uniform(m_rng) * 20.0)
-                        : (30.0 + m_uniform(m_rng) * 20.0);
-        double macdLine = up ? 0.35 : -0.28;
-        double macdSig  = up ? 0.22 : -0.15;
-
-        m_results.push_back(MakeResult(
+        auto r = MakeResult(
             s.sym, s.name, s.sector, "NYSE",
             s.px, s.prevC,
             s.px * 1.002, s.px * 0.998,
             s.vol, s.vol * 1.1, s.mktCapM, 0.0,
-            s.hi52, s.lo52, rsi, macdLine, macdSig,
-            s.px * 0.012, std::move(spark)));
+            s.hi52, s.lo52, 50.0, 0.0, 0.0, 0.0, std::move(spark));
+        SeedTechnicals(r);
+        m_results.push_back(std::move(r));
     }
 }
 
@@ -1081,19 +1272,17 @@ void ScannerWindow::SimulateFutures()
 
     for (const auto& s : kFut) {
         bool up = s.px > s.prevC;
-        auto spark = GenerateSparkline(s.lo52, 0.009, up);
+        auto spark = GenerateSparkline(s.lo52, 0.009, up, 40);
         if (!spark.empty()) spark.back() = static_cast<float>(s.px);
 
-        double rsi = up ? (52.0 + m_uniform(m_rng) * 22.0)
-                        : (28.0 + m_uniform(m_rng) * 22.0);
-
-        m_results.push_back(MakeResult(
+        auto r = MakeResult(
             s.sym, s.name, s.sector, "CME",
             s.px, s.prevC,
             s.px * 1.003, s.px * 0.997,
             0, 0, 0, 0,
-            s.hi52, s.lo52, rsi, 0.0, 0.0,
-            s.px * 0.015, std::move(spark)));
+            s.hi52, s.lo52, 50.0, 0.0, 0.0, 0.0, std::move(spark));
+        SeedTechnicals(r);
+        m_results.push_back(std::move(r));
     }
 }
 

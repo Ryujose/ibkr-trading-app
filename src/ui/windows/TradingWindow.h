@@ -56,6 +56,8 @@ public:
                        bool outsideRth           // true = allow pre/after-hours fills
                        )> OnOrderSubmit;
     std::function<void(int orderId)> OnOrderCancel;
+    // Fired when the user types a new symbol and presses Enter in Order Entry.
+    std::function<void(const std::string& symbol)> OnSymbolChanged;
 
 private:
     bool m_open = true;
@@ -87,8 +89,9 @@ private:
     double m_maxVolAtPrice = 1.0;
 
     // ── Click-to-trade ───────────────────────────────────────────────────────
-    bool m_clickToTrade = false;
-    int  m_ladderRows   = 25;    // virtual price levels above ask / below bid
+    bool m_clickToTrade  = false;
+    int  m_ladderRows    = 25;    // virtual price levels above ask / below bid
+    int  m_ladderRowsIdx = 4;     // index into kLadderOptions[] — default 25 (index 4)
 
     struct DOMOrder {
         int               orderId;
