@@ -112,8 +112,13 @@ static void ComputeTechnicals(core::ScanResult& r)
 void ScannerWindow::OnScanData(int /*reqId*/,
                                const std::vector<core::ScanResult>& results)
 {
-    m_scanning    = false;
+    m_scanning     = false;
     m_lastScanTime = Clock::now();   // prevent immediate re-scan
+    // Update the displayed timestamp (only reachable via IB path; simulation
+    // updates it at the bottom of RunScan() which doesn't early-return).
+    std::time_t now2 = std::time(nullptr);
+    if (std::tm* tm2 = std::localtime(&now2))
+        std::strftime(m_lastScanTimeStr, sizeof(m_lastScanTimeStr), "%H:%M:%S", tm2);
     if (results.empty()) return;     // scan failed (e.g. IND/FUT on paper) — don't wipe table
     m_hasRealData = true;
     m_results = results;

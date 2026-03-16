@@ -64,6 +64,7 @@ struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
                            std::string articleId; std::string headline; };
 struct MsgHistoricalNewsEnd { int reqId; };
 struct MsgNewsArticle    { int reqId; std::string text; };
+struct MsgAcctSummary    { std::string tag; std::string value; std::string currency; };
 
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
@@ -71,7 +72,8 @@ using IBMessage = std::variant<
     MsgFill, MsgDepth, MsgScanItem, MsgScanEnd, MsgNews,
     MsgError, MsgNextOrderId,
     MsgOpenOrder, MsgOpenOrderEnd,
-    MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle
+    MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
+    MsgAcctSummary
 >;
 
 // ============================================================================
@@ -93,9 +95,10 @@ public:
 
     // ── Outgoing requests ─────────────────────────────────────────────────
     void ReqHistoricalData(int reqId, const std::string& symbol,
-                           const std::string& duration = "6 M",
-                           const std::string& barSize  = "1 day",
-                           bool useRTH = true);
+                           const std::string& duration    = "6 M",
+                           const std::string& barSize     = "1 day",
+                           bool               useRTH      = true,
+                           const std::string& endDateTime = "");  // "" = now
     void CancelHistoricalData(int reqId);
 
     // Contract lookup (needed for reqHistoricalNews which takes conId, not symbol)
@@ -141,6 +144,11 @@ public:
     void ReqAccountUpdates(bool subscribe, const std::string& acctCode = "");
     void ReqPositions();
 
+    // Request account summary (reliable base-currency retrieval).
+    // tags: comma-separated AccountSummaryTags, e.g. "Currency" or "Currency,NetLiquidation"
+    void ReqAccountSummary(int reqId, const std::string& tags = "Currency");
+    void CancelAccountSummary(int reqId);
+
     void ReqScannerData(int reqId,
                         const std::string& scanCode     = "TOP_PERC_GAIN",
                         const std::string& instrument   = "STK",
@@ -182,6 +190,10 @@ public:
     std::function<void(std::time_t, const std::string& provider,
                        const std::string& id,
                        const std::string& headline)>                        onNewsItem;
+
+    // Account summary (e.g. tag="Currency", value="USD")
+    std::function<void(const std::string& tag, const std::string& value,
+                       const std::string& currency)>                        onAccountSummary;
     std::function<void(int reqId, int code, const std::string& msg)>        onError;
     std::function<void(int nextOrderId)>                                    onNextValidId;
 
@@ -318,6 +330,10 @@ private:
 
     void newsArticle(int requestId, int articleType,
                      const std::string& articleText) override;
+
+    void accountSummary(int reqId, const std::string& account, const std::string& tag,
+                        const std::string& value, const std::string& currency) override;
+    void accountSummaryEnd(int reqId) override;
 };
 
 } // namespace core::services

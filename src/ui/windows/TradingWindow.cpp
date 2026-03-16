@@ -319,12 +319,16 @@ void TradingWindow::DrawOrderBook() {
     ImGui::SameLine(0, 16);
     ImGui::TextDisabled("Levels:");
     ImGui::SameLine(0, 4);
-    ImGui::SetNextItemWidth(52);
-    ImGui::InputInt("##ladder_rows", &m_ladderRows, 0, 0);
-    if (m_ladderRows < 1)   m_ladderRows = 1;
-    if (m_ladderRows > 200) m_ladderRows = 200;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Virtual price rows shown above ask and below bid\nwhen no Level II subscription is active (1–200).");
+    {
+        static constexpr int  kLadderOptions[] = {5, 10, 15, 20, 25, 30, 40, 50};
+        static const char*    kLadderLabels[]  = {"5","10","15","20","25","30","40","50"};
+        static constexpr int  kLadderCount = 8;
+        ImGui::SetNextItemWidth(58);
+        if (ImGui::Combo("##ladder_rows", &m_ladderRowsIdx, kLadderLabels, kLadderCount))
+            m_ladderRows = kLadderOptions[m_ladderRowsIdx];
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Virtual price rows shown above ask and below bid\nwhen no Level II subscription is active.");
+    }
 
     // ── Subscription banners ──────────────────────────────────────────────────
     if (m_mktDataStatus == SubStatus::NeedSubscription) {
@@ -725,8 +729,28 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::Text("Symbol");
     ImGui::SameLine(75);
     ImGui::SetNextItemWidth(72);
-    ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
-                     ImGuiInputTextFlags_CharsUppercase);
+    bool symEntered = ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
+                                       ImGuiInputTextFlags_CharsUppercase |
+                                       ImGuiInputTextFlags_EnterReturnsTrue);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Type a symbol and press Enter to subscribe");
+    if (symEntered && m_symbol[0] != '\0') {
+        // Clear stale book data for the old symbol
+        m_bids.clear();
+        m_asks.clear();
+        m_volAtPrice.clear();
+        m_maxVolAtPrice  = 1.0;
+        m_maxDepthSize   = 1.0;
+        m_nbboBid        = 0.0;
+        m_nbboAsk        = 0.0;
+        m_nbboBidSz      = 0.0;
+        m_nbboAskSz      = 0.0;
+        m_midPrice       = 0.0;
+        m_prevMidPrice   = 0.0;
+        m_mktDataStatus  = SubStatus::Unknown;
+        m_depthStatus    = SubStatus::Unknown;
+        if (OnSymbolChanged) OnSymbolChanged(m_symbol);
+    }
 
     ImGui::SameLine(0, 8);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.65f, 1.0f));

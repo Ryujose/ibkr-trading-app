@@ -70,10 +70,15 @@ void PortfolioWindow::OnAccountValue(const std::string& key, const std::string& 
     else if (key == "DailyPnL")          m_account.dayPnL  = d;
     else if (key == "UnrealizedDayPnL")  m_account.dayPnL += d;
     else if (key == "RealizedDayPnL")    m_account.dayPnL += d;
-    // IB sends key="Currency" with the account's base currency code (USD, EUR…)
-    else if (key == "Currency" && !val.empty())  m_account.baseCurrency = val;
-    // Some IB versions send it in the currency param on the AccountType key
-    if (m_account.baseCurrency.empty() && !currency.empty() && currency != "BASE")
+    // IB sends key="Currency" twice per account: once with val="<code>" currency="BASE"
+    // and once with val="BASE" currency="<code>" — only accept proper 3-letter ISO codes
+    // as the value so "BASE" is never stored as the base currency.
+    else if (key == "Currency" && val.size() == 3)
+        m_account.baseCurrency = val;
+    // Fallback: infer from the currency field of any 3-letter non-BASE denomination.
+    // SetBaseCurrency() (called from reqAccountSummary) takes priority; this is only
+    // used if that call hasn't returned yet.
+    if (m_account.baseCurrency.empty() && currency.size() == 3 && currency != "BASE")
         m_account.baseCurrency = currency;
     m_account.updatedAt = std::time(nullptr);
 }
@@ -81,7 +86,22 @@ void PortfolioWindow::OnAccountValue(const std::string& key, const std::string& 
 void PortfolioWindow::OnPositionUpdate(const core::Position& pos)
 {
     for (auto& p : m_positions) {
-        if (p.symbol == pos.symbol) { p = pos; return; }
+        if (p.symbol == pos.symbol) {
+            if (pos.marketPrice < 1e-9) {
+                // Position snapshot from reqPositions: IB provides qty + avgCost only.
+                // Preserve the live market-derived fields that arrived via updatePortfolio
+                // so they aren't overwritten with zeros.
+                p.quantity  = pos.quantity;
+                p.avgCost   = pos.avgCost;
+                p.costBasis = p.quantity * p.avgCost;
+            } else {
+                // Full position update from updatePortfolio: replace everything.
+                p = pos;
+            }
+            RecalcAccountTotals();
+            SortPositions();
+            return;
+        }
     }
     m_positions.push_back(pos);
     RecalcAccountTotals();
@@ -919,26 +939,37 @@ void PortfolioWindow::DrawRiskTab()
 
 void PortfolioWindow::RecalcAccountTotals()
 {
-    double grossPos = 0.0;
-    double unreal   = 0.0;
-    double real     = 0.0;
+    double grossPos  = 0.0;
+    double unreal    = 0.0;
+    double real      = 0.0;
+    bool   allPriced = !m_positions.empty();
 
     for (auto& p : m_positions) {
-        p.marketValue   = p.quantity * p.marketPrice;
-        p.costBasis     = p.quantity * p.avgCost;
-        p.unrealizedPnL = p.marketValue - p.costBasis;
-        p.unrealizedPct = std::abs(p.costBasis) > 1e-9
-                          ? (p.unrealizedPnL / std::abs(p.costBasis)) * 100.0
-                          : 0.0;
+        if (p.marketPrice > 1e-9) {
+            // Live market price available: derive all fields.
+            p.marketValue   = p.quantity * p.marketPrice;
+            p.costBasis     = p.quantity * p.avgCost;
+            p.unrealizedPnL = p.marketValue - p.costBasis;
+            p.unrealizedPct = std::abs(p.costBasis) > 1e-9
+                              ? (p.unrealizedPnL / std::abs(p.costBasis)) * 100.0
+                              : 0.0;
+        } else {
+            // No market price yet (position from reqPositions, updatePortfolio hasn't
+            // arrived).  Keep whatever unrealizedPnL IB already gave us and ensure
+            // costBasis is at least set so the table shows something sensible.
+            allPriced = false;
+            if (std::abs(p.costBasis) < 1e-9)
+                p.costBasis = p.quantity * p.avgCost;
+        }
         grossPos += std::abs(p.marketValue);
         unreal   += p.unrealizedPnL;
         real     += p.realizedPnL;
     }
 
-    // Only overwrite IB-provided account-level P&L when positions carry the data
-    // (updatePortfolio fills unrealizedPnL/realizedPnL per position; position()
-    // does not, so when positions arrived via reqPositions the sum is 0)
-    if (unreal != 0.0 || real != 0.0) {
+    // Only overwrite the IB-provided account-level P&L totals once every position
+    // has a live market price.  Before that point the sum would include zeros (or
+    // -costBasis values) for unpriced positions and produce a wrong account card.
+    if (allPriced) {
         m_account.unrealizedPnL = unreal;
         m_account.realizedPnL   = real;
     }

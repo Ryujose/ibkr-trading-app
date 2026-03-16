@@ -48,11 +48,18 @@ static core::services::IBKRClient* g_IBClient = nullptr;
 
 // Pending bar accumulation for the chart (fills as historicalData callbacks arrive)
 static core::BarSeries g_pendingBars;
+// Pending bar accumulation for the extend-history (pan-left) request
+static core::BarSeries g_pendingExtendBars;
 
 // Pending scanner results (fills as scannerData callbacks arrive)
 static std::vector<core::ScanResult> g_pendingScanResults;
 
-// True while SCAN_REQID is active — prevents duplicate-subscription error 'cn'.
+// Active scanner subscription reqId.  Incremented each time we subscribe so we
+// never collide with the previous session's subscription that IB Gateway keeps
+// alive across reconnects ("duplicate scan subscription" error in the gateway log).
+// Range: SCAN_REQID_BASE … SCAN_REQID_BASE+99, wrapping.
+// Starts one below SCAN_REQID_BASE (300) so the first increment lands on 300.
+static int  g_activeScanReqId          = 299;
 static bool g_scannerSubscriptionActive = false;
 
 // Previous-close prices keyed by symbol, used to compute change/% for scanner rows.
@@ -134,9 +141,10 @@ static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 
 // Request IDs (reserved ranges)
 static constexpr int HIST_REQID          = 1;    // historical data for the chart
+static constexpr int HIST_EXTEND_REQID   = 2;    // extend-history (pan-left) request
 static constexpr int DEPTH_REQID         = 200;  // market depth
 static constexpr int NEWS_RT_REQID       = 201;  // real-time news subscription (mdoff;292)
-static constexpr int SCAN_REQID          = 300;  // scanner subscription
+static constexpr int SCAN_REQID_BASE     = 300;  // scanner reqId pool base (300–399)
 static constexpr int SCAN_MKT_BASE       = 800;  // market data for scanner symbols (800–849)
 static constexpr int SCAN_MKT_MAX        = 50;   // max scanner symbols with live quotes
 static constexpr int MKT_REQID_BASE      = 100;  // market data per-symbol offset
@@ -157,12 +165,16 @@ static constexpr int NEWS_ART_BASE       = 600;
 static constexpr int NEWS_ART_END        = 699;
 static constexpr int NEWS_HIST_MKT       = 700;  // base; +i per seed symbol
 static constexpr int NEWS_CONID_MKT      = 750;  // base; +i per seed symbol
+static constexpr int ACCT_SUMMARY_REQID  = 900;  // reqAccountSummary for base currency
 
 // Symbols fetched on connection to seed the Market-tab news feed.
 static const char* kMktSeedSymbols[] = { "AAPL", "SPY", "MSFT", "TSLA", "NVDA" };
 static constexpr int kMktSeedCount   = 5;
 static int           g_nextArtReqId      = NEWS_ART_BASE;
 static std::unordered_map<int,int> g_artReqToItemId;  // reqId → NewsItem.id
+// Tracks which contract-detail reqIds have already triggered reqHistoricalNews,
+// preventing duplicate calls when IB returns multiple exchange matches per symbol.
+static std::unordered_map<int,bool> g_newsConIdFired;
 
 // ============================================================================
 // Connection / Login state
@@ -452,6 +464,20 @@ static void CreateTradingWindows() {
         UpdateChartPosition();
     };
 
+    // Pan-left: load older historical bars and prepend them to the chart
+    g_ChartWindow->OnExtendHistory = [](const std::string& sym, core::Timeframe tf,
+                                        const std::string& endDateTime, bool useRTH) {
+        if (!g_IBClient) return;
+        g_IBClient->CancelHistoricalData(HIST_EXTEND_REQID);
+        g_pendingExtendBars           = core::BarSeries{};
+        g_pendingExtendBars.symbol    = sym;
+        g_pendingExtendBars.timeframe = tf;
+        g_IBClient->ReqHistoricalData(HIST_EXTEND_REQID, sym,
+                                      core::TimeframeIBDuration(tf),
+                                      core::TimeframeIBBarSize(tf),
+                                      useRTH, endDateTime);
+    };
+
     // Chart trade panel: place orders directly from the chart
     g_ChartWindow->OnOrderSubmit = [](const std::string& sym, const std::string& side,
                                       const std::string& orderType, double qty, double price,
@@ -583,16 +609,31 @@ static void CreateTradingWindows() {
     g_TradingWindow->OnOrderCancel = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
+    g_TradingWindow->OnSymbolChanged = [ReqChartData](const std::string& sym) {
+        g_chartSymbol = sym;
+        if (g_ChartWindow) g_ChartWindow->SetSymbol(sym);
+        if (g_IBClient) {
+            g_IBClient->CancelMarketData(MKT_REQID_BASE);
+            g_IBClient->CancelMktDepth(DEPTH_REQID);
+            ReqChartData(sym, core::Timeframe::D1, true);
+            g_tickerSymbols[MKT_REQID_BASE] = sym;
+            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym, MktDataTicks());
+            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
+        }
+        UpdateChartPendingOrders();
+        UpdateChartPosition();
+    };
 
     // Wire scanner to IB
     g_ScannerWindow->OnScanRequest = [](const std::string& scanCode,
                                         const std::string& instrument,
                                         const std::string& location) {
         if (!g_IBClient) return;
-        // Cancel the previous scanner subscription before reusing the same reqId.
-        // Without this, IB rejects the new subscription with error 'cn' (duplicate ticker ID).
+        // Cancel the previous scanner subscription.  Always send the cancel even
+        // if we think none is active — on reconnect the IB Gateway may have a
+        // restored subscription for the old reqId that we need to clear.
         if (g_scannerSubscriptionActive) {
-            g_IBClient->CancelScannerData(SCAN_REQID);
+            g_IBClient->CancelScannerData(g_activeScanReqId);
             g_scannerSubscriptionActive = false;
         }
         // Cancel any active market-data subscriptions from the previous scan batch.
@@ -604,7 +645,11 @@ static void CreateTradingWindows() {
             }
         }
         g_pendingScanResults.clear();
-        g_IBClient->ReqScannerData(SCAN_REQID, scanCode, instrument, location);
+        // Advance to the next reqId so we never reuse the one that IB Gateway
+        // may still have registered from the previous session.
+        if (++g_activeScanReqId >= SCAN_REQID_BASE + 100)
+            g_activeScanReqId = SCAN_REQID_BASE;
+        g_IBClient->ReqScannerData(g_activeScanReqId, scanCode, instrument, location);
         g_scannerSubscriptionActive = true;
     };
 
@@ -614,6 +659,33 @@ static void CreateTradingWindows() {
     };
     g_OrdersWindow->OnRefresh = []() {
         if (g_IBClient) g_IBClient->ReqOpenOrders();
+    };
+
+    // ── News window: reqId routing + user-interaction callbacks ──────────────
+    // Must be wired here (after g_NewsWindow is created), NOT in WireIBCallbacks()
+    // which runs at startup before any window exists.
+    g_NewsWindow->SetStockNewsReqId(NEWS_HIST_STOCK);
+    g_NewsWindow->SetPortNewsReqIdBase(NEWS_HIST_PORT);
+    g_NewsWindow->SetMktNewsReqIdBase(NEWS_HIST_MKT);
+
+    g_NewsWindow->OnStockNewsRequested = [](const std::string& symbol) {
+        if (g_IBClient && g_IBClient->IsConnected())
+            g_IBClient->ReqContractDetails(NEWS_CONID_STOCK, symbol);
+    };
+
+    g_NewsWindow->OnPortfolioNewsRequested = [](const std::vector<std::string>& syms) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        for (int i = 0; i < (int)syms.size() && i < 20; ++i)
+            g_IBClient->ReqContractDetails(NEWS_CONID_PORT + i, syms[i]);
+    };
+
+    g_NewsWindow->OnArticleRequested = [](int itemId, const std::string& provider,
+                                          const std::string& articleId) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        int reqId = g_nextArtReqId++;
+        if (g_nextArtReqId > NEWS_ART_END) g_nextArtReqId = NEWS_ART_BASE;
+        g_artReqToItemId[reqId] = itemId;
+        g_IBClient->ReqNewsArticle(reqId, provider, articleId);
     };
 }
 
@@ -627,9 +699,17 @@ static void DestroyTradingWindows() {
     g_portfolioSymbols.clear();
     g_artReqToItemId.clear();
     g_nextArtReqId = NEWS_ART_BASE;
+    g_newsConIdFired.clear();
     g_liveOrders.clear();
     g_positions.clear();
     g_symbolCommissions.clear();
+    // Reset scanner subscription state so reconnect starts clean.
+    g_scannerSubscriptionActive = false;
+    g_scannerPrevClose.clear();
+    g_scannerVolume.clear();
+    // Clear scanner market-data ticker slots so stale IDs don't carry over.
+    for (int i = 0; i < SCAN_MKT_MAX; ++i)
+        g_tickerSymbols.erase(SCAN_MKT_BASE + i);
 }
 
 // ============================================================================
@@ -654,9 +734,17 @@ static void WireIBCallbacks() {
             // Start subscriptions
             g_IBClient->ReqAccountUpdates(true);
             g_IBClient->ReqPositions();
+            // Fetch base currency via reqAccountSummary — more reliable than parsing
+            // updateAccountValue which also sends key="Currency", val="BASE".
+            g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
             g_IBClient->ReqOpenOrders();
-            g_IBClient->ReqScannerData(SCAN_REQID);
-            g_scannerSubscriptionActive = true;
+            // Cancel whatever reqId the previous session left active on the gateway
+            // (same client ID = session restored = old subscription still registered).
+            // We do NOT subscribe here — ScannerWindow::Render() triggers the first
+            // RunScan() immediately (m_lastScanTime=epoch) and calls OnScanRequest,
+            // which advances g_activeScanReqId to a fresh value before subscribing.
+            g_IBClient->CancelScannerData(g_activeScanReqId);
+            g_scannerSubscriptionActive = false;
 
             // Chart — default AAPL
             const std::string sym = "AAPL";
@@ -691,7 +779,17 @@ static void WireIBCallbacks() {
     };
 
     // ── Historical bars (chart) ───────────────────────────────────────────
-    g_IBClient->onBarData = [](int /*reqId*/, const core::Bar& bar, bool done, bool isLive) {
+    g_IBClient->onBarData = [](int reqId, const core::Bar& bar, bool done, bool isLive) {
+        if (reqId == HIST_EXTEND_REQID) {
+            // Extend-history (pan-left) response — prepend to existing chart data
+            if (!done) {
+                g_pendingExtendBars.bars.push_back(bar);
+            } else if (g_ChartWindow) {
+                g_ChartWindow->PrependHistoricalData(g_pendingExtendBars);
+                g_pendingExtendBars.bars.clear();
+            }
+            return;
+        }
         if (isLive) {
             // keepUpToDate=true live update — update the forming bar in the chart
             if (g_ChartWindow) g_ChartWindow->UpdateLiveBar(bar);
@@ -890,6 +988,14 @@ static void WireIBCallbacks() {
             g_PortfolioWindow->OnAccountValue(key, val, currency, acct);
     };
 
+    // ── Account summary (base currency via reqAccountSummary) ─────────────
+    // tag="Currency", value="USD" — this is the authoritative source.
+    g_IBClient->onAccountSummary = [](const std::string& tag, const std::string& value,
+                                      const std::string& /*currency*/) {
+        if (tag == "Currency" && !value.empty() && g_PortfolioWindow)
+            g_PortfolioWindow->SetBaseCurrency(value);
+    };
+
     // ── Positions ─────────────────────────────────────────────────────────
     g_IBClient->onPositionData = [](const core::Position& pos, bool done) {
         if (g_PortfolioWindow) {
@@ -968,10 +1074,10 @@ static void WireIBCallbacks() {
 
     // ── Scanner ───────────────────────────────────────────────────────────
     g_IBClient->onScanItem = [](int reqId, const core::ScanResult& result) {
-        if (reqId == SCAN_REQID) g_pendingScanResults.push_back(result);
+        if (reqId == g_activeScanReqId) g_pendingScanResults.push_back(result);
     };
     g_IBClient->onScanEnd = [](int reqId) {
-        if (reqId != SCAN_REQID || !g_ScannerWindow) return;
+        if (reqId != g_activeScanReqId || !g_ScannerWindow) return;
 
         // Always cancel previously-subscribed market data slots before (re)subscribing.
         // Without this, a rapid rescan reuses reqIds 800-824 while the farm still has them
@@ -1018,6 +1124,10 @@ static void WireIBCallbacks() {
     // ── News — contract details → historical news chain ───────────────────
     g_IBClient->onContractConId = [](int reqId, long conId) {
         if (!g_IBClient) return;
+        // IB may call contractDetails multiple times (one per exchange match).
+        // Only use the first conId per reqId so we don't issue duplicate news requests.
+        if (g_newsConIdFired[reqId]) return;
+        g_newsConIdFired[reqId] = true;
         if (reqId == NEWS_CONID_STOCK) {
             g_IBClient->ReqHistoricalNews(NEWS_HIST_STOCK, (int)conId, 30);
         } else if (reqId >= NEWS_CONID_PORT && reqId < NEWS_CONID_PORT + 20) {
@@ -1063,37 +1173,6 @@ static void WireIBCallbacks() {
         if (g_NewsWindow) g_NewsWindow->OnArticleReceived(itemId, text);
     };
 
-    // ── News window callbacks (fire when user interacts) ──────────────────
-    if (g_NewsWindow) {
-        // Inform window which reqIds belong to which tab
-        g_NewsWindow->SetStockNewsReqId(NEWS_HIST_STOCK);
-        g_NewsWindow->SetPortNewsReqIdBase(NEWS_HIST_PORT);
-        g_NewsWindow->SetMktNewsReqIdBase(NEWS_HIST_MKT);
-
-        // Stock news: user typed a symbol → look up conId, then fetch news
-        g_NewsWindow->OnStockNewsRequested = [](const std::string& symbol) {
-            if (g_IBClient && g_IBClient->IsConnected())
-                g_IBClient->ReqContractDetails(NEWS_CONID_STOCK, symbol);
-        };
-
-        // Portfolio news: symbols updated → fetch for each
-        g_NewsWindow->OnPortfolioNewsRequested = [](const std::vector<std::string>& syms) {
-            if (!g_IBClient || !g_IBClient->IsConnected()) return;
-            for (int i = 0; i < (int)syms.size() && i < 20; ++i)
-                g_IBClient->ReqContractDetails(NEWS_CONID_PORT + i, syms[i]);
-        };
-
-        // Article body: user expanded an item → fetch full text
-        g_NewsWindow->OnArticleRequested = [](int itemId, const std::string& provider,
-                                              const std::string& articleId) {
-            if (!g_IBClient || !g_IBClient->IsConnected()) return;
-            int reqId = g_nextArtReqId++;
-            if (g_nextArtReqId > NEWS_ART_END) g_nextArtReqId = NEWS_ART_BASE;
-            g_artReqToItemId[reqId] = itemId;
-            g_IBClient->ReqNewsArticle(reqId, provider, articleId);
-        };
-    }
-
     // ── Errors ────────────────────────────────────────────────────────────
     g_IBClient->onError = [](int reqId, int code, const std::string& msg) {
         fprintf(stderr, "[IB Error reqId=%d code=%d] %s\n", reqId, code, msg.c_str());
@@ -1115,6 +1194,21 @@ static void WireIBCallbacks() {
             if (g_TradingWindow)
                 g_TradingWindow->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0);
             UpdateChartPendingOrders();
+        }
+
+        // News errors: if reqHistoricalNews or reqContractDetails fails (e.g. no news
+        // subscription, code 321/10197), IB sends an error instead of historicalNewsEnd.
+        // Clear the loading state so the UI doesn't hang on "Loading..." indefinitely.
+        if (g_NewsWindow) {
+            if (reqId == NEWS_HIST_STOCK || reqId == NEWS_CONID_STOCK) {
+                g_NewsWindow->OnHistoricalNewsEnd(NEWS_HIST_STOCK);
+            } else if (reqId >= NEWS_HIST_PORT && reqId < NEWS_HIST_PORT + 20) {
+                g_NewsWindow->OnHistoricalNewsEnd(reqId);
+            } else if (reqId >= NEWS_CONID_PORT && reqId < NEWS_CONID_PORT + 20) {
+                int i = reqId - NEWS_CONID_PORT;
+                g_NewsWindow->OnHistoricalNewsEnd(NEWS_HIST_PORT + i);
+            }
+            // Market-tab seed errors don't affect loading UI — market tab is push-based.
         }
 
         if (!g_TradingWindow) return;
@@ -1178,6 +1272,7 @@ static void Disconnect() {
     g_Login.connectedAs.clear();
     g_Login.errorMsg.clear();
     g_pendingBars       = core::BarSeries{};
+    g_pendingExtendBars = core::BarSeries{};
     g_pendingScanResults.clear();
     g_scannerPrevClose.clear();
     g_scannerVolume.clear();

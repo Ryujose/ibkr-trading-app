@@ -128,7 +128,8 @@ Contract IBKRClient::MakeStockContract(const std::string& symbol) const {
 void IBKRClient::ReqHistoricalData(int reqId, const std::string& symbol,
                                     const std::string& duration,
                                     const std::string& barSize,
-                                    bool useRTH) {
+                                    bool useRTH,
+                                    const std::string& endDateTime) {
     Contract c = MakeStockContract(symbol);
     TagValueListSPtr empty;
     // formatDate=2 → IB always returns Unix timestamps.
@@ -137,8 +138,11 @@ void IBKRClient::ReqHistoricalData(int reqId, const std::string& symbol,
     bool isIntraday = (barSize.find("day")   == std::string::npos &&
                        barSize.find("week")  == std::string::npos &&
                        barSize.find("month") == std::string::npos);
-    m_client->reqHistoricalData(reqId, c, "", duration, barSize,
-                                "TRADES", useRTH ? 1 : 0, 2, isIntraday, empty);
+    // When endDateTime is provided (extend-history request), disable keepUpToDate
+    // regardless of bar size — historical range requests can't use keepUpToDate.
+    bool keepUpToDate = isIntraday && endDateTime.empty();
+    m_client->reqHistoricalData(reqId, c, endDateTime, duration, barSize,
+                                "TRADES", useRTH ? 1 : 0, 2, keepUpToDate, empty);
 }
 
 void IBKRClient::CancelHistoricalData(int reqId) {
@@ -146,7 +150,13 @@ void IBKRClient::CancelHistoricalData(int reqId) {
 }
 
 void IBKRClient::ReqContractDetails(int reqId, const std::string& symbol) {
-    Contract c = MakeStockContract(symbol);
+    Contract c;
+    c.symbol   = symbol;
+    c.secType  = "STK";
+    c.currency = "USD";
+    c.exchange = "SMART";
+    // Do NOT set primaryExchange: filtering by it silently drops non-NASDAQ stocks
+    // (e.g. SPY on ARCA, BRK.B on NYSE), so onContractConId would never fire.
     m_client->reqContractDetails(reqId, c);
 }
 
@@ -202,6 +212,14 @@ void IBKRClient::ReqAccountUpdates(bool subscribe, const std::string& acctCode) 
 
 void IBKRClient::ReqPositions() {
     m_client->reqPositions();
+}
+
+void IBKRClient::ReqAccountSummary(int reqId, const std::string& tags) {
+    m_client->reqAccountSummary(reqId, "All", tags);
+}
+
+void IBKRClient::CancelAccountSummary(int reqId) {
+    m_client->cancelAccountSummary(reqId);
 }
 
 void IBKRClient::ReqScannerData(int reqId, const std::string& scanCode,
@@ -370,6 +388,9 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgNewsArticle>) {
                 if (onNewsArticle) onNewsArticle(m.reqId, 0, m.text);
+
+            } else if constexpr (std::is_same_v<T, MsgAcctSummary>) {
+                if (onAccountSummary) onAccountSummary(m.tag, m.value, m.currency);
             }
         }, msg);
 
@@ -479,11 +500,27 @@ void IBKRClient::updateMktDepthL2(TickerId id, int position,
 
 std::time_t IBKRClient::ParseIBTime(const std::string& ts) {
     if (ts.empty()) return 0;
-    // Plain unix timestamp (intraday bars)?
+
     bool allDigits = true;
     for (char c : ts) if (!isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
-    if (allDigits) return static_cast<std::time_t>(std::stoll(ts));
-    // "YYYYMMDD  HH:MM:SS" or "YYYYMMDD HH:MM:SS [TZ]"
+
+    if (allDigits) {
+        if (ts.size() == 8) {
+            // "YYYYMMDD" — IB always returns this format for D1/W1/MN bars regardless
+            // of the formatDate=2 parameter (which only applies to intraday bars).
+            // Parse as noon UTC so gmtime() always maps back to the correct calendar
+            // date in any timezone (noon UTC ± 12 h offset never crosses midnight UTC).
+            struct tm t = {};
+            strptime(ts.c_str(), "%Y%m%d", &t);
+            t.tm_hour = 12; t.tm_min = t.tm_sec = 0;
+            t.tm_isdst = 0;
+            return timegm(&t);   // POSIX: interpret tm as UTC, not local time
+        }
+        // Unix timestamp string from IB (intraday bars with formatDate=2)
+        return static_cast<std::time_t>(std::stoll(ts));
+    }
+
+    // "YYYYMMDD  HH:MM:SS" or "YYYYMMDD HH:MM:SS [TZ]" — intraday bars with formatDate=1
     struct tm t = {};
     const char* res = strptime(ts.c_str(), "%Y%m%d %H:%M:%S", &t);
     if (!res) strptime(ts.c_str(), "%Y%m%d", &t);
@@ -754,6 +791,18 @@ void IBKRClient::historicalNewsEnd(int requestId, bool /*hasMore*/) {
 void IBKRClient::newsArticle(int requestId, int /*articleType*/,
                               const std::string& articleText) {
     Push(MsgNewsArticle{requestId, articleText});
+}
+
+// ── Account summary ──────────────────────────────────────────────────────────
+
+void IBKRClient::accountSummary(int /*reqId*/, const std::string& /*account*/,
+                                 const std::string& tag, const std::string& value,
+                                 const std::string& currency) {
+    Push(MsgAcctSummary{tag, value, currency});
+}
+
+void IBKRClient::accountSummaryEnd(int /*reqId*/) {
+    // Nothing to do; all data was already pushed item-by-item.
 }
 
 } // namespace core::services

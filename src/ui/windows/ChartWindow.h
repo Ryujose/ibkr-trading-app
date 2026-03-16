@@ -49,6 +49,8 @@ public:
     void SetSymbol(const std::string& symbol);
     void AddBar(const core::Bar& bar, bool done);
     void SetHistoricalData(const core::BarSeries& series);
+    // Prepend older bars to the left of the current series (extend-history result).
+    void PrependHistoricalData(const core::BarSeries& older);
 
     // Update the currently-forming (live) bar without a full reload.
     // Called on each historicalDataUpdate callback while keepUpToDate is active.
@@ -75,6 +77,11 @@ public:
     // Fired when user changes symbol/timeframe/rth — host wires to ReqHistoricalData
     // useRTH=false → include pre/post-market bars
     std::function<void(const std::string& sym, core::Timeframe tf, bool useRTH)> OnDataRequest;
+
+    // Fired when user pans left past the first bar to request older history.
+    // endDateTime: IB-formatted "YYYYMMDD HH:MM:SS UTC" of the oldest known bar.
+    std::function<void(const std::string& sym, core::Timeframe tf,
+                       const std::string& endDateTime, bool useRTH)> OnExtendHistory;
 
     // Fired when user places an order from the chart trade panel
     // auxPrice: stop price for STP LMT, trail amount for TRAIL/TRAIL LIMIT/LIT/MIT, else 0
@@ -156,6 +163,10 @@ private:
     int   m_hoverIdx          = -1;
     float m_chartHeightRatio  = 0.60f;
     float m_volumeHeightRatio = 0.20f;
+
+    // ---- Extend-history state -----------------------------------------------
+    bool  m_loadingMore    = false;   // extend request in flight
+    bool  m_historyAtStart = false;   // no more older data available
 
     // ---- Pending order lines and position -----------------------------------
     std::vector<PendingOrderLine> m_pendingOrders;

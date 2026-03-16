@@ -4,6 +4,7 @@
 #include "implot.h"
 
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <ctime>
 #include <algorithm>
@@ -106,6 +107,8 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     if (symbol.empty() || symbol.size() >= sizeof(m_symbol)) return;
     std::memcpy(m_symbol, symbol.c_str(), symbol.size() + 1);
     m_viewInitialized = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
     // Reset drawing / order state so NoInputs is never left armed on the new symbol
     m_drawTool    = DrawTool::Cursor;
     m_drawPending = false;
@@ -144,9 +147,45 @@ void ChartWindow::SetHistoricalData(const core::BarSeries& series) {
     m_hasRealData     = true;
     m_needsRefresh    = false;
     m_loading         = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
     m_viewInitialized = false;
     RebuildFlatArrays();
     ComputeIndicators();
+}
+
+void ChartWindow::PrependHistoricalData(const core::BarSeries& older) {
+    m_loadingMore = false;
+    if (older.bars.empty()) {
+        m_historyAtStart = true;   // IB returned nothing — we're at the oldest data
+        return;
+    }
+
+    // Only keep bars strictly older than our current first bar to avoid duplicates
+    double firstTs = m_xs.empty() ? 1e18 : m_xs[0];
+    core::BarSeries merged;
+    merged.symbol    = m_series.symbol;
+    merged.timeframe = m_series.timeframe;
+    for (const auto& b : older.bars)
+        if (b.timestamp < firstTs) merged.bars.push_back(b);
+
+    if (merged.bars.empty()) {
+        m_historyAtStart = true;
+        return;
+    }
+
+    int prependCount = (int)merged.bars.size();
+
+    // Append existing bars after the older ones
+    for (const auto& b : m_series.bars) merged.bars.push_back(b);
+    m_series = std::move(merged);
+
+    RebuildFlatArrays();
+    ComputeIndicators();
+
+    // Shift the X axis links right so the visible window stays on the same candles
+    m_xMin += prependCount;
+    m_xMax += prependCount;
 }
 
 void ChartWindow::UpdateLiveBar(const core::Bar& bar) {
@@ -204,28 +243,29 @@ void ChartWindow::OnLastPrice(double price) {
 }
 
 void ChartWindow::EnsureTodayBar(double price) {
-    // Compute today's date in local time
+    // Use UTC for date comparisons so the result agrees with ParseIBTime's noon-UTC
+    // convention and with XTickFormatter which uses gmtime() for D1+ labels.
     std::time_t now = std::time(nullptr);
     struct tm nowTm{};
-    localtime_r(&now, &nowTm);
+    gmtime_r(&now, &nowTm);
 
-    // No bars on weekends — IB won't send ticks either, but guard anyway
+    // No bars on weekends
     if (nowTm.tm_wday == 0 || nowTm.tm_wday == 6) return;
 
     // Check if today's bar is already the last bar
     if (!m_xs.empty()) {
         std::time_t lastTs = static_cast<std::time_t>(m_xs.back());
         struct tm lastTm{};
-        localtime_r(&lastTs, &lastTm);
+        gmtime_r(&lastTs, &lastTm);
         if (nowTm.tm_year == lastTm.tm_year && nowTm.tm_yday == lastTm.tm_yday)
             return;  // already have today
     }
 
-    // Build today's bar at local midnight
-    struct tm midnight = nowTm;
-    midnight.tm_hour = midnight.tm_min = midnight.tm_sec = 0;
-    midnight.tm_isdst = -1;
-    auto todayTs = static_cast<double>(mktime(&midnight));
+    // Build today's bar at noon UTC — same convention as ParseIBTime("YYYYMMDD").
+    struct tm noon = nowTm;
+    noon.tm_hour = 12; noon.tm_min = noon.tm_sec = 0;
+    noon.tm_isdst = 0;
+    auto todayTs = static_cast<double>(timegm(&noon));
 
     core::Bar today{};
     today.timestamp = todayTs;
@@ -315,6 +355,11 @@ bool ChartWindow::Render() {
     if (!m_open) return false;
 
     ImGui::SetNextWindowSize(ImVec2(1000, 720), ImGuiCond_FirstUseEver);
+    // Enforce a minimum height so Volume / RSI sub-plots are never clipped out of view.
+    float minH = 460.0f;
+    if (m_ind.volume) minH += 90.0f;
+    if (m_ind.rsi)    minH += 90.0f;
+    ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, minH), ImVec2(FLT_MAX, FLT_MAX));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (!ImGui::Begin("Chart", &m_open, flags)) {
         ImGui::End();
@@ -829,6 +874,44 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     bool hovered   = ImGui::IsMouseHoveringRect(pMin, pMax, false);
     ImPlotPoint mp = hovered ? ImPlot::GetPlotMousePos() : ImPlotPoint{0, 0};
 
+    // ── Position break-even line ──────────────────────────────────────────────
+    // Shows the price at which net P&L = 0 after the commissions already paid.
+    // For long: be = avgCost + commission/qty.  For short: commission/qty is negative.
+    if (m_position.hasPosition && std::abs(m_position.qty) > 1e-9 &&
+        m_position.avgCost > 0.0) {
+        double qty  = m_position.qty;
+        double comm = m_position.commission;
+        double be   = m_position.avgCost + (comm > 1e-9 ? comm / qty : 0.0);
+
+        static constexpr ImU32 kBeCol = IM_COL32(255, 215,  50, 220);
+        static constexpr ImU32 kBeBg  = IM_COL32( 70,  55,   5, 235);
+
+        ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, be);
+        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, be);
+        DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, kBeCol, 1.5f, 5.f, 3.f);
+
+        // Centre label
+        char beBuf[80];
+        if (comm > 1e-9)
+            std::snprintf(beBuf, sizeof(beBuf),
+                          " B/E  $%.2f   (net 0 incl. $%.2f comm) ", be, comm);
+        else
+            std::snprintf(beBuf, sizeof(beBuf), " B/E  $%.2f ", be);
+        ImVec2 beSz = ImGui::CalcTextSize(beBuf);
+        float  beX  = lp0.x + 20.f;
+        dl->AddRectFilled(ImVec2(beX - 2, lp0.y - 8),
+                          ImVec2(beX + beSz.x + 2, lp0.y + 8), kBeBg, 2.f);
+        dl->AddText(ImVec2(beX, lp0.y - 7), kBeCol, beBuf);
+
+        // Right-edge price tag
+        char edgeBuf[24];
+        std::snprintf(edgeBuf, sizeof(edgeBuf), " B/E %.2f ", be);
+        ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
+        dl->AddRectFilled(ImVec2(lp1.x, lp0.y - 9),
+                          ImVec2(lp1.x + eSz.x + 4, lp0.y + 9), kBeBg, 2.f);
+        dl->AddText(ImVec2(lp1.x + 2, lp0.y - 7), kBeCol, edgeBuf);
+    }
+
     // ── Render stored drawings ─────────────────────────────────────────────
     for (const auto& dr : m_drawings) {
         switch (dr.type) {
@@ -978,20 +1061,49 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, drawPrice);
         ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, drawPrice);
 
+        // ── Position-aware P&L helper ─────────────────────────────────────────
+        // Returns net P&L (gross minus entry commission) when this order closes the
+        // current position at the given price; returns NaN when not applicable.
+        auto calcOrderPnL = [&](double price) -> double {
+            if (isAux) return std::nan("");            // aux leg: P&L on main leg
+            if (!m_position.hasPosition) return std::nan("");
+            double posQty = m_position.qty;
+            bool closingLong  = !order.isBuy && posQty >  1e-9;
+            bool closingShort =  order.isBuy && posQty < -1e-9;
+            if (!closingLong && !closingShort) return std::nan("");
+            double closeQty = std::min((double)order.qty, std::abs(posQty));
+            double gross = closingLong
+                           ? (price - m_position.avgCost) * closeQty
+                           : (m_position.avgCost - price) * closeQty;
+            return gross - m_position.commission;
+        };
+
         // Pre-compute label text and cancel-button rect so we can exclude the
         // button area from the drag-start hit-test (same click must not do both).
-        char lbl[96];
+        char lbl[128];
         const char* legTag = isAux ? "LMT" : (order.orderType == "STP LMT" ? "STP" : "");
-        if (isDragging)
-            std::snprintf(lbl, sizeof(lbl), " %s %s%.0f  $%.2f  [release] ",
-                          order.isBuy ? "BUY" : "SELL",
-                          legTag[0] ? legTag : "", order.qty, drawPrice);
-        else if (legTag[0])
-            std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f ",
-                          order.isBuy ? "BUY" : "SELL", legTag, drawPrice);
-        else
-            std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f ",
-                          order.isBuy ? "BUY" : "SELL", order.qty, drawPrice);
+        {
+            double pnl = calcOrderPnL(drawPrice);
+            if (isDragging) {
+                if (!std::isnan(pnl))
+                    std::snprintf(lbl, sizeof(lbl),
+                                  " %s %.0f  $%.2f   P&L %+.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %s%.0f  $%.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL",
+                                  legTag[0] ? legTag : "", order.qty, drawPrice);
+            } else if (legTag[0]) {
+                std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f ",
+                              order.isBuy ? "BUY" : "SELL", legTag, drawPrice);
+            } else if (!std::isnan(pnl)) {
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+            } else {
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice);
+            }
+        }
 
         ImVec2 lblSz  = ImGui::CalcTextSize(lbl);
         float  lblX   = lp0.x + 20.f;
@@ -1040,6 +1152,26 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             }
         }
 
+        // Rebuild label with the live drawPrice (updated above during drag) so the
+        // displayed price and P&L always match where the line is actually drawn.
+        if (isDragging || !std::isnan(calcOrderPnL(drawPrice))) {
+            double pnl = calcOrderPnL(drawPrice);
+            if (isDragging) {
+                if (!std::isnan(pnl))
+                    std::snprintf(lbl, sizeof(lbl),
+                                  " %s %.0f  $%.2f   P&L %+.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %s%.0f  $%.2f  [release] ",
+                                  order.isBuy ? "BUY" : "SELL",
+                                  legTag[0] ? legTag : "", order.qty, drawPrice);
+            } else if (!std::isnan(pnl)) {
+                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
+                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+            }
+            lblSz = ImGui::CalcTextSize(lbl);
+        }
+
         float lineThick = (nearLine || isDragging) ? 2.5f : 1.5f;
         DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol, lineThick, 8.f, 5.f);
 
@@ -1086,17 +1218,24 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         bool isBuy    = (m_limitSide == "BUY");
         double cursorPrice = std::round(mp.y / 0.01) * 0.01;
 
-        // Helper: draw a floating dashed line with a price bubble at the cursor
+        // Helper: draw a floating dashed line with a price bubble at the cursor.
+        // pnl=NaN → no P&L annotation.
         auto drawArmedLine = [&](double linePrice, ImU32 lineCol, ImU32 bubBg,
-                                  const char* tag, bool followsCursor) {
+                                  const char* tag, bool followsCursor,
+                                  double pnl = std::numeric_limits<double>::quiet_NaN()) {
             ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, linePrice);
             ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, linePrice);
             DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol,
                             followsCursor ? 2.0f : 2.5f, 8.f, 5.f);
 
             // Floating price bubble at cursor X (or center for fixed line)
-            char bubBuf[32];
-            std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f", tag, linePrice);
+            char bubBuf[64];
+            if (!std::isnan(pnl))
+                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f   P&L %+.2f",
+                              tag[0] ? tag : m_limitSide.c_str(), linePrice, pnl);
+            else
+                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f",
+                              tag[0] ? tag : m_limitSide.c_str(), linePrice);
             ImVec2 bubSz  = ImGui::CalcTextSize(bubBuf);
             float  mouseX = followsCursor
                             ? ImGui::GetIO().MousePos.x
@@ -1112,14 +1251,34 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                                   ImVec2(midX+4, by+bubSz.y+4),
                                   ImVec2(midX,   lp0.y), bubBg);
 
-            // Right-edge label
-            char edgeBuf[48];
-            std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f ",
-                          m_limitSide.c_str(), tag, linePrice);
+            // Right-edge label (shows P&L when available)
+            char edgeBuf[64];
+            if (!std::isnan(pnl))
+                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f   %+.2f ",
+                              m_limitSide.c_str(), tag, linePrice, pnl);
+            else
+                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f ",
+                              m_limitSide.c_str(), tag, linePrice);
             ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
             dl->AddRectFilled(ImVec2(lp1.x, lp0.y-9),
                               ImVec2(lp1.x+eSz.x+4, lp0.y+9), bubBg, 2.f);
             dl->AddText(ImVec2(lp1.x+2, lp0.y-7), IM_COL32(255,255,255,255), edgeBuf);
+        };
+
+        // Compute P&L for an armed (new) order at the given price against the position.
+        auto calcArmedPnL = [&](double price) -> double {
+            if (!m_position.hasPosition || std::abs(m_position.qty) < 1e-9 ||
+                m_position.avgCost <= 0.0)
+                return std::numeric_limits<double>::quiet_NaN();
+            bool closingLong  = (m_limitSide == "SELL") && (m_position.qty >  1e-9);
+            bool closingShort = (m_limitSide == "BUY")  && (m_position.qty < -1e-9);
+            if (!closingLong && !closingShort)
+                return std::numeric_limits<double>::quiet_NaN();
+            double closeQty = std::min((double)m_orderQty, std::abs(m_position.qty));
+            double gross = closingLong
+                           ? (price - m_position.avgCost) * closeQty
+                           : (m_position.avgCost - price) * closeQty;
+            return gross - m_position.commission;
         };
 
         // Colors
@@ -1130,8 +1289,10 @@ void ChartWindow::DrawOverlays(double /*step*/) {
 
         if (isDual && m_firstPricePlaced) {
             // Phase 2: fixed stop line + moving limit line
-            drawArmedLine(m_firstPrice,  stopCol, stopBg, "STOP", false);
-            drawArmedLine(cursorPrice,   lmtCol,  lmtBg,  "LMT",  true);
+            // P&L shown on the limit leg (the fill price that determines profit)
+            drawArmedLine(m_firstPrice, stopCol, stopBg, "STOP", false);
+            drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
+                          calcArmedPnL(cursorPrice));
 
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (OnOrderSubmit) {
@@ -1148,7 +1309,11 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         } else {
             // Phase 1: single moving line (stop/trigger for dual, price for single)
             const char* tag = isDual ? "STOP" : "";
-            drawArmedLine(cursorPrice, stopCol, stopBg, tag, true);
+            // For dual types the P&L is shown later (phase 2 limit leg); for single types
+            // show it now — a stop on a long position exits at the stop price.
+            double armedPnL = isDual ? std::numeric_limits<double>::quiet_NaN()
+                                     : calcArmedPnL(cursorPrice);
+            drawArmedLine(cursorPrice, stopCol, stopBg, tag, true, armedPnL);
 
             bool ctrlHeld = ImGui::GetIO().KeyCtrl;
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -1255,6 +1420,9 @@ void ChartWindow::DrawCandleChart() {
     float chartH    = available - volumeH - rsiH
                       - (m_ind.volume ? spacing : 0.0f)
                       - (m_ind.rsi    ? spacing : 0.0f);
+    chartH  = std::max(chartH,  80.0f);
+    volumeH = std::max(volumeH, m_ind.volume ? 60.0f : 0.0f);
+    rsiH    = std::max(rsiH,    m_ind.rsi    ? 60.0f : 0.0f);
 
     // Disable ImPlot panning for drawing tools and while dragging an order line.
     // Do NOT add NoInputs for m_limitArmed: ImPlot must keep its mouse-position
@@ -1273,6 +1441,21 @@ void ChartWindow::DrawCandleChart() {
     ImPlot::SetupAxisLinks(ImAxis_X1, &m_xMin, &m_xMax);
     ImPlot::SetupAxisLinks(ImAxis_Y1, &m_priceMin, &m_priceMax);
     ImPlot::SetupFinish();
+
+    // ── Pan-to-load-more: fire OnExtendHistory when user drags past first bar ──
+    // Trigger when the left edge of the view is 3+ bars before the start of data.
+    if (!m_loading && !m_loadingMore && !m_historyAtStart &&
+        !m_xs.empty() && m_xMin < -3.0 && OnExtendHistory) {
+        m_loadingMore = true;
+        // Format the timestamp of the first bar as IB endDateTime (1 second before
+        // so the new series ends strictly before what we already have).
+        std::time_t endTs = static_cast<std::time_t>(m_xs[0]) - 1;
+        struct tm   endTm{};
+        gmtime_r(&endTs, &endTm);
+        char endBuf[32];
+        std::strftime(endBuf, sizeof(endBuf), "%Y%m%d %H:%M:%S UTC", &endTm);
+        OnExtendHistory(m_symbol, m_timeframe, endBuf, m_useRTH);
+    }
 
     // Session background bands (pre/post/overnight shading)
     DrawSessionBands();
@@ -1531,6 +1714,8 @@ void ChartWindow::DrawVolumeChart() {
     float available = ImGui::GetContentRegionAvail().y;
     float rsiH      = m_ind.rsi ? available * (0.20f / (1.0f - m_volumeHeightRatio)) : 0.0f;
     float volH      = available - rsiH - (m_ind.rsi ? ImGui::GetStyle().ItemSpacing.y : 0.0f);
+    rsiH = std::max(rsiH, m_ind.rsi ? 60.0f : 0.0f);
+    volH = std::max(volH, 60.0f);
 
     double maxVol = 1.0;
     for (int i = 0; i < n; i++)
@@ -1569,7 +1754,8 @@ void ChartWindow::DrawRsiChart() {
     int n = (int)m_idxs.size();
     if (n == 0 || (int)m_rsi.size() != n) return;
 
-    if (!ImPlot::BeginPlot("##rsi", ImVec2(-1, -1),
+    float rsiAvail = std::max(60.0f, ImGui::GetContentRegionAvail().y);
+    if (!ImPlot::BeginPlot("##rsi", ImVec2(-1, rsiAvail),
                            ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
         return;
 

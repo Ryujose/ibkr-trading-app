@@ -169,8 +169,9 @@ void NewsWindow::DrawToolbar() {
 void NewsWindow::DrawTabMarket() {
     if (m_marketNews.empty()) {
         ImGui::Spacing();
-        ImGui::TextDisabled("  Loading recent news...");
-        ImGui::TextDisabled("  New headlines will appear automatically as IB pushes them.");
+        ImGui::TextDisabled("  No real-time news yet.");
+        ImGui::TextDisabled("  Headlines appear automatically when IB delivers them.");
+        ImGui::TextDisabled("  (Requires an active IB market data + news subscription.)");
         return;
     }
     DrawBreakingBanner(m_marketNews);

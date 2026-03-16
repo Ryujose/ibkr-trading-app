@@ -41,6 +41,8 @@ public:
     // --- IB Gateway callbacks (future integration) ---
     void OnAccountValue(const std::string& key, const std::string& val,
                         const std::string& currency, const std::string& accountName);
+    // Called by main.cpp with the reliable base currency from reqAccountSummary.
+    void SetBaseCurrency(const std::string& currency) { m_account.baseCurrency = currency; }
     void OnPositionUpdate(const core::Position& pos);
     void OnTradeExecuted(const core::TradeRecord& trade);
     void OnAccountEnd();
