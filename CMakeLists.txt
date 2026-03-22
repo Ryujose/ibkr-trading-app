@@ -51,7 +51,11 @@ option(IBKR_USE_SYSTEM_VULKAN "Use system-installed Vulkan headers" OFF)
 
 # Check C++20 support
 include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-std=c++20" COMPILER_SUPPORTS_CXX20)
+if(MSVC)
+    check_cxx_compiler_flag("/std:c++20" COMPILER_SUPPORTS_CXX20)
+else()
+    check_cxx_compiler_flag("-std=c++20" COMPILER_SUPPORTS_CXX20)
+endif()
 if(NOT COMPILER_SUPPORTS_CXX20)
     message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} does not support C++20. This is required.")
 endif()
@@ -191,9 +195,17 @@ target_include_directories(ibapi-lib PUBLIC
     ${IBAPI_PROTO_DIR}
     ${Protobuf_INCLUDE_DIRS}
 )
-target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES} pthread)
+if(WIN32)
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES})
+else()
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES} pthread)
+endif()
 # Suppress warnings from third-party IB API code
-target_compile_options(ibapi-lib PRIVATE -w)
+if(MSVC)
+    target_compile_options(ibapi-lib PRIVATE /w)
+else()
+    target_compile_options(ibapi-lib PRIVATE -w)
+endif()
 # IB API uses C++14 features; allow its sources to compile as C++17
 set_target_properties(ibapi-lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED OFF)
 

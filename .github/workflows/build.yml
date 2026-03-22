@@ -56,8 +56,14 @@ jobs:
           tar -xzf twsapi_macunix.1037.02.tar.gz
           rm twsapi_macunix.1037.02.tar.gz
 
+      - name: Regenerate protobuf sources
+        run: |
+          PROTO_SRC=twsapi_macunix.1037.02/IBJts/source/proto
+          PROTO_OUT=twsapi_macunix.1037.02/IBJts/source/cppclient/client/protobufUnix
+          protoc --cpp_out=$PROTO_OUT --proto_path=$PROTO_SRC $PROTO_SRC/*.proto
+
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$(brew --prefix)
 
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu)
@@ -85,6 +91,15 @@ jobs:
             -pass pass:${{ secrets.TWSAPI_DECRYPT_KEY }}
           tar -xzf twsapi_macunix.1037.02.tar.gz
           Remove-Item twsapi_macunix.1037.02.tar.gz
+        shell: pwsh
+
+      - name: Regenerate protobuf sources
+        run: |
+          $PROTO_SRC = "twsapi_macunix.1037.02/IBJts/source/proto"
+          $PROTO_OUT = "twsapi_macunix.1037.02/IBJts/source/cppclient/client/protobufUnix"
+          Get-ChildItem $PROTO_SRC -Filter *.proto | ForEach-Object {
+            protoc --cpp_out=$PROTO_OUT --proto_path=$PROTO_SRC $_.FullName
+          }
         shell: pwsh
 
       - name: Configure
