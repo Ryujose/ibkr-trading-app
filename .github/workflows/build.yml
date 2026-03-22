@@ -37,3 +37,71 @@ jobs:
 
       - name: Build
         run: cmake --build build -j$(nproc)
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: brew install cmake glfw protobuf
+
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.204.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Decrypt TWS API
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -in twsapi_macunix.1037.02.tar.gz.enc \
+            -out twsapi_macunix.1037.02.tar.gz \
+            -pass pass:${{ secrets.TWSAPI_DECRYPT_KEY }}
+          tar -xzf twsapi_macunix.1037.02.tar.gz
+          rm twsapi_macunix.1037.02.tar.gz
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-query-version: 1.3.204.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Install dependencies via vcpkg
+        run: vcpkg install glfw3:x64-windows protobuf:x64-windows
+
+      - name: Decrypt TWS API
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 `
+            -in twsapi_macunix.1037.02.tar.gz.enc `
+            -out twsapi_macunix.1037.02.tar.gz `
+            -pass pass:${{ secrets.TWSAPI_DECRYPT_KEY }}
+          tar -xzf twsapi_macunix.1037.02.tar.gz
+          Remove-Item twsapi_macunix.1037.02.tar.gz
+        shell: pwsh
+
+      - name: Configure
+        run: >
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows
+        shell: pwsh
+
+      - name: Build
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
