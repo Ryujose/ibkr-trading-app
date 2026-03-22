@@ -122,6 +122,9 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(implot)
 
+# Find GLFW3 early — needed by imgui backends
+find_package(glfw3 REQUIRED)
+
 # ============================================================================
 # Create ImGui Library from source files
 # ============================================================================
@@ -147,6 +150,7 @@ target_include_directories(imgui-lib PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
+target_link_libraries(imgui-lib PRIVATE glfw)
 
 target_sources(imgui-lib PRIVATE
     ${IMGUI_BACKENDS_SOURCES}
@@ -222,9 +226,6 @@ set(APPLICATION_SOURCES
     src/ui/windows/PortfolioWindow.cpp
     src/ui/windows/OrdersWindow.cpp
 )
-
-# Find GLFW3 library (use system installed)
-find_package(glfw3 REQUIRED)
 
 set(APPLICATION_LIBS
     # Core libraries - our custom libs + system imports
