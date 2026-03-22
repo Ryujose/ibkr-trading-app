@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libvulkan-dev vulkan-validationlayers \
+            libglfw3-dev \
+            libprotobuf-dev protobuf-compiler \
+            libgl1-mesa-dev
+
+      - name: Decrypt TWS API
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -in twsapi_macunix.1037.02.tar.gz.enc \
+            -out twsapi_macunix.1037.02.tar.gz \
+            -pass pass:${{ secrets.TWSAPI_DECRYPT_KEY }}
+          tar -xzf twsapi_macunix.1037.02.tar.gz
+          rm twsapi_macunix.1037.02.tar.gz
+
+      - name: Configure
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
