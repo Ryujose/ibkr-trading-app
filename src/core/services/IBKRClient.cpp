@@ -16,6 +16,8 @@
 
 #include <cstring>
 #include <ctime>
+#include <sstream>
+#include <iomanip>
 #include <cassert>
 #include <chrono>
 
@@ -511,10 +513,14 @@ std::time_t IBKRClient::ParseIBTime(const std::string& ts) {
             // Parse as noon UTC so gmtime() always maps back to the correct calendar
             // date in any timezone (noon UTC ± 12 h offset never crosses midnight UTC).
             struct tm t = {};
-            strptime(ts.c_str(), "%Y%m%d", &t);
+            std::istringstream(ts) >> std::get_time(&t, "%Y%m%d");
             t.tm_hour = 12; t.tm_min = t.tm_sec = 0;
             t.tm_isdst = 0;
-            return timegm(&t);   // POSIX: interpret tm as UTC, not local time
+#ifdef _WIN32
+            return _mkgmtime(&t);
+#else
+            return timegm(&t);
+#endif
         }
         // Unix timestamp string from IB (intraday bars with formatDate=2)
         return static_cast<std::time_t>(std::stoll(ts));
@@ -522,8 +528,9 @@ std::time_t IBKRClient::ParseIBTime(const std::string& ts) {
 
     // "YYYYMMDD  HH:MM:SS" or "YYYYMMDD HH:MM:SS [TZ]" — intraday bars with formatDate=1
     struct tm t = {};
-    const char* res = strptime(ts.c_str(), "%Y%m%d %H:%M:%S", &t);
-    if (!res) strptime(ts.c_str(), "%Y%m%d", &t);
+    std::istringstream ss(ts);
+    ss >> std::get_time(&t, "%Y%m%d %H:%M:%S");
+    if (ss.fail()) { ss.clear(); std::istringstream(ts) >> std::get_time(&t, "%Y%m%d"); }
     t.tm_isdst = -1;
     return mktime(&t);
 }

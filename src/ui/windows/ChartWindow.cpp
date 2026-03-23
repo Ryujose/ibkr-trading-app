@@ -246,8 +246,7 @@ void ChartWindow::EnsureTodayBar(double price) {
     // Use UTC for date comparisons so the result agrees with ParseIBTime's noon-UTC
     // convention and with XTickFormatter which uses gmtime() for D1+ labels.
     std::time_t now = std::time(nullptr);
-    struct tm nowTm{};
-    gmtime_r(&now, &nowTm);
+    struct tm nowTm = *std::gmtime(&now);
 
     // No bars on weekends
     if (nowTm.tm_wday == 0 || nowTm.tm_wday == 6) return;
@@ -255,8 +254,7 @@ void ChartWindow::EnsureTodayBar(double price) {
     // Check if today's bar is already the last bar
     if (!m_xs.empty()) {
         std::time_t lastTs = static_cast<std::time_t>(m_xs.back());
-        struct tm lastTm{};
-        gmtime_r(&lastTs, &lastTm);
+        struct tm lastTm = *std::gmtime(&lastTs);
         if (nowTm.tm_year == lastTm.tm_year && nowTm.tm_yday == lastTm.tm_yday)
             return;  // already have today
     }
@@ -265,7 +263,11 @@ void ChartWindow::EnsureTodayBar(double price) {
     struct tm noon = nowTm;
     noon.tm_hour = 12; noon.tm_min = noon.tm_sec = 0;
     noon.tm_isdst = 0;
+#ifdef _WIN32
+    auto todayTs = static_cast<double>(_mkgmtime(&noon));
+#else
     auto todayTs = static_cast<double>(timegm(&noon));
+#endif
 
     core::Bar today{};
     today.timestamp = todayTs;
@@ -1450,8 +1452,7 @@ void ChartWindow::DrawCandleChart() {
         // Format the timestamp of the first bar as IB endDateTime (1 second before
         // so the new series ends strictly before what we already have).
         std::time_t endTs = static_cast<std::time_t>(m_xs[0]) - 1;
-        struct tm   endTm{};
-        gmtime_r(&endTs, &endTm);
+        struct tm   endTm = *std::gmtime(&endTs);
         char endBuf[32];
         std::strftime(endBuf, sizeof(endBuf), "%Y%m%d %H:%M:%S UTC", &endTm);
         OnExtendHistory(m_symbol, m_timeframe, endBuf, m_useRTH);
