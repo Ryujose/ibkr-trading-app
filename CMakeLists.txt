@@ -30,6 +30,11 @@ endif()
 # Platform-specific settings
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Use static CRT on Windows to match x64-windows-static vcpkg triplet (/MT)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 if(UNIX AND NOT APPLE)
     set(LINUX TRUE)
     add_compile_options(-Wall -Wextra -Wpedantic)
@@ -186,8 +191,22 @@ set(IBAPI_PROTO_DIR "${IBAPI_DIR}/protobufUnix")
 add_library(bid-stubs STATIC src/bid_stubs/bid_stubs.c)
 target_include_directories(bid-stubs PUBLIC ${IBAPI_DIR})
 
-# Protobuf (system-installed)
-find_package(Protobuf REQUIRED)
+# Protobuf — config-mode preferred (vcpkg/modern installs), fallback to module-mode
+find_package(protobuf CONFIG QUIET)
+if(protobuf_FOUND)
+    # Config-mode found (vcpkg). Target protobuf::libprotobuf already exists with
+    # transitive abseil deps. Include dirs propagate via link; no need for explicit vars.
+    set(Protobuf_INCLUDE_DIRS "")
+    set(Protobuf_FOUND TRUE)
+else()
+    find_package(Protobuf REQUIRED)
+    # Module-mode: ensure modern target name exists for uniform usage below
+    if(NOT TARGET protobuf::libprotobuf)
+        add_library(protobuf::libprotobuf INTERFACE IMPORTED)
+        target_link_libraries(protobuf::libprotobuf INTERFACE ${Protobuf_LIBRARIES})
+        target_include_directories(protobuf::libprotobuf INTERFACE ${Protobuf_INCLUDE_DIRS})
+    endif()
+endif()
 
 # IB API static library
 file(GLOB IBAPI_CPP_SOURCES "${IBAPI_DIR}/*.cpp")
@@ -200,9 +219,9 @@ target_include_directories(ibapi-lib PUBLIC
     ${Protobuf_INCLUDE_DIRS}
 )
 if(WIN32)
-    target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES})
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs protobuf::libprotobuf)
 else()
-    target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES} pthread)
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs protobuf::libprotobuf pthread)
 endif()
 # Suppress warnings from third-party IB API code
 if(MSVC)
