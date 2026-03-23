@@ -30,6 +30,11 @@ endif()
 # Platform-specific settings
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+# Use static CRT on Windows to match x64-windows-static vcpkg triplet (/MT)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 if(UNIX AND NOT APPLE)
     set(LINUX TRUE)
     add_compile_options(-Wall -Wextra -Wpedantic)
@@ -51,7 +56,11 @@ option(IBKR_USE_SYSTEM_VULKAN "Use system-installed Vulkan headers" OFF)
 
 # Check C++20 support
 include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-std=c++20" COMPILER_SUPPORTS_CXX20)
+if(MSVC)
+    check_cxx_compiler_flag("/std:c++20" COMPILER_SUPPORTS_CXX20)
+else()
+    check_cxx_compiler_flag("-std=c++20" COMPILER_SUPPORTS_CXX20)
+endif()
 if(NOT COMPILER_SUPPORTS_CXX20)
     message(FATAL_ERROR "The compiler ${CMAKE_CXX_COMPILER} does not support C++20. This is required.")
 endif()
@@ -118,6 +127,9 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(implot)
 
+# Find GLFW3 early — needed by imgui backends
+find_package(glfw3 REQUIRED)
+
 # ============================================================================
 # Create ImGui Library from source files
 # ============================================================================
@@ -143,6 +155,7 @@ target_include_directories(imgui-lib PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
+target_link_libraries(imgui-lib PRIVATE glfw Vulkan::Vulkan)
 
 target_sources(imgui-lib PRIVATE
     ${IMGUI_BACKENDS_SOURCES}
@@ -178,8 +191,22 @@ set(IBAPI_PROTO_DIR "${IBAPI_DIR}/protobufUnix")
 add_library(bid-stubs STATIC src/bid_stubs/bid_stubs.c)
 target_include_directories(bid-stubs PUBLIC ${IBAPI_DIR})
 
-# Protobuf (system-installed)
-find_package(Protobuf REQUIRED)
+# Protobuf — config-mode preferred (vcpkg/modern installs), fallback to module-mode
+find_package(protobuf CONFIG QUIET)
+if(protobuf_FOUND)
+    # Config-mode found (vcpkg). Target protobuf::libprotobuf already exists with
+    # transitive abseil deps. Include dirs propagate via link; no need for explicit vars.
+    set(Protobuf_INCLUDE_DIRS "")
+    set(Protobuf_FOUND TRUE)
+else()
+    find_package(Protobuf REQUIRED)
+    # Module-mode: ensure modern target name exists for uniform usage below
+    if(NOT TARGET protobuf::libprotobuf)
+        add_library(protobuf::libprotobuf INTERFACE IMPORTED)
+        target_link_libraries(protobuf::libprotobuf INTERFACE ${Protobuf_LIBRARIES})
+        target_include_directories(protobuf::libprotobuf INTERFACE ${Protobuf_INCLUDE_DIRS})
+    endif()
+endif()
 
 # IB API static library
 file(GLOB IBAPI_CPP_SOURCES "${IBAPI_DIR}/*.cpp")
@@ -191,9 +218,17 @@ target_include_directories(ibapi-lib PUBLIC
     ${IBAPI_PROTO_DIR}
     ${Protobuf_INCLUDE_DIRS}
 )
-target_link_libraries(ibapi-lib PUBLIC bid-stubs ${Protobuf_LIBRARIES} pthread)
+if(WIN32)
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs protobuf::libprotobuf)
+else()
+    target_link_libraries(ibapi-lib PUBLIC bid-stubs protobuf::libprotobuf pthread)
+endif()
 # Suppress warnings from third-party IB API code
-target_compile_options(ibapi-lib PRIVATE -w)
+if(MSVC)
+    target_compile_options(ibapi-lib PRIVATE /w)
+else()
+    target_compile_options(ibapi-lib PRIVATE -w)
+endif()
 # IB API uses C++14 features; allow its sources to compile as C++17
 set_target_properties(ibapi-lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED OFF)
 
@@ -210,9 +245,6 @@ set(APPLICATION_SOURCES
     src/ui/windows/PortfolioWindow.cpp
     src/ui/windows/OrdersWindow.cpp
 )
-
-# Find GLFW3 library (use system installed)
-find_package(glfw3 REQUIRED)
 
 set(APPLICATION_LIBS
     # Core libraries - our custom libs + system imports
