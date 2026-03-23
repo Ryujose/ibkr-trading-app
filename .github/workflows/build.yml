@@ -9,6 +9,7 @@ on:
 jobs:
   build-linux:
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -38,8 +39,17 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibkr-trading-app-linux
+          path: build/ibkr-trading-app
+          retention-days: 30
+
   build-macos:
     runs-on: macos-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -64,8 +74,17 @@ jobs:
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu)
 
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibkr-trading-app-macos
+          path: build/ibkr-trading-app
+          retention-days: 30
+
   build-windows:
     runs-on: windows-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -116,3 +135,11 @@ jobs:
       - name: Build
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
+
+      - name: Upload artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibkr-trading-app-windows
+          path: build/Release/ibkr-trading-app.exe
+          retention-days: 30
