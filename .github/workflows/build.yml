@@ -57,7 +57,9 @@ jobs:
           rm twsapi_macunix.1037.02.tar.gz
 
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=$(brew --prefix)
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix protobuf@21);$(brew --prefix)"
 
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu)
@@ -90,8 +92,8 @@ jobs:
       - name: Regenerate protobuf sources
         run: |
           $protoc = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\tools\protobuf\protoc.exe"
-          $PROTO_SRC = "twsapi_macunix.1037.02/IBJts/source/proto"
-          $PROTO_OUT = "twsapi_macunix.1037.02/IBJts/source/cppclient/client/protobufUnix"
+          $PROTO_SRC = (Resolve-Path "twsapi_macunix.1037.02/IBJts/source/proto").Path
+          $PROTO_OUT = (Resolve-Path "twsapi_macunix.1037.02/IBJts/source/cppclient/client/protobufUnix").Path
           Get-ChildItem $PROTO_SRC -Filter *.proto | ForEach-Object {
             & $protoc --cpp_out=$PROTO_OUT --proto_path=$PROTO_SRC $_.FullName
           }
