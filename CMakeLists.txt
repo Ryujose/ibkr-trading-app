@@ -150,7 +150,7 @@ target_include_directories(imgui-lib PRIVATE
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
-target_link_libraries(imgui-lib PRIVATE glfw)
+target_link_libraries(imgui-lib PRIVATE glfw Vulkan::Vulkan)
 
 target_sources(imgui-lib PRIVATE
     ${IMGUI_BACKENDS_SOURCES}
