@@ -40,6 +40,8 @@ public:
     // Call once per frame. Returns false when window is closed.
     bool Render();
     bool& open() { return m_open; }
+    void setGroupId(int id) { m_groupId = id; }
+    int  groupId() const    { return m_groupId; }
 
     // --- IB Gateway callbacks (future integration) ---
     void OnScanData(int reqId, const std::vector<core::ScanResult>& results);
@@ -69,7 +71,8 @@ public:
 
 private:
     // ---- Window state -------------------------------------------------------
-    bool m_open = true;
+    bool m_open    = true;
+    int  m_groupId = 0;
     bool m_hasRealData = false;
 
     // ---- Asset class tabs ---------------------------------------------------

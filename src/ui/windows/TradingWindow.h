@@ -27,6 +27,8 @@ public:
 
     bool Render();
     bool& open() { return m_open; }
+    void setGroupId(int id) { m_groupId = id; }
+    int  groupId() const    { return m_groupId; }
 
     // Subscription status per data stream
     enum class SubStatus { Unknown, Ok, NeedSubscription, NotAllowed };
@@ -61,7 +63,8 @@ public:
     std::function<void(const std::string& symbol)> OnSymbolChanged;
 
 private:
-    bool m_open = true;
+    bool m_open    = true;
+    int  m_groupId = 0;
 
     // ── Subscription status ──────────────────────────────────────────────────
     SubStatus m_mktDataStatus = SubStatus::Unknown;

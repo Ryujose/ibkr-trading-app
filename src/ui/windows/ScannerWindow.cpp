@@ -1,6 +1,7 @@
 #include "ScannerWindow.h"
 
 #include "imgui.h"
+#include "core/models/WindowGroup.h"
 #include "implot.h"
 
 #include <algorithm>
@@ -358,6 +359,9 @@ void ScannerWindow::DrawToolbar()
     // Refresh interval slider
     ImGui::SetNextItemWidth(80);
     ImGui::SliderFloat("##interval", &m_autoRefreshSec, 5.f, 120.f, "%.0fs");
+
+    ImGui::SameLine(0, 12);
+    core::DrawGroupPicker(m_groupId, "##scanner_grp");
 }
 
 // ============================================================================

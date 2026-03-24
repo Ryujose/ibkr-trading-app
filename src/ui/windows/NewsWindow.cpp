@@ -1,5 +1,6 @@
 #include "ui/windows/NewsWindow.h"
 #include "imgui.h"
+#include "core/models/WindowGroup.h"
 
 #include <algorithm>
 #include <cstring>
@@ -161,6 +162,9 @@ void NewsWindow::DrawToolbar() {
     if (ImGui::Button("Refresh")) RefreshAll();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Re-request news for portfolio and current stock symbol");
+
+    ImGui::SameLine(0, 12);
+    core::DrawGroupPicker(m_groupId, "##news_grp");
 }
 
 // ============================================================================
@@ -445,6 +449,14 @@ void NewsWindow::RefreshPortfolio() {
         m_portfolioNews.clear();
         OnPortfolioNewsRequested(m_portfolioSymbols);
     }
+}
+
+void NewsWindow::SetSymbol(const std::string& sym) {
+    if (std::strncmp(m_stockSymbol, sym.c_str(), sizeof(m_stockSymbol)) == 0) return;
+    std::strncpy(m_stockSymbol, sym.c_str(), sizeof(m_stockSymbol) - 1);
+    m_stockSymbol[sizeof(m_stockSymbol) - 1] = '\0';
+    m_activeTab = 2;   // switch to Stock tab
+    RefreshStock(sym);
 }
 
 void NewsWindow::RefreshStock(const std::string& symbol) {

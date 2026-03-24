@@ -1,6 +1,7 @@
 #include "ui/windows/ChartWindow.h"
 
 #include "imgui.h"
+#include "core/models/WindowGroup.h"
 #include "implot.h"
 
 #include <cmath>
@@ -521,6 +522,9 @@ void ChartWindow::DrawToolbar() {
     ImGui::Checkbox("VWAP",   &m_ind.vwap);   ImGui::SameLine();
     ImGui::Checkbox("Vol",    &m_ind.volume); ImGui::SameLine();
     ImGui::Checkbox("RSI",    &m_ind.rsi);
+
+    ImGui::SameLine(0, 16);
+    core::DrawGroupPicker(m_groupId, "##chart_grp");
 }
 
 // ============================================================================

@@ -26,6 +26,10 @@ public:
     // Returns false if the window was closed.
     bool Render();
     bool& open() { return m_open; }
+    void setGroupId(int id) { m_groupId = id; }
+    int  groupId() const    { return m_groupId; }
+    // Switch to Stock tab and load news for the given symbol (called by group sync).
+    void SetSymbol(const std::string& sym);
 
     // ── IB data push-ins (called by main.cpp callbacks) ──────────────────
     // Real-time headline from tickNews; item.summary carries articleId as
@@ -57,6 +61,7 @@ public:
 private:
     // ---- UI state -----------------------------------------------------------
     bool m_open            = true;
+    int  m_groupId         = 0;
     int  m_activeTab       = 0;       // 0=Market, 1=Portfolio, 2=Stock
     char m_stockSymbol[16] = "AAPL";
     int  m_expandedId      = -1;      // which item is expanded (-1=none)

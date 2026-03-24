@@ -32,6 +32,7 @@
 #include "ui/windows/OrdersWindow.h"
 
 #include "core/services/IBKRClient.h"
+#include "core/models/WindowGroup.h"
 
 // ============================================================================
 // Global window instances
@@ -74,6 +75,11 @@ static int g_nextOrderId   = 1;
 
 // Current chart symbol (kept in sync with ChartWindow)
 static std::string g_chartSymbol = "AAPL";
+
+// ---- Window groups (4 slots; index 0 = group id 1) -------------------------
+static std::array<core::GroupState, 4> g_groups;
+// Guard against re-entrant group broadcasts when SetSymbol() re-fires callbacks.
+static bool g_groupSyncInProgress = false;
 
 // Live orders for chart overlay (orderId → Order; refreshed on every status change)
 static std::unordered_map<int, core::Order> g_liveOrders;
@@ -424,6 +430,25 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 }
 
 // ============================================================================
+// Group sync helper — must be defined before CreateTradingWindows lambdas
+// ============================================================================
+// Propagate a symbol change to all windows in the same group.
+// Re-entrant guard prevents loops when SetSymbol() re-fires callbacks.
+static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
+    if (groupId <= 0 || g_groupSyncInProgress) return;
+    core::GroupState& gs = g_groups[groupId - 1];
+    if (gs.symbol == sym) return;   // already broadcast this symbol
+    g_groupSyncInProgress = true;
+    gs.id     = groupId;
+    gs.symbol = sym;
+    if (g_ChartWindow   && g_ChartWindow->groupId()   == groupId) g_ChartWindow->SetSymbol(sym);
+    if (g_TradingWindow && g_TradingWindow->groupId() == groupId) g_TradingWindow->SetSymbol(sym, 0.0);
+    if (g_NewsWindow    && g_NewsWindow->groupId()    == groupId) g_NewsWindow->SetSymbol(sym);
+    // ScannerWindow is a symbol source only — no inbound SetSymbol
+    g_groupSyncInProgress = false;
+}
+
+// ============================================================================
 // Window lifecycle helpers
 // ============================================================================
 static void CreateTradingWindows() {
@@ -462,6 +487,7 @@ static void CreateTradingWindows() {
         ReqChartData(sym, tf, useRTH);
         UpdateChartPendingOrders();
         UpdateChartPosition();
+        BroadcastGroupSymbol(g_ChartWindow->groupId(), sym);
     };
 
     // Pan-left: load older historical bars and prepend them to the chart
@@ -592,6 +618,7 @@ static void CreateTradingWindows() {
         }
         UpdateChartPendingOrders();
         UpdateChartPosition();
+        BroadcastGroupSymbol(g_ScannerWindow->groupId(), sym);
     };
 
     // Wire order submission / cancellation to IB
@@ -622,6 +649,7 @@ static void CreateTradingWindows() {
         }
         UpdateChartPendingOrders();
         UpdateChartPosition();
+        BroadcastGroupSymbol(g_TradingWindow->groupId(), sym);
     };
 
     // Wire scanner to IB
@@ -1445,6 +1473,29 @@ static void RenderLoginWindow() {
 }
 
 // ============================================================================
+// Window presets
+// ============================================================================
+static const core::WindowPreset kBuiltinPresets[] = {
+    // name           chart       trading     news        scanner     portfolio   orders
+    { "Trading Focus",{true,  1}, {true,  1}, {false, 0}, {false, 0}, {false, 0}, {true,  1} },
+    { "Research",     {true,  1}, {false, 0}, {true,  1}, {true,  1}, {false, 0}, {false, 0} },
+    { "Full Desk",    {true,  1}, {true,  1}, {true,  2}, {true,  2}, {true,  0}, {true,  1} },
+};
+static constexpr int kNumBuiltinPresets = static_cast<int>(
+    sizeof(kBuiltinPresets) / sizeof(kBuiltinPresets[0]));
+
+static void ApplyPreset(const core::WindowPreset& p) {
+    if (g_ChartWindow)     { g_ChartWindow->open()     = p.chart.visible;     g_ChartWindow->setGroupId(p.chart.groupId); }
+    if (g_TradingWindow)   { g_TradingWindow->open()   = p.trading.visible;   g_TradingWindow->setGroupId(p.trading.groupId); }
+    if (g_NewsWindow)      { g_NewsWindow->open()      = p.news.visible;      g_NewsWindow->setGroupId(p.news.groupId); }
+    if (g_ScannerWindow)   { g_ScannerWindow->open()   = p.scanner.visible;   g_ScannerWindow->setGroupId(p.scanner.groupId); }
+    if (g_PortfolioWindow) { g_PortfolioWindow->open() = p.portfolio.visible; }
+    if (g_OrdersWindow)    { g_OrdersWindow->open()    = p.orders.visible; }
+    // Reset group state so the next symbol change re-broadcasts correctly
+    for (auto& gs : g_groups) gs.symbol.clear();
+}
+
+// ============================================================================
 // Trading UI (post-login)
 // ============================================================================
 static void RenderTradingUI() {
@@ -1467,12 +1518,19 @@ static void RenderTradingUI() {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                if (g_ChartWindow)    ImGui::MenuItem("Chart",        nullptr, &g_ChartWindow->open());
-                if (g_TradingWindow)  ImGui::MenuItem("Order Book",   nullptr, &g_TradingWindow->open());
-                if (g_OrdersWindow)   ImGui::MenuItem("Orders",       nullptr, &g_OrdersWindow->open());
-                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio",   nullptr, &g_PortfolioWindow->open());
-                if (g_NewsWindow)     ImGui::MenuItem("News",         nullptr, &g_NewsWindow->open());
-                if (g_ScannerWindow)  ImGui::MenuItem("Scanner",      nullptr, &g_ScannerWindow->open());
+                if (g_ChartWindow)     ImGui::MenuItem("Chart",      nullptr, &g_ChartWindow->open());
+                if (g_TradingWindow)   ImGui::MenuItem("Order Book", nullptr, &g_TradingWindow->open());
+                if (g_OrdersWindow)    ImGui::MenuItem("Orders",     nullptr, &g_OrdersWindow->open());
+                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio",  nullptr, &g_PortfolioWindow->open());
+                if (g_NewsWindow)      ImGui::MenuItem("News",       nullptr, &g_NewsWindow->open());
+                if (g_ScannerWindow)   ImGui::MenuItem("Scanner",    nullptr, &g_ScannerWindow->open());
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Presets")) {
+                for (int i = 0; i < kNumBuiltinPresets; i++) {
+                    if (ImGui::MenuItem(kBuiltinPresets[i].name))
+                        ApplyPreset(kBuiltinPresets[i]);
+                }
                 ImGui::EndMenu();
             }
 

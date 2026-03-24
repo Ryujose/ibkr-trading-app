@@ -1,5 +1,6 @@
 #include "ui/windows/TradingWindow.h"
 #include "imgui.h"
+#include "core/models/WindowGroup.h"
 
 #include <algorithm>
 #include <cmath>
@@ -756,6 +757,8 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.65f, 1.0f));
     ImGui::Text("Mid: $%.2f", m_midPrice);
     ImGui::PopStyleColor();
+    ImGui::SameLine(0, 12);
+    core::DrawGroupPicker(m_groupId, "##trading_grp");
 
     ImGui::Spacing();
     ImGui::Separator();
