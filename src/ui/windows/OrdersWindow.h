@@ -25,6 +25,7 @@ class OrdersWindow {
 public:
     OrdersWindow();
     bool Render();   // returns false when window is closed
+    bool& open() { return m_open; }
 
     // ── Data push-ins ─────────────────────────────────────────────────────
     void OnOpenOrder(const core::Order& order);

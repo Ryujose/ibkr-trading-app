@@ -26,6 +26,7 @@ public:
     ~TradingWindow() = default;
 
     bool Render();
+    bool& open() { return m_open; }
 
     // Subscription status per data stream
     enum class SubStatus { Unknown, Ok, NeedSubscription, NotAllowed };

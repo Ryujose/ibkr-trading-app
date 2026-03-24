@@ -39,6 +39,7 @@ public:
 
     // Call once per frame. Returns false when window is closed.
     bool Render();
+    bool& open() { return m_open; }
 
     // --- IB Gateway callbacks (future integration) ---
     void OnScanData(int reqId, const std::vector<core::ScanResult>& results);

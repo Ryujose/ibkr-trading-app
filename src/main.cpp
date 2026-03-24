@@ -1467,12 +1467,12 @@ static void RenderTradingUI() {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                ImGui::MenuItem("Chart",      nullptr, nullptr, false);
-                ImGui::MenuItem("Order Book", nullptr, nullptr, false);
-                ImGui::MenuItem("Orders",     nullptr, nullptr, false);
-                ImGui::MenuItem("Portfolio",  nullptr, nullptr, false);
-                ImGui::MenuItem("News",       nullptr, nullptr, false);
-                ImGui::MenuItem("Scanner",    nullptr, nullptr, false);
+                if (g_ChartWindow)    ImGui::MenuItem("Chart",        nullptr, &g_ChartWindow->open());
+                if (g_TradingWindow)  ImGui::MenuItem("Order Book",   nullptr, &g_TradingWindow->open());
+                if (g_OrdersWindow)   ImGui::MenuItem("Orders",       nullptr, &g_OrdersWindow->open());
+                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio",   nullptr, &g_PortfolioWindow->open());
+                if (g_NewsWindow)     ImGui::MenuItem("News",         nullptr, &g_NewsWindow->open());
+                if (g_ScannerWindow)  ImGui::MenuItem("Scanner",      nullptr, &g_ScannerWindow->open());
                 ImGui::EndMenu();
             }
 

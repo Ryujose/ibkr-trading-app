@@ -25,6 +25,7 @@ public:
     // Call once per frame inside an ImGui context.
     // Returns false if the window was closed.
     bool Render();
+    bool& open() { return m_open; }
 
     // ── IB data push-ins (called by main.cpp callbacks) ──────────────────
     // Real-time headline from tickNews; item.summary carries articleId as

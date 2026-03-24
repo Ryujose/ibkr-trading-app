@@ -46,6 +46,7 @@ public:
     ChartWindow();
 
     bool Render();
+    bool& open() { return m_open; }
     void SetSymbol(const std::string& symbol);
     void AddBar(const core::Bar& bar, bool done);
     void SetHistoricalData(const core::BarSeries& series);
