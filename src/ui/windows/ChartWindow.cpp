@@ -1,6 +1,7 @@
 #include "ui/windows/ChartWindow.h"
 
 #include "imgui.h"
+#include "core/models/WindowGroup.h"
 #include "implot.h"
 
 #include <cmath>
@@ -101,8 +102,13 @@ void ChartWindow::AddToHistory(const std::string& symbol) {
 }
 
 // ============================================================================
-// SetSymbol / AddBar / SetHistoricalData
+// setInstanceId / SetSymbol / AddBar / SetHistoricalData
 // ============================================================================
+void ChartWindow::setInstanceId(int id) {
+    m_instanceId = id;
+    std::snprintf(m_title, sizeof(m_title), "Chart %d##chart%d", id, id);
+}
+
 void ChartWindow::SetSymbol(const std::string& symbol) {
     if (symbol.empty() || symbol.size() >= sizeof(m_symbol)) return;
     std::memcpy(m_symbol, symbol.c_str(), symbol.size() + 1);
@@ -363,7 +369,7 @@ bool ChartWindow::Render() {
     if (m_ind.rsi)    minH += 90.0f;
     ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, minH), ImVec2(FLT_MAX, FLT_MAX));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin("Chart", &m_open, flags)) {
+    if (!ImGui::Begin(m_title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -402,6 +408,8 @@ bool ChartWindow::Render() {
 // Toolbar row 1 — symbol, timeframe, zoom, indicators
 // ============================================================================
 void ChartWindow::DrawToolbar() {
+    core::DrawGroupPicker(m_groupId, "##chart_grp");
+    ImGui::SameLine(0, 8);
     ImGui::SetNextItemWidth(80);
     if (ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
                          ImGuiInputTextFlags_EnterReturnsTrue)) {
@@ -521,6 +529,7 @@ void ChartWindow::DrawToolbar() {
     ImGui::Checkbox("VWAP",   &m_ind.vwap);   ImGui::SameLine();
     ImGui::Checkbox("Vol",    &m_ind.volume); ImGui::SameLine();
     ImGui::Checkbox("RSI",    &m_ind.rsi);
+
 }
 
 // ============================================================================

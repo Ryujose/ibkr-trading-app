@@ -12,6 +12,9 @@ A professional-grade C++20 trading terminal for Interactive Brokers, built with 
 - **Portfolio Dashboard** — Account summary, positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
 - **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L
 - **Paper & Live accounts** — Toggle between paper and live trading from the login screen
+- **Multi-Instance Windows** — Open up to 4 simultaneous Chart, Order Book, and Scanner windows to monitor multiple assets at once
+- **Window Groups** — Link any windows into a color-coded group (G1–G4); changing the asset in one window instantly syncs all others in the same group
+- **Layout Presets** — One-click workspace layouts: Trading Focus, Research, Full Desk
 
 ---
 
@@ -155,6 +158,29 @@ Click **Connect**. The app waits for `nextValidId` from IB (which signals the co
 
 The UI uses ImGui's docking system. All windows are dockable and can be rearranged freely.
 
+### Multi-Instance Windows
+
+Chart, Order Book, and Scanner windows support up to **4 simultaneous instances**. Open additional instances from **Windows → + New Chart / + New Order Book / + New Scanner**. Each instance has an independent symbol subscription and its own IB reqId range, so they never interfere with each other.
+
+### Window Groups & Symbol Sync
+
+Every window has a **group button** (`G1` / `G2` / `G3` / `G4` / `G-`) at the leftmost position of its toolbar.
+
+- Click the button to assign the window to a group (or clear it with `G-`).
+- When you change the asset in any grouped window — by typing a symbol in the chart search box, changing the symbol in the Order Book, or double-clicking a row in the Scanner — **all other windows in the same group immediately switch to that asset** and re-subscribe to live market data.
+- Groups are color-coded: G1 = blue, G2 = green, G3 = orange, G4 = purple.
+- By default, instance N starts in group N (e.g. Chart 1, Order Book 1, Scanner 1 all start in G1).
+
+### Layout Presets
+
+The **Presets** menu applies one-click workspace configurations:
+
+| Preset | Windows shown |
+|---|---|
+| Trading Focus | Chart 1, Order Book 1, Orders |
+| Research | Chart 1, Scanner 1, News |
+| Full Desk | Chart 1, Order Book 1, News (G2), Scanner (G2), Portfolio, Orders |
+
 ### Chart Window
 
 Real-time candlestick charting with technical analysis overlays.
@@ -295,7 +321,8 @@ Live order blotter with two tabs.
 ┌─────────────────────────────────────────────────────────┐
 │                      main.cpp                           │
 │  Vulkan/GLFW init · Login state machine · UI dispatch   │
-│  Wires IBKRClient callbacks → Window methods            │
+│  Entry structs (ChartEntry, TradingEntry, ScannerEntry) │
+│  BroadcastGroupSymbol · SpawnXxxWindow · WireIBCallbacks│
 └────────────────────────┬────────────────────────────────┘
                          │
          ┌───────────────▼───────────────┐
@@ -313,12 +340,12 @@ Live order blotter with two tabs.
          │    └─ drain queue (5ms budget)│
          │         └─ invoke callbacks   │
          └──┬────────────────────────────┘
-            │
-   ┌────────┼──────────────────────────────────┐
-   │        │  Callbacks routed to windows      │
-   ▼        ▼        ▼        ▼        ▼        ▼
-Chart   Trading   News   Scanner  Portfolio  Orders
-Window  Window   Window  Window   Window    Window
+            │  Callbacks routed by reqId to entry vectors
+   ┌────────┼──────────────────────────────────────────────┐
+   │        │                  │              │             │
+   ▼        ▼                  ▼              ▼             ▼
+Chart×4  Trading×4   News   Scanner×4   Portfolio   Orders
+ (G1-G4)  (G1-G4)  (G1)    (G1-G4)    (singleton) (singleton)
 ```
 
 **Threading model:**
