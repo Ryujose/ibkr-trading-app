@@ -25,3 +25,8 @@ All planned tasks are complete through Phase 5.
 - [x] **Task #12** — Group sync fix — `ApplyTradingSymbol` helper so group broadcast re-subscribes IB market data + depth (not just display); reqId collision audit (TradingDepth moved to 120+, ScannerBase moved to 1000+)
 - [x] **Task #13** — Group picker visibility fix — replaced Unicode glyphs with ASCII `G1`/`G-` labels, moved picker to leftmost toolbar position in all windows, raised button alpha
 - [x] **Task #14** — Default group assignment — instance N auto-assigned to group N on spawn; NewsWindow defaults to group 1
+
+## Phase 6: UX Polish & Resilience
+- [x] **Task #15** — Current price line — dashed grey horizontal line at last close price; right-aligned price tag inside the chart clip rect (`DrawOverlays()` in `ChartWindow.cpp`); uses `pMax.x` (actual pixel boundary) for correct placement
+- [x] **Task #16** — Disconnection badge — `LostConnection` added to `ConnectionState` enum; on unexpected disconnect keeps trading UI alive (nulls client, doesn't destroy windows); orange `DISCONNECTED` badge with background rect rendered left of `[LIVE]`/`[PAPER]` in menu bar
+- [x] **Task #17** — Auto-reconnect — `StartSilentReconnect()` in `main.cpp`; `g_reconnectNextAttempt` timer (5s interval) polled each frame when `LostConnection && !g_IBClient`; on reconnect success re-subscribes each chart/trading window with its current symbol+timeframe instead of recreating windows; `getTimeframe()` added to `ChartWindow`, `getSymbol()` added to `TradingWindow`
