@@ -27,8 +27,10 @@ public:
 
     bool Render();
     bool& open() { return m_open; }
-    void setGroupId(int id) { m_groupId = id; }
-    int  groupId() const    { return m_groupId; }
+    void setGroupId(int id)    { m_groupId = id; }
+    int  groupId() const       { return m_groupId; }
+    void setInstanceId(int id);
+    int  instanceId() const    { return m_instanceId; }
 
     // Subscription status per data stream
     enum class SubStatus { Unknown, Ok, NeedSubscription, NotAllowed };
@@ -63,8 +65,10 @@ public:
     std::function<void(const std::string& symbol)> OnSymbolChanged;
 
 private:
-    bool m_open    = true;
-    int  m_groupId = 0;
+    bool m_open       = true;
+    int  m_groupId    = 0;
+    int  m_instanceId = 1;
+    char m_title[40]  = "Book Trading 1##trading1";
 
     // ── Subscription status ──────────────────────────────────────────────────
     SubStatus m_mktDataStatus = SubStatus::Unknown;

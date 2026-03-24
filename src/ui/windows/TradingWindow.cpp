@@ -128,6 +128,11 @@ void TradingWindow::OnTick(double price, double size, bool isUptick) {
     }
 }
 
+void TradingWindow::setInstanceId(int id) {
+    m_instanceId = id;
+    std::snprintf(m_title, sizeof(m_title), "Book Trading %d##trading%d", id, id);
+}
+
 void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
     std::strncpy(m_symbol, symbol.c_str(), sizeof(m_symbol) - 1);
     m_symbol[sizeof(m_symbol) - 1] = '\0';
@@ -158,7 +163,7 @@ bool TradingWindow::Render() {
 
     ImGui::SetNextWindowSize(ImVec2(1100, 620), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin("Book Trading", &m_open, flags)) {
+    if (!ImGui::Begin(m_title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -727,6 +732,8 @@ void TradingWindow::DrawOrderBook() {
 // ============================================================================
 void TradingWindow::DrawOrderEntry() {
     // ---- Symbol row ---------------------------------------------------------
+    core::DrawGroupPicker(m_groupId, "##trading_grp");
+    ImGui::SameLine(0, 8);
     ImGui::Text("Symbol");
     ImGui::SameLine(75);
     ImGui::SetNextItemWidth(72);
@@ -757,8 +764,6 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.65f, 1.0f));
     ImGui::Text("Mid: $%.2f", m_midPrice);
     ImGui::PopStyleColor();
-    ImGui::SameLine(0, 12);
-    core::DrawGroupPicker(m_groupId, "##trading_grp");
 
     ImGui::Spacing();
     ImGui::Separator();

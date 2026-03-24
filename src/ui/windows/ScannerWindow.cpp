@@ -221,6 +221,11 @@ void ScannerWindow::SetPortfolioSymbols(const std::vector<std::string>& symbols)
     m_portfolioSymbols = symbols;
 }
 
+void ScannerWindow::setInstanceId(int id) {
+    m_instanceId = id;
+    std::snprintf(m_title, sizeof(m_title), "Market Scanner %d##scanner%d", id, id);
+}
+
 // ============================================================================
 // Render
 // ============================================================================
@@ -260,7 +265,7 @@ bool ScannerWindow::Render()
     ImGui::SetNextWindowSize(ImVec2(1100, 660), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin("Market Scanner", &m_open, flags)) {
+    if (!ImGui::Begin(m_title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -281,6 +286,9 @@ bool ScannerWindow::Render()
 
 void ScannerWindow::DrawToolbar()
 {
+    core::DrawGroupPicker(m_groupId, "##scanner_grp");
+    ImGui::SameLine(0, 10);
+
     // Asset class tabs
     const core::AssetClass classes[] = {
         core::AssetClass::Stocks,
@@ -360,8 +368,6 @@ void ScannerWindow::DrawToolbar()
     ImGui::SetNextItemWidth(80);
     ImGui::SliderFloat("##interval", &m_autoRefreshSec, 5.f, 120.f, "%.0fs");
 
-    ImGui::SameLine(0, 12);
-    core::DrawGroupPicker(m_groupId, "##scanner_grp");
 }
 
 // ============================================================================

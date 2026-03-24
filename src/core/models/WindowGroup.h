@@ -50,15 +50,19 @@ inline ImVec4 GroupColor(int groupId) {
 // ============================================================================
 inline bool DrawGroupPicker(int& groupId, const char* popupId) {
     ImVec4 col = GroupColor(groupId);
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(col.x, col.y, col.z, 0.22f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(col.x, col.y, col.z, 0.50f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(col.x, col.y, col.z, 0.75f));
-    const char* dotLabel = groupId > 0 ? "●##grp" : "○##grp";
-    bool clicked = ImGui::SmallButton(dotLabel);
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(col.x, col.y, col.z, 0.55f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(col.x, col.y, col.z, 0.78f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(col.x, col.y, col.z, 1.00f));
+    char btnLabel[24];
+    if (groupId > 0)
+        std::snprintf(btnLabel, sizeof(btnLabel), "G%d##grp", groupId);
+    else
+        std::snprintf(btnLabel, sizeof(btnLabel), "G-##grp");
+    bool clicked = ImGui::Button(btnLabel, ImVec2(28, 0));
     ImGui::PopStyleColor(3);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(groupId == 0
-            ? "No group — click to link"
+            ? "No group — click to link windows"
             : "Group %d — click to change", groupId);
     if (clicked) ImGui::OpenPopup(popupId);
 

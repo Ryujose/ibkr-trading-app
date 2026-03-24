@@ -48,8 +48,11 @@ public:
     bool Render();
     bool& open() { return m_open; }
     void SetSymbol(const std::string& symbol);
-    void setGroupId(int id) { m_groupId = id; }
-    int  groupId() const    { return m_groupId; }
+    std::string getSymbol() const { return m_symbol; }
+    void setGroupId(int id)    { m_groupId = id; }
+    int  groupId() const       { return m_groupId; }
+    void setInstanceId(int id);
+    int  instanceId() const    { return m_instanceId; }
     void AddBar(const core::Bar& bar, bool done);
     void SetHistoricalData(const core::BarSeries& series);
     // Prepend older bars to the left of the current series (extend-history result).
@@ -123,6 +126,8 @@ private:
 
     // ---- State --------------------------------------------------------------
     int               m_groupId         = 0;
+    int               m_instanceId      = 1;
+    char              m_title[32]       = "Chart 1##chart1";
     char              m_symbol[16]      = "AAPL";
     core::Timeframe   m_timeframe       = core::Timeframe::D1;
     bool              m_needsRefresh    = true;

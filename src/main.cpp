@@ -35,33 +35,50 @@
 #include "core/models/WindowGroup.h"
 
 // ============================================================================
-// Global window instances
+// Multi-instance window entry structs
 // ============================================================================
-static ui::ChartWindow*    g_ChartWindow    = nullptr;
-static ui::NewsWindow*     g_NewsWindow     = nullptr;
-static ui::TradingWindow*  g_TradingWindow  = nullptr;
-static ui::ScannerWindow*  g_ScannerWindow  = nullptr;
+struct ChartEntry {
+    ui::ChartWindow* win         = nullptr;
+    int              histId      = 0;   // reqHistoricalData id
+    int              extId       = 0;   // extend-history (pan-left) id
+    int              mktId       = 0;   // reqMarketData id (chart ticks)
+    core::BarSeries  pendingBars;
+    core::BarSeries  pendingExtBars;
+};
+
+struct TradingEntry {
+    ui::TradingWindow* win          = nullptr;
+    int                depthId      = 0;   // reqMktDepth id
+    int                mktId        = 0;   // reqMarketData id (NBBO ticks)
+    double nbboBid = 0, nbboBidSz = 0;
+    double nbboAsk = 0, nbboAskSz = 0;
+    double lastTickPrice = 0, lastTickSize = 0;
+};
+
+struct ScannerEntry {
+    ui::ScannerWindow* win           = nullptr;
+    int                scanBase      = 0;   // reqId pool base (scanBase..scanBase+99)
+    int                activeScanId  = 0;
+    bool               subActive     = false;
+    int                mktBase       = 0;   // market-data base for live quotes
+    static constexpr int kMktSlots   = 12;
+    std::vector<core::ScanResult> pendingResults;
+};
+
+static constexpr int kMaxMultiWin = 4;   // max instances per window type
+
+// ---- Multi-instance containers -----------------------------------------------
+static std::vector<ChartEntry>   g_chartEntries;
+static std::vector<TradingEntry> g_tradingEntries;
+static std::vector<ScannerEntry> g_scannerEntries;
+
+// ---- Singleton windows (one each) --------------------------------------------
+static ui::NewsWindow*      g_NewsWindow      = nullptr;
 static ui::PortfolioWindow* g_PortfolioWindow = nullptr;
-static ui::OrdersWindow*   g_OrdersWindow   = nullptr;
+static ui::OrdersWindow*    g_OrdersWindow    = nullptr;
 
 // IB API client (created on Connect, deleted on Disconnect)
 static core::services::IBKRClient* g_IBClient = nullptr;
-
-// Pending bar accumulation for the chart (fills as historicalData callbacks arrive)
-static core::BarSeries g_pendingBars;
-// Pending bar accumulation for the extend-history (pan-left) request
-static core::BarSeries g_pendingExtendBars;
-
-// Pending scanner results (fills as scannerData callbacks arrive)
-static std::vector<core::ScanResult> g_pendingScanResults;
-
-// Active scanner subscription reqId.  Incremented each time we subscribe so we
-// never collide with the previous session's subscription that IB Gateway keeps
-// alive across reconnects ("duplicate scan subscription" error in the gateway log).
-// Range: SCAN_REQID_BASE … SCAN_REQID_BASE+99, wrapping.
-// Starts one below SCAN_REQID_BASE (300) so the first increment lands on 300.
-static int  g_activeScanReqId          = 299;
-static bool g_scannerSubscriptionActive = false;
 
 // Previous-close prices keyed by symbol, used to compute change/% for scanner rows.
 static std::unordered_map<std::string, double> g_scannerPrevClose;
@@ -72,9 +89,6 @@ static std::unordered_map<std::string, double> g_scannerVolume;
 static std::unordered_map<int, std::string> g_tickerSymbols;
 
 static int g_nextOrderId   = 1;
-
-// Current chart symbol (kept in sync with ChartWindow)
-static std::string g_chartSymbol = "AAPL";
 
 // ---- Window groups (4 slots; index 0 = group id 1) -------------------------
 static std::array<core::GroupState, 4> g_groups;
@@ -94,18 +108,18 @@ static bool IsTerminalOrderStatus(core::OrderStatus s) {
            s == core::OrderStatus::Rejected;
 }
 
-// Push pending order lines for the current chart symbol into the ChartWindow
-static void UpdateChartPendingOrders() {
-    if (!g_ChartWindow) return;
+// Push pending order lines for a specific chart window (matched by symbol)
+static void UpdateChartPendingOrders(ui::ChartWindow* win) {
+    if (!win) return;
+    const std::string sym = win->getSymbol();
     std::vector<ui::ChartWindow::PendingOrderLine> lines;
     for (const auto& [id, o] : g_liveOrders) {
-        if (o.symbol != g_chartSymbol) continue;
+        if (o.symbol != sym) continue;
         if (IsTerminalOrderStatus(o.status)) continue;
         ui::ChartWindow::PendingOrderLine ln;
         ln.orderId = id;
         ln.isBuy   = (o.side == core::OrderSide::Buy);
         ln.qty     = o.quantity;
-
         if (o.type == core::OrderType::StopLimit) {
             ln.price     = o.stopPrice;
             ln.auxPrice  = o.limitPrice;
@@ -117,43 +131,62 @@ static void UpdateChartPendingOrders() {
             ln.price     = o.limitPrice;
             ln.orderType = "LMT";
         } else {
-            continue;  // market order — nothing to draw
+            continue;
         }
         if (ln.price <= 0.0) continue;
         lines.push_back(ln);
     }
-    g_ChartWindow->SetPendingOrders(lines);
+    win->SetPendingOrders(lines);
 }
 
-// Push position info for the current chart symbol into the ChartWindow
-static void UpdateChartPosition() {
-    if (!g_ChartWindow) return;
+static void UpdateAllChartPendingOrders() {
+    for (auto& e : g_chartEntries) UpdateChartPendingOrders(e.win);
+}
+
+// Push position info for a specific chart window (matched by symbol)
+static void UpdateChartPosition(ui::ChartWindow* win) {
+    if (!win) return;
+    const std::string sym = win->getSymbol();
     ui::ChartWindow::PositionInfo info;
-    auto it = g_positions.find(g_chartSymbol);
+    auto it = g_positions.find(sym);
     if (it != g_positions.end() && std::abs(it->second.quantity) > 1e-9) {
         info.hasPosition = true;
         info.qty         = it->second.quantity;
         info.avgCost     = it->second.avgCost;
         info.lastPrice   = it->second.marketPrice;
         info.unrealPnL   = it->second.unrealizedPnL;
-        auto cit = g_symbolCommissions.find(g_chartSymbol);
+        auto cit = g_symbolCommissions.find(sym);
         info.commission  = (cit != g_symbolCommissions.end()) ? cit->second : 0.0;
     }
-    g_ChartWindow->SetPosition(info);
+    win->SetPosition(info);
+}
+
+static void UpdateAllChartPositions() {
+    for (auto& e : g_chartEntries) UpdateChartPosition(e.win);
 }
 static int g_newsItemId    = 10000;  // unique IDs for real-time market news items
 static int g_histNewsId    = 20000;  // unique IDs for historical news items
 static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 
-// Request IDs (reserved ranges)
-static constexpr int HIST_REQID          = 1;    // historical data for the chart
-static constexpr int HIST_EXTEND_REQID   = 2;    // extend-history (pan-left) request
-static constexpr int DEPTH_REQID         = 200;  // market depth
+// Request IDs (reserved ranges — no overlaps)
+// Per-instance helpers: each window type has its own slot.
+//   Chart   hist:  1,3,5,7       ext: 2,4,6,8     mkt: 100-103
+//   Trading mkt:   110-113       depth: 120-123
+//   Scanner scan:  1000,1100,1200,1300 (+99 ea)    mkt: 800,812,824,836 (+12 ea)
+//   News:          201(RT), 400-420(conId), 500-520(hist), 600-699(art), 700-759(mkt)
+//   Account:       900
 static constexpr int NEWS_RT_REQID       = 201;  // real-time news subscription (mdoff;292)
-static constexpr int SCAN_REQID_BASE     = 300;  // scanner reqId pool base (300–399)
-static constexpr int SCAN_MKT_BASE       = 800;  // market data for scanner symbols (800–849)
-static constexpr int SCAN_MKT_MAX        = 50;   // max scanner symbols with live quotes
-static constexpr int MKT_REQID_BASE      = 100;  // market data per-symbol offset
+
+// Inline helpers — idx is 0-based instance index
+inline int ChartHistId   (int idx) { return 1    + idx * 2; }   // 1,3,5,7
+inline int ChartExtId    (int idx) { return 2    + idx * 2; }   // 2,4,6,8
+inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-103
+inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-113
+inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-123
+inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,1200,1300
+inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,824,836
+
+static constexpr int ACCT_SUMMARY_REQID  = 900;  // reqAccountSummary for base currency
 
 // News reqId layout:
 //   400        — contract-details lookup for stock tab
@@ -171,7 +204,6 @@ static constexpr int NEWS_ART_BASE       = 600;
 static constexpr int NEWS_ART_END        = 699;
 static constexpr int NEWS_HIST_MKT       = 700;  // base; +i per seed symbol
 static constexpr int NEWS_CONID_MKT      = 750;  // base; +i per seed symbol
-static constexpr int ACCT_SUMMARY_REQID  = 900;  // reqAccountSummary for base currency
 
 // Symbols fetched on connection to seed the Market-tab news feed.
 static const char* kMktSeedSymbols[] = { "AAPL", "SPY", "MSFT", "TSLA", "NVDA" };
@@ -432,6 +464,19 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 // ============================================================================
 // Group sync helper — must be defined before CreateTradingWindows lambdas
 // ============================================================================
+
+// Update a trading entry's displayed symbol AND re-subscribe IB market data + depth.
+// Used both from BroadcastGroupSymbol and from OnSymbolChanged so the logic is in one place.
+static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
+    if (te.win) te.win->SetSymbol(sym, 0.0);
+    if (!g_IBClient) return;
+    g_IBClient->CancelMarketData(te.mktId);
+    g_IBClient->CancelMktDepth(te.depthId);
+    g_tickerSymbols[te.mktId] = sym;
+    g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
+    g_IBClient->ReqMktDepth(te.depthId, sym, 20);
+}
+
 // Propagate a symbol change to all windows in the same group.
 // Re-entrant guard prevents loops when SetSymbol() re-fires callbacks.
 static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
@@ -441,89 +486,86 @@ static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
     g_groupSyncInProgress = true;
     gs.id     = groupId;
     gs.symbol = sym;
-    if (g_ChartWindow   && g_ChartWindow->groupId()   == groupId) g_ChartWindow->SetSymbol(sym);
-    if (g_TradingWindow && g_TradingWindow->groupId() == groupId) g_TradingWindow->SetSymbol(sym, 0.0);
-    if (g_NewsWindow    && g_NewsWindow->groupId()    == groupId) g_NewsWindow->SetSymbol(sym);
+    for (auto& e : g_chartEntries)
+        if (e.win && e.win->groupId() == groupId) e.win->SetSymbol(sym);
+    for (auto& te : g_tradingEntries)
+        if (te.win && te.win->groupId() == groupId) ApplyTradingSymbol(te, sym);
+    if (g_NewsWindow && g_NewsWindow->groupId() == groupId) g_NewsWindow->SetSymbol(sym);
     // ScannerWindow is a symbol source only — no inbound SetSymbol
     g_groupSyncInProgress = false;
 }
 
 // ============================================================================
-// Window lifecycle helpers
+// Window lifecycle helpers — per-instance spawn functions
 // ============================================================================
-static void CreateTradingWindows() {
-    delete g_ChartWindow;     g_ChartWindow     = new ui::ChartWindow();
-    delete g_NewsWindow;      g_NewsWindow      = new ui::NewsWindow();
-    delete g_TradingWindow;   g_TradingWindow   = new ui::TradingWindow();
-    delete g_ScannerWindow;   g_ScannerWindow   = new ui::ScannerWindow();
-    delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
-    delete g_OrdersWindow;    g_OrdersWindow    = new ui::OrdersWindow();
 
-    // Helper: cancel existing historical request and issue a new one
-    // useRTH=false → include pre/post-market bars
-    auto ReqChartData = [](const std::string& sym, core::Timeframe tf, bool useRTH) {
+// Issue / re-issue a historical + market-data subscription for a chart instance.
+static void ReqChartData(int histId, int mktId,
+                         const std::string& sym, core::Timeframe tf, bool useRTH,
+                         core::BarSeries& pendingBars) {
+    if (!g_IBClient) return;
+    g_IBClient->CancelHistoricalData(histId);
+    pendingBars         = core::BarSeries{};
+    pendingBars.symbol  = sym;
+    pendingBars.timeframe = tf;
+    g_IBClient->ReqHistoricalData(histId, sym,
+                                  core::TimeframeIBDuration(tf),
+                                  core::TimeframeIBBarSize(tf),
+                                  useRTH);
+    if (g_tickerSymbols[mktId] != sym) {
+        g_IBClient->CancelMarketData(mktId);
+        g_tickerSymbols[mktId] = sym;
+        g_IBClient->ReqMarketData(mktId, sym, MktDataTicks());
+    }
+}
+
+static void SpawnChartWindow(int idx) {
+    ChartEntry e;
+    e.histId = ChartHistId(idx);
+    e.extId  = ChartExtId(idx);
+    e.mktId  = ChartMktId(idx);
+    e.win    = new ui::ChartWindow();
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+
+    // Capture idx (not pointer — vector may reallocate)
+    e.win->OnDataRequest = [idx](const std::string& sym, core::Timeframe tf, bool useRTH) {
+        auto& ce = g_chartEntries[idx];
+        ReqChartData(ce.histId, ce.mktId, sym, tf, useRTH, ce.pendingBars);
+        UpdateChartPendingOrders(ce.win);
+        UpdateChartPosition(ce.win);
+        BroadcastGroupSymbol(ce.win->groupId(), sym);
+    };
+
+    e.win->OnExtendHistory = [idx](const std::string& sym, core::Timeframe tf,
+                                   const std::string& endDT, bool useRTH) {
         if (!g_IBClient) return;
-        g_IBClient->CancelHistoricalData(HIST_REQID);
-        g_pendingBars             = core::BarSeries{};
-        g_pendingBars.symbol      = sym;
-        g_pendingBars.timeframe   = tf;
-        g_IBClient->ReqHistoricalData(HIST_REQID, sym,
+        auto& ce = g_chartEntries[idx];
+        g_IBClient->CancelHistoricalData(ce.extId);
+        ce.pendingExtBars           = core::BarSeries{};
+        ce.pendingExtBars.symbol    = sym;
+        ce.pendingExtBars.timeframe = tf;
+        g_IBClient->ReqHistoricalData(ce.extId, sym,
                                       core::TimeframeIBDuration(tf),
                                       core::TimeframeIBBarSize(tf),
-                                      useRTH);
-        // Re-subscribe market data ticks so OnLastPrice / OnDayTick receive
-        // live prices for the new symbol.
-        if (g_tickerSymbols[MKT_REQID_BASE] != sym) {
-            g_IBClient->CancelMarketData(MKT_REQID_BASE);
-            g_tickerSymbols[MKT_REQID_BASE] = sym;
-            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym, MktDataTicks());
-        }
+                                      useRTH, endDT);
     };
 
-    // Chart toolbar: symbol/timeframe/rth changed by the user
-    g_ChartWindow->OnDataRequest = [ReqChartData](const std::string& sym,
-                                                   core::Timeframe tf, bool useRTH) {
-        g_chartSymbol = sym;
-        ReqChartData(sym, tf, useRTH);
-        UpdateChartPendingOrders();
-        UpdateChartPosition();
-        BroadcastGroupSymbol(g_ChartWindow->groupId(), sym);
-    };
-
-    // Pan-left: load older historical bars and prepend them to the chart
-    g_ChartWindow->OnExtendHistory = [](const std::string& sym, core::Timeframe tf,
-                                        const std::string& endDateTime, bool useRTH) {
-        if (!g_IBClient) return;
-        g_IBClient->CancelHistoricalData(HIST_EXTEND_REQID);
-        g_pendingExtendBars           = core::BarSeries{};
-        g_pendingExtendBars.symbol    = sym;
-        g_pendingExtendBars.timeframe = tf;
-        g_IBClient->ReqHistoricalData(HIST_EXTEND_REQID, sym,
-                                      core::TimeframeIBDuration(tf),
-                                      core::TimeframeIBBarSize(tf),
-                                      useRTH, endDateTime);
-    };
-
-    // Chart trade panel: place orders directly from the chart
-    g_ChartWindow->OnOrderSubmit = [](const std::string& sym, const std::string& side,
-                                      const std::string& orderType, double qty, double price,
-                                      const std::string& tif, bool outsideRth, double auxPrice) {
+    e.win->OnOrderSubmit = [](const std::string& sym, const std::string& side,
+                              const std::string& orderType, double qty, double price,
+                              const std::string& tif, bool outsideRth, double auxPrice) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         int id = g_nextOrderId++;
-        // Keep TradingWindow counter in sync so no duplicate IDs
-        if (g_TradingWindow) g_TradingWindow->SetNextOrderId(g_nextOrderId);
-
-        // Optimistic insert: show order immediately in OrdersWindow / chart overlay
+        for (auto& te : g_tradingEntries)
+            if (te.win) te.win->SetNextOrderId(g_nextOrderId);
         core::Order pending;
-        pending.orderId    = id;
-        pending.symbol     = sym;
-        pending.side       = (side == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
-        pending.quantity   = qty;
-        pending.status     = core::OrderStatus::Pending;
+        pending.orderId     = id;
+        pending.symbol      = sym;
+        pending.side        = (side == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+        pending.quantity    = qty;
+        pending.status      = core::OrderStatus::Pending;
         pending.submittedAt = std::time(nullptr);
         pending.updatedAt   = pending.submittedAt;
-
-        // Map IB order type string → core::OrderType so OrdersWindow shows the right label.
         if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
             pending.type = core::OrderType::Limit;
         else if (orderType == "STP")
@@ -532,40 +574,30 @@ static void CreateTradingWindows() {
             pending.type = core::OrderType::StopLimit;
         else
             pending.type = core::OrderType::Market;
-
         if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
             pending.limitPrice = price;
         if (orderType == "STP" || orderType == "STP LMT" || orderType == "MIT")
-            pending.stopPrice  = price;
-
+            pending.stopPrice = price;
         g_liveOrders[id] = pending;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(pending);
-        UpdateChartPendingOrders();
-
+        UpdateAllChartPendingOrders();
         g_IBClient->PlaceOrder(id, sym, side, orderType, qty, price, tif, outsideRth, auxPrice);
     };
 
-    // Cancel order directly from the chart overlay
-    g_ChartWindow->OnCancelOrder = [](int orderId) {
+    e.win->OnCancelOrder = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
 
-    // Drag-to-move: cancel old order and re-submit at the new price
-    g_ChartWindow->OnModifyOrder = [](int orderId, double newPrice, double newAuxPrice) {
+    e.win->OnModifyOrder = [](int orderId, double newPrice, double newAuxPrice) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         auto it = g_liveOrders.find(orderId);
         if (it == g_liveOrders.end()) return;
-        const core::Order old = it->second;   // copy before we erase
-
-        // Cancel the original order on IB
+        const core::Order old = it->second;
         g_IBClient->CancelOrder(orderId);
         g_liveOrders.erase(it);
-
-        // Allocate a fresh order ID for the replacement
         int newId = g_nextOrderId++;
-        if (g_TradingWindow) g_TradingWindow->SetNextOrderId(g_nextOrderId);
-
-        // Build replacement — same params, new ID + new price(s)
+        for (auto& te : g_tradingEntries)
+            if (te.win) te.win->SetNextOrderId(g_nextOrderId);
         core::Order rep       = old;
         rep.orderId           = newId;
         rep.status            = core::OrderStatus::Pending;
@@ -573,115 +605,132 @@ static void CreateTradingWindows() {
         rep.updatedAt         = rep.submittedAt;
         rep.filledQty         = 0.0;
         rep.avgFillPrice      = 0.0;
-
-        // Apply the new price(s) directly — no offset calculation
-        double mainPrice = newPrice;
-        double auxPrice  = 0.0;
-        if (old.type == core::OrderType::Limit) {
-            rep.limitPrice = newPrice;
-            rep.stopPrice  = 0.0;
-        } else if (old.type == core::OrderType::Stop) {
-            rep.stopPrice  = newPrice;
-            rep.limitPrice = 0.0;
-        } else if (old.type == core::OrderType::StopLimit) {
-            rep.stopPrice  = newPrice;
-            rep.limitPrice = newAuxPrice;
-            mainPrice      = newPrice;
-            auxPrice       = newAuxPrice;
+        double mainPrice = newPrice, auxPrice = 0.0;
+        if (old.type == core::OrderType::Limit)      { rep.limitPrice = newPrice; rep.stopPrice = 0.0; }
+        else if (old.type == core::OrderType::Stop)  { rep.stopPrice = newPrice; rep.limitPrice = 0.0; }
+        else if (old.type == core::OrderType::StopLimit) {
+            rep.stopPrice = newPrice; rep.limitPrice = newAuxPrice;
+            mainPrice = newPrice; auxPrice = newAuxPrice;
         }
-
         g_liveOrders[newId] = rep;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(rep);
-        UpdateChartPendingOrders();
-
+        UpdateAllChartPendingOrders();
         g_IBClient->PlaceOrder(newId, old.symbol,
                                core::OrderSideStr(old.side),
                                core::OrderTypeStr(old.type),
                                old.quantity, mainPrice,
-                               core::TIFStr(old.tif),
-                               /*outsideRth=*/false,
-                               auxPrice);
+                               core::TIFStr(old.tif), false, auxPrice);
     };
 
-    // Scanner row double-click → switch chart + trading window symbol + request new data
-    g_ScannerWindow->OnSymbolSelected = [ReqChartData](const std::string& sym) {
-        g_chartSymbol = sym;
-        if (g_ChartWindow)   g_ChartWindow->SetSymbol(sym);
-        if (g_TradingWindow) g_TradingWindow->SetSymbol(sym, 0.0);
-        if (g_IBClient) {
-            g_IBClient->CancelMarketData(MKT_REQID_BASE);
-            g_IBClient->CancelMktDepth(DEPTH_REQID);
-            ReqChartData(sym, core::Timeframe::D1, true);  // D1 always RTH
-            g_tickerSymbols[MKT_REQID_BASE] = sym;
-            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym, MktDataTicks());
-            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
-        }
-        UpdateChartPendingOrders();
-        UpdateChartPosition();
-        BroadcastGroupSymbol(g_ScannerWindow->groupId(), sym);
-    };
+    g_chartEntries.push_back(std::move(e));
+}
 
-    // Wire order submission / cancellation to IB
-    g_TradingWindow->SetNextOrderId(g_nextOrderId);
-    g_TradingWindow->OnOrderSubmit = [](int orderId, const std::string& sym,
-                                        const std::string& action,
-                                        const std::string& orderType,
-                                        double qty, double price, double auxPrice,
-                                        const std::string& tif, bool outsideRth) {
+static void SpawnTradingWindow(int idx) {
+    TradingEntry e;
+    e.depthId = TradingDepthId(idx);
+    e.mktId   = TradingMktId(idx);
+    e.win     = new ui::TradingWindow();
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+    e.win->SetNextOrderId(g_nextOrderId);
+
+    e.win->OnOrderSubmit = [](int orderId, const std::string& sym,
+                               const std::string& action,
+                               const std::string& orderType,
+                               double qty, double price, double auxPrice,
+                               const std::string& tif, bool outsideRth) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         g_IBClient->PlaceOrder(orderId, sym, action, orderType, qty, price,
                                tif, outsideRth, auxPrice);
         if (orderId >= g_nextOrderId) g_nextOrderId = orderId + 1;
     };
-    g_TradingWindow->OnOrderCancel = [](int orderId) {
+
+    e.win->OnOrderCancel = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
-    g_TradingWindow->OnSymbolChanged = [ReqChartData](const std::string& sym) {
-        g_chartSymbol = sym;
-        if (g_ChartWindow) g_ChartWindow->SetSymbol(sym);
-        if (g_IBClient) {
-            g_IBClient->CancelMarketData(MKT_REQID_BASE);
-            g_IBClient->CancelMktDepth(DEPTH_REQID);
-            ReqChartData(sym, core::Timeframe::D1, true);
-            g_tickerSymbols[MKT_REQID_BASE] = sym;
-            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym, MktDataTicks());
-            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
-        }
-        UpdateChartPendingOrders();
-        UpdateChartPosition();
-        BroadcastGroupSymbol(g_TradingWindow->groupId(), sym);
+
+    e.win->OnSymbolChanged = [idx](const std::string& sym) {
+        auto& te = g_tradingEntries[idx];
+        ApplyTradingSymbol(te, sym);
+        BroadcastGroupSymbol(te.win->groupId(), sym);
     };
 
-    // Wire scanner to IB
-    g_ScannerWindow->OnScanRequest = [](const std::string& scanCode,
-                                        const std::string& instrument,
-                                        const std::string& location) {
+    g_tradingEntries.push_back(std::move(e));
+}
+
+static void SpawnScannerWindow(int idx) {
+    ScannerEntry e;
+    e.scanBase     = ScannerBase(idx);
+    e.activeScanId = e.scanBase - 1;   // first increment lands on scanBase
+    e.mktBase      = ScannerMktBase(idx);
+    e.win          = new ui::ScannerWindow();
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+
+    e.win->OnSymbolSelected = [idx](const std::string& sym) {
+        // Propagate to all charts/trading in the same group, or just broadcast
+        BroadcastGroupSymbol(g_scannerEntries[idx].win->groupId(), sym);
+        // Also update any chart windows not in a group (default behavior)
+        for (auto& ce : g_chartEntries)
+            if (ce.win && ce.win->groupId() == 0) {
+                ReqChartData(ce.histId, ce.mktId, sym, core::Timeframe::D1, true, ce.pendingBars);
+                ce.win->SetSymbol(sym);
+                UpdateChartPendingOrders(ce.win);
+                UpdateChartPosition(ce.win);
+            }
+        for (auto& te : g_tradingEntries)
+            if (te.win && te.win->groupId() == 0) {
+                if (g_IBClient) {
+                    g_IBClient->CancelMarketData(te.mktId);
+                    g_IBClient->CancelMktDepth(te.depthId);
+                    g_tickerSymbols[te.mktId] = sym;
+                    g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
+                    g_IBClient->ReqMktDepth(te.depthId, sym, 20);
+                }
+                te.win->SetSymbol(sym, 0.0);
+            }
+    };
+
+    e.win->OnScanRequest = [idx](const std::string& scanCode,
+                                  const std::string& instrument,
+                                  const std::string& location) {
         if (!g_IBClient) return;
-        // Cancel the previous scanner subscription.  Always send the cancel even
-        // if we think none is active — on reconnect the IB Gateway may have a
-        // restored subscription for the old reqId that we need to clear.
-        if (g_scannerSubscriptionActive) {
-            g_IBClient->CancelScannerData(g_activeScanReqId);
-            g_scannerSubscriptionActive = false;
+        auto& se = g_scannerEntries[idx];
+        if (se.subActive) {
+            g_IBClient->CancelScannerData(se.activeScanId);
+            se.subActive = false;
         }
-        // Cancel any active market-data subscriptions from the previous scan batch.
-        for (int i = 0; i < SCAN_MKT_MAX; ++i) {
-            int rid = SCAN_MKT_BASE + i;
+        // Cancel stale market-data slots for this scanner
+        for (int i = 0; i < ScannerEntry::kMktSlots; ++i) {
+            int rid = se.mktBase + i;
             if (g_tickerSymbols.count(rid)) {
                 g_IBClient->CancelMarketData(rid);
                 g_tickerSymbols.erase(rid);
             }
         }
-        g_pendingScanResults.clear();
-        // Advance to the next reqId so we never reuse the one that IB Gateway
-        // may still have registered from the previous session.
-        if (++g_activeScanReqId >= SCAN_REQID_BASE + 100)
-            g_activeScanReqId = SCAN_REQID_BASE;
-        g_IBClient->ReqScannerData(g_activeScanReqId, scanCode, instrument, location);
-        g_scannerSubscriptionActive = true;
+        se.pendingResults.clear();
+        if (++se.activeScanId >= se.scanBase + 100)
+            se.activeScanId = se.scanBase;
+        g_IBClient->ReqScannerData(se.activeScanId, scanCode, instrument, location);
+        se.subActive = true;
     };
 
-    // Wire OrdersWindow actions
+    g_scannerEntries.push_back(std::move(e));
+}
+
+static void CreateTradingWindows() {
+    // Singleton windows
+    delete g_NewsWindow;      g_NewsWindow      = new ui::NewsWindow();
+    g_NewsWindow->setGroupId(1);
+    delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
+    delete g_OrdersWindow;    g_OrdersWindow    = new ui::OrdersWindow();
+
+    // Spawn first instance of each multi-window type
+    SpawnChartWindow(0);
+    SpawnTradingWindow(0);
+    SpawnScannerWindow(0);
+
+    // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
@@ -689,9 +738,7 @@ static void CreateTradingWindows() {
         if (g_IBClient) g_IBClient->ReqOpenOrders();
     };
 
-    // ── News window: reqId routing + user-interaction callbacks ──────────────
-    // Must be wired here (after g_NewsWindow is created), NOT in WireIBCallbacks()
-    // which runs at startup before any window exists.
+    // Wire NewsWindow
     g_NewsWindow->SetStockNewsReqId(NEWS_HIST_STOCK);
     g_NewsWindow->SetPortNewsReqIdBase(NEWS_HIST_PORT);
     g_NewsWindow->SetMktNewsReqIdBase(NEWS_HIST_MKT);
@@ -700,13 +747,11 @@ static void CreateTradingWindows() {
         if (g_IBClient && g_IBClient->IsConnected())
             g_IBClient->ReqContractDetails(NEWS_CONID_STOCK, symbol);
     };
-
     g_NewsWindow->OnPortfolioNewsRequested = [](const std::vector<std::string>& syms) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         for (int i = 0; i < (int)syms.size() && i < 20; ++i)
             g_IBClient->ReqContractDetails(NEWS_CONID_PORT + i, syms[i]);
     };
-
     g_NewsWindow->OnArticleRequested = [](int itemId, const std::string& provider,
                                           const std::string& articleId) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
@@ -718,12 +763,17 @@ static void CreateTradingWindows() {
 }
 
 static void DestroyTradingWindows() {
-    delete g_ChartWindow;     g_ChartWindow     = nullptr;
+    for (auto& e : g_chartEntries)   { delete e.win; e.win = nullptr; }
+    for (auto& e : g_tradingEntries) { delete e.win; e.win = nullptr; }
+    for (auto& e : g_scannerEntries) { delete e.win; e.win = nullptr; }
+    g_chartEntries.clear();
+    g_tradingEntries.clear();
+    g_scannerEntries.clear();
+
     delete g_NewsWindow;      g_NewsWindow      = nullptr;
-    delete g_TradingWindow;   g_TradingWindow   = nullptr;
-    delete g_ScannerWindow;   g_ScannerWindow   = nullptr;
     delete g_PortfolioWindow; g_PortfolioWindow = nullptr;
     delete g_OrdersWindow;    g_OrdersWindow    = nullptr;
+
     g_portfolioSymbols.clear();
     g_artReqToItemId.clear();
     g_nextArtReqId = NEWS_ART_BASE;
@@ -731,13 +781,15 @@ static void DestroyTradingWindows() {
     g_liveOrders.clear();
     g_positions.clear();
     g_symbolCommissions.clear();
-    // Reset scanner subscription state so reconnect starts clean.
-    g_scannerSubscriptionActive = false;
     g_scannerPrevClose.clear();
     g_scannerVolume.clear();
-    // Clear scanner market-data ticker slots so stale IDs don't carry over.
-    for (int i = 0; i < SCAN_MKT_MAX; ++i)
-        g_tickerSymbols.erase(SCAN_MKT_BASE + i);
+    // Clear all multi-window market-data ticker slots
+    for (int i = 0; i < kMaxMultiWin; ++i) {
+        g_tickerSymbols.erase(ChartMktId(i));
+        g_tickerSymbols.erase(TradingMktId(i));
+        for (int s = 0; s < ScannerEntry::kMktSlots; ++s)
+            g_tickerSymbols.erase(ScannerMktBase(i) + s);
+    }
 }
 
 // ============================================================================
@@ -766,25 +818,26 @@ static void WireIBCallbacks() {
             // updateAccountValue which also sends key="Currency", val="BASE".
             g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
             g_IBClient->ReqOpenOrders();
-            // Cancel whatever reqId the previous session left active on the gateway
-            // (same client ID = session restored = old subscription still registered).
-            // We do NOT subscribe here — ScannerWindow::Render() triggers the first
-            // RunScan() immediately (m_lastScanTime=epoch) and calls OnScanRequest,
-            // which advances g_activeScanReqId to a fresh value before subscribing.
-            g_IBClient->CancelScannerData(g_activeScanReqId);
-            g_scannerSubscriptionActive = false;
+            // Cancel stale scanner subscriptions from previous session (same clientId =
+            // session restored = old subscription still registered on the gateway).
+            for (auto& se : g_scannerEntries)
+                g_IBClient->CancelScannerData(se.activeScanId);
 
-            // Chart — default AAPL
+            // Default symbol for chart/trading window 0
             const std::string sym = "AAPL";
-            g_pendingBars.symbol    = sym;
-            g_pendingBars.timeframe = core::Timeframe::D1;
-            g_tickerSymbols[MKT_REQID_BASE] = sym;
-            g_IBClient->ReqHistoricalData(HIST_REQID, sym,
-                                          core::TimeframeIBDuration(core::Timeframe::D1),
-                                          core::TimeframeIBBarSize(core::Timeframe::D1),
-                                          true); // D1 default: RTH only
-            g_IBClient->ReqMarketData(MKT_REQID_BASE, sym, MktDataTicks());
-            g_IBClient->ReqMktDepth(DEPTH_REQID, sym, 20);
+            if (!g_chartEntries.empty()) {
+                auto& ce = g_chartEntries[0];
+                ce.pendingBars.symbol    = sym;
+                ce.pendingBars.timeframe = core::Timeframe::D1;
+                g_tickerSymbols[ce.mktId] = sym;
+                g_IBClient->ReqHistoricalData(ce.histId, sym,
+                                              core::TimeframeIBDuration(core::Timeframe::D1),
+                                              core::TimeframeIBBarSize(core::Timeframe::D1),
+                                              true);
+                g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+            }
+            if (!g_tradingEntries.empty())
+                ApplyTradingSymbol(g_tradingEntries[0], sym);
 
             // Real-time news subscription (fires tickNews → onNewsItem).
             // "mdoff;292:PROVIDERS" bypasses market-data subscription requirement.
@@ -808,34 +861,32 @@ static void WireIBCallbacks() {
 
     // ── Historical bars (chart) ───────────────────────────────────────────
     g_IBClient->onBarData = [](int reqId, const core::Bar& bar, bool done, bool isLive) {
-        if (reqId == HIST_EXTEND_REQID) {
-            // Extend-history (pan-left) response — prepend to existing chart data
-            if (!done) {
-                g_pendingExtendBars.bars.push_back(bar);
-            } else if (g_ChartWindow) {
-                g_ChartWindow->PrependHistoricalData(g_pendingExtendBars);
-                g_pendingExtendBars.bars.clear();
+        for (auto& ce : g_chartEntries) {
+            if (reqId == ce.extId) {
+                // Extend-history (pan-left) response — prepend to existing chart data
+                if (!done) {
+                    ce.pendingExtBars.bars.push_back(bar);
+                } else if (ce.win) {
+                    ce.win->PrependHistoricalData(ce.pendingExtBars);
+                    ce.pendingExtBars.bars.clear();
+                }
+                return;
             }
-            return;
-        }
-        if (isLive) {
-            // keepUpToDate=true live update — update the forming bar in the chart
-            if (g_ChartWindow) g_ChartWindow->UpdateLiveBar(bar);
-        } else if (!done) {
-            g_pendingBars.bars.push_back(bar);
-        } else if (g_ChartWindow) {
-            g_ChartWindow->SetHistoricalData(g_pendingBars);
-            g_pendingBars.bars.clear();
+            if (reqId == ce.histId) {
+                if (isLive) {
+                    if (ce.win) ce.win->UpdateLiveBar(bar);
+                } else if (!done) {
+                    ce.pendingBars.bars.push_back(bar);
+                } else if (ce.win) {
+                    ce.win->SetHistoricalData(ce.pendingBars);
+                    ce.pendingBars.bars.clear();
+                }
+                return;
+            }
         }
     };
 
     // ── Market data ticks ─────────────────────────────────────────────────
-    // Cached tick values — combined when the relevant price tick fires
-    static double g_lastTickSize  = 0.0;
-    static double g_lastTickPrice = 0.0;
-    static double g_nbboBid = 0.0, g_nbboBidSz = 0.0;
-    static double g_nbboAsk = 0.0, g_nbboAskSz = 0.0;
-
     g_IBClient->onTickSize = [](int tickerId, int field, double size) {
         // Normalise delayed-data variants (paper / reqMarketDataType(3)) to standard fields.
         // DELAYED_BID_SIZE=69, DELAYED_ASK_SIZE=70, DELAYED_LAST_SIZE=71, DELAYED_VOLUME=74
@@ -847,47 +898,35 @@ static void WireIBCallbacks() {
             default: break;
         }
 
-        bool isScannerReqId = (tickerId >= SCAN_MKT_BASE &&
-                               tickerId <  SCAN_MKT_BASE + SCAN_MKT_MAX);
-
-        if (field == 87) {  // AVG_VOLUME (10-day avg, from generic tick 221)
-            auto it = g_tickerSymbols.find(tickerId);
-            if (it != g_tickerSymbols.end() && (tickerId == MKT_REQID_BASE || isScannerReqId)) {
-                if (g_ScannerWindow)
-                    g_ScannerWindow->SetAvgVolume(it->second, size);
+        // Trading entry: NBBO sizes and LAST_SIZE
+        for (auto& te : g_tradingEntries) {
+            if (tickerId != te.mktId) continue;
+            switch (field) {
+                case 5: te.lastTickSize = size; break;
+                case 0:  // BID_SIZE
+                    te.nbboBidSz = size;
+                    if (te.win) te.win->OnNBBO(te.nbboBid, te.nbboBidSz, te.nbboAsk, te.nbboAskSz);
+                    break;
+                case 3:  // ASK_SIZE
+                    te.nbboAskSz = size;
+                    if (te.win) te.win->OnNBBO(te.nbboBid, te.nbboBidSz, te.nbboAsk, te.nbboAskSz);
+                    break;
+                default: break;
             }
         }
 
-        if (field == 8) {  // VOLUME (day) — update scanner row
-            auto it = g_tickerSymbols.find(tickerId);
-            if (it != g_tickerSymbols.end() && (tickerId == MKT_REQID_BASE || isScannerReqId)) {
-                const std::string& sym = it->second;
+        // Scanner entries: avg volume (87) and day volume (8)
+        auto symIt = g_tickerSymbols.find(tickerId);
+        if (symIt == g_tickerSymbols.end()) return;
+        const std::string& sym = symIt->second;
+        for (auto& se : g_scannerEntries) {
+            if (tickerId < se.mktBase || tickerId >= se.mktBase + ScannerEntry::kMktSlots) continue;
+            if (field == 87 && se.win)
+                se.win->SetAvgVolume(sym, size);
+            if (field == 8) {
                 g_scannerVolume[sym] = size;
-                if (g_ScannerWindow) {
-                    // Signal scanner with vol update only; price==0 is filtered in OnQuoteUpdate.
-                    g_ScannerWindow->OnQuoteUpdate(sym, 0.0, 0.0, 0.0, size);
-                }
+                if (se.win) se.win->OnQuoteUpdate(sym, 0.0, 0.0, 0.0, size);
             }
-        }
-
-        if (tickerId != MKT_REQID_BASE) return;
-        switch (field) {
-            case 5:  // LAST_SIZE
-                g_lastTickSize = size;
-                break;
-            case 0:  // BID_SIZE — fire NBBO update
-                g_nbboBidSz = size;
-                if (g_TradingWindow)
-                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
-                                            g_nbboAsk, g_nbboAskSz);
-                break;
-            case 3:  // ASK_SIZE — fire NBBO update
-                g_nbboAskSz = size;
-                if (g_TradingWindow)
-                    g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
-                                            g_nbboAsk, g_nbboAskSz);
-                break;
-            default: break;
         }
     };
 
@@ -911,65 +950,75 @@ static void WireIBCallbacks() {
             default: break;
         }
 
-        bool isScannerReqId = (tickerId >= SCAN_MKT_BASE &&
-                               tickerId <  SCAN_MKT_BASE + SCAN_MKT_MAX);
+        // Find which scanner entry owns this tickerId (if any)
+        ScannerEntry* scanEntry = nullptr;
+        for (auto& se : g_scannerEntries) {
+            if (tickerId >= se.mktBase && tickerId < se.mktBase + ScannerEntry::kMktSlots) {
+                scanEntry = &se;
+                break;
+            }
+        }
 
         switch (field) {
             case 1:  // BID price — fire NBBO update
-                if (tickerId == MKT_REQID_BASE) {
-                    g_nbboBid = price;
-                    if (g_TradingWindow)
-                        g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
-                                                g_nbboAsk, g_nbboAskSz);
+                for (auto& te : g_tradingEntries) {
+                    if (tickerId == te.mktId) {
+                        te.nbboBid = price;
+                        if (te.win) te.win->OnNBBO(te.nbboBid, te.nbboBidSz, te.nbboAsk, te.nbboAskSz);
+                    }
                 }
                 break;
             case 2:  // ASK price — fire NBBO update
-                if (tickerId == MKT_REQID_BASE) {
-                    g_nbboAsk = price;
-                    if (g_TradingWindow)
-                        g_TradingWindow->OnNBBO(g_nbboBid, g_nbboBidSz,
-                                                g_nbboAsk, g_nbboAskSz);
+                for (auto& te : g_tradingEntries) {
+                    if (tickerId == te.mktId) {
+                        te.nbboAsk = price;
+                        if (te.win) te.win->OnNBBO(te.nbboBid, te.nbboBidSz, te.nbboAsk, te.nbboAskSz);
+                    }
                 }
                 break;
             case 9: {  // CLOSE — previous session close price
                 g_scannerPrevClose[sym] = price;
-                // Also push to scanner immediately so change/% update even when
-                // CLOSE tick arrives after LAST tick (common with delayed data).
-                if (g_ScannerWindow && isScannerReqId)
-                    g_ScannerWindow->SetPrevClose(sym, price);
+                if (scanEntry && scanEntry->win)
+                    scanEntry->win->SetPrevClose(sym, price);
                 break;
             }
             case 79: {  // IB_52_WK_HIGH (from generic tick 165)
-                if (g_ScannerWindow && (tickerId == MKT_REQID_BASE || isScannerReqId))
-                    g_ScannerWindow->Set52WHigh(sym, price);
+                if (scanEntry && scanEntry->win)
+                    scanEntry->win->Set52WHigh(sym, price);
                 break;
             }
             case 80: {  // IB_52_WK_LOW (from generic tick 165)
-                if (g_ScannerWindow && (tickerId == MKT_REQID_BASE || isScannerReqId))
-                    g_ScannerWindow->Set52WLow(sym, price);
+                if (scanEntry && scanEntry->win)
+                    scanEntry->win->Set52WLow(sym, price);
                 break;
             }
             case 4: {  // LAST price
-                // Chart / trading window only for the primary chart symbol
-                if (tickerId == MKT_REQID_BASE) {
-                    bool isUp = (price >= g_lastTickPrice);
-                    g_lastTickPrice = price;
-                    if (g_TradingWindow) {
-                        g_TradingWindow->UpdateMidPrice(price);
-                        g_TradingWindow->OnTick(price, g_lastTickSize, isUp);
-                    }
-                    if (g_ChartWindow && sym == g_chartSymbol) {
-                        g_ChartWindow->OnLastPrice(price);
-                        g_ChartWindow->OnDayTick(4, price);
-                    }
-                    auto pit = g_positions.find(sym);
-                    if (pit != g_positions.end()) {
-                        pit->second.marketPrice = price;
-                        if (sym == g_chartSymbol) UpdateChartPosition();
+                // Trading windows
+                for (auto& te : g_tradingEntries) {
+                    if (tickerId == te.mktId) {
+                        bool isUp = (price >= te.lastTickPrice);
+                        te.lastTickPrice = price;
+                        if (te.win) {
+                            te.win->UpdateMidPrice(price);
+                            te.win->OnTick(price, te.lastTickSize, isUp);
+                        }
                     }
                 }
+                // Chart windows
+                for (auto& ce : g_chartEntries) {
+                    if (tickerId == ce.mktId && ce.win && sym == ce.win->getSymbol()) {
+                        ce.win->OnLastPrice(price);
+                        ce.win->OnDayTick(4, price);
+                    }
+                }
+                // Position market-price update
+                auto pit = g_positions.find(sym);
+                if (pit != g_positions.end()) {
+                    pit->second.marketPrice = price;
+                    UpdateAllChartPositions();
+                }
                 // Scanner: compute change/% from stored prevClose
-                if (g_ScannerWindow && (tickerId == MKT_REQID_BASE || isScannerReqId)) {
+                if (scanEntry && scanEntry->win) {
                     double prevC = 0.0;
                     auto pcIt = g_scannerPrevClose.find(sym);
                     if (pcIt != g_scannerPrevClose.end()) prevC = pcIt->second;
@@ -978,23 +1027,26 @@ static void WireIBCallbacks() {
                     double vol    = 0.0;
                     auto vIt = g_scannerVolume.find(sym);
                     if (vIt != g_scannerVolume.end()) vol = vIt->second;
-                    g_ScannerWindow->OnQuoteUpdate(sym, price, chg, chgPct, vol);
+                    scanEntry->win->OnQuoteUpdate(sym, price, chg, chgPct, vol);
                 }
                 break;
             }
             case 6: {  // HIGH
-                if (g_ChartWindow && sym == g_chartSymbol)
-                    g_ChartWindow->OnDayTick(6, price);
+                for (auto& ce : g_chartEntries)
+                    if (tickerId == ce.mktId && ce.win && sym == ce.win->getSymbol())
+                        ce.win->OnDayTick(6, price);
                 break;
             }
             case 7: {  // LOW
-                if (g_ChartWindow && sym == g_chartSymbol)
-                    g_ChartWindow->OnDayTick(7, price);
+                for (auto& ce : g_chartEntries)
+                    if (tickerId == ce.mktId && ce.win && sym == ce.win->getSymbol())
+                        ce.win->OnDayTick(7, price);
                 break;
             }
             case 14: {  // OPEN
-                if (g_ChartWindow && sym == g_chartSymbol)
-                    g_ChartWindow->OnDayTick(14, price);
+                for (auto& ce : g_chartEntries)
+                    if (tickerId == ce.mktId && ce.win && sym == ce.win->getSymbol())
+                        ce.win->OnDayTick(14, price);
                 break;
             }
             default: break;
@@ -1004,8 +1056,9 @@ static void WireIBCallbacks() {
     // ── Market depth (Level II order book) ───────────────────────────────
     g_IBClient->onDepthUpdate = [](int id, bool isBid, int pos, int op,
                                    double price, double size) {
-        if (g_TradingWindow)
-            g_TradingWindow->OnDepthUpdate(id, isBid, pos, op, price, size);
+        for (auto& te : g_tradingEntries)
+            if (id == te.depthId && te.win)
+                te.win->OnDepthUpdate(id, isBid, pos, op, price, size);
     };
 
     // ── Account values ────────────────────────────────────────────────────
@@ -1039,8 +1092,9 @@ static void WireIBCallbacks() {
             if (it == g_portfolioSymbols.end())
                 g_portfolioSymbols.push_back(pos.symbol);
         } else {
-            if (g_ScannerWindow) g_ScannerWindow->SetPortfolioSymbols(g_portfolioSymbols);
-            if (g_NewsWindow)    g_NewsWindow->SetPortfolioSymbols(g_portfolioSymbols);
+            for (auto& se : g_scannerEntries)
+                if (se.win) se.win->SetPortfolioSymbols(g_portfolioSymbols);
+            if (g_NewsWindow) g_NewsWindow->SetPortfolioSymbols(g_portfolioSymbols);
         }
     };
 
@@ -1048,14 +1102,14 @@ static void WireIBCallbacks() {
     g_IBClient->onPortfolioUpdate = [](const core::Position& pos) {
         if (g_PortfolioWindow) g_PortfolioWindow->OnPositionUpdate(pos);
         g_positions[pos.symbol] = pos;
-        UpdateChartPosition();
+        UpdateAllChartPositions();
     };
 
     // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
     g_IBClient->onOpenOrder = [](const core::Order& order) {
         g_liveOrders[order.orderId] = order;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
-        UpdateChartPendingOrders();
+        UpdateAllChartPendingOrders();
     };
     g_IBClient->onOpenOrderEnd = []() {
         // nothing extra needed — data already pushed via onOpenOrder
@@ -1064,8 +1118,8 @@ static void WireIBCallbacks() {
     // ── Order status ──────────────────────────────────────────────────────
     g_IBClient->onOrderStatusChanged = [](int orderId, core::OrderStatus status,
                                           double filled, double avgPrice) {
-        if (g_TradingWindow)
-            g_TradingWindow->OnOrderStatus(orderId, status, filled, avgPrice);
+        for (auto& te : g_tradingEntries)
+            if (te.win) te.win->OnOrderStatus(orderId, status, filled, avgPrice);
         if (g_OrdersWindow)
             g_OrdersWindow->OnOrderStatus(orderId, status, filled, avgPrice);
         // Keep our local order map in sync for the chart overlay
@@ -1075,13 +1129,14 @@ static void WireIBCallbacks() {
             it->second.filledQty    = filled;
             it->second.avgFillPrice = avgPrice;
         }
-        UpdateChartPendingOrders();
+        UpdateAllChartPendingOrders();
     };
 
     // ── Fills ─────────────────────────────────────────────────────────────
     g_IBClient->onFillReceived = [](const core::Fill& fill) {
-        if (g_TradingWindow) g_TradingWindow->OnFill(fill);
-        if (g_OrdersWindow)  g_OrdersWindow->OnFill(fill);
+        for (auto& te : g_tradingEntries)
+            if (te.win) te.win->OnFill(fill);
+        if (g_OrdersWindow) g_OrdersWindow->OnFill(fill);
         // Accumulate commission per symbol for the P&L strip
         g_symbolCommissions[fill.symbol] += fill.commission;
         if (g_PortfolioWindow) {
@@ -1096,41 +1151,45 @@ static void WireIBCallbacks() {
             tr.executedAt  = fill.timestamp;
             g_PortfolioWindow->OnTradeExecuted(tr);
         }
-        UpdateChartPosition();
+        UpdateAllChartPositions();
     };
 
 
     // ── Scanner ───────────────────────────────────────────────────────────
     g_IBClient->onScanItem = [](int reqId, const core::ScanResult& result) {
-        if (reqId == g_activeScanReqId) g_pendingScanResults.push_back(result);
+        for (auto& se : g_scannerEntries)
+            if (reqId == se.activeScanId) se.pendingResults.push_back(result);
     };
     g_IBClient->onScanEnd = [](int reqId) {
-        if (reqId != g_activeScanReqId || !g_ScannerWindow) return;
+        for (auto& se : g_scannerEntries) {
+            if (reqId != se.activeScanId || !se.win) continue;
 
-        // Always cancel previously-subscribed market data slots before (re)subscribing.
-        // Without this, a rapid rescan reuses reqIds 800-824 while the farm still has them
-        // active → "Duplicate ticker id" errors for each slot.
-        for (int i = 0; i < SCAN_MKT_MAX; ++i) {
-            int rid = SCAN_MKT_BASE + i;
-            if (g_tickerSymbols.count(rid)) {
-                g_IBClient->CancelMarketData(rid);
-                g_tickerSymbols.erase(rid);
+            // Cancel previously-subscribed market data slots before (re)subscribing.
+            // Without this, a rapid rescan reuses the same reqIds while the farm still has
+            // them active → "Duplicate ticker id" errors for each slot.
+            for (int i = 0; i < ScannerEntry::kMktSlots; ++i) {
+                int rid = se.mktBase + i;
+                if (g_tickerSymbols.count(rid)) {
+                    g_IBClient->CancelMarketData(rid);
+                    g_tickerSymbols.erase(rid);
+                }
             }
-        }
 
-        // Deliver results (empty vector clears m_scanning without wiping the table).
-        g_ScannerWindow->OnScanData(reqId, g_pendingScanResults);
+            // Deliver results (empty vector clears m_scanning without wiping the table).
+            se.win->OnScanData(reqId, se.pendingResults);
 
-        // Subscribe market data for each result so price/change/volume columns live-update.
-        int slot = 0;
-        for (const auto& r : g_pendingScanResults) {
-            if (slot >= SCAN_MKT_MAX) break;
-            int rid = SCAN_MKT_BASE + slot;
-            g_tickerSymbols[rid] = r.symbol;
-            g_IBClient->ReqMarketData(rid, r.symbol, MktDataTicks());
-            ++slot;
+            // Subscribe market data for each result so price/change/volume columns live-update.
+            int slot = 0;
+            for (const auto& r : se.pendingResults) {
+                if (slot >= ScannerEntry::kMktSlots) break;
+                int rid = se.mktBase + slot;
+                g_tickerSymbols[rid] = r.symbol;
+                g_IBClient->ReqMarketData(rid, r.symbol, MktDataTicks());
+                ++slot;
+            }
+            se.pendingResults.clear();
+            break;
         }
-        g_pendingScanResults.clear();
     };
 
     // ── News — real-time (tickNews fires for subscribed market data) ──────
@@ -1219,9 +1278,9 @@ static void WireIBCallbacks() {
             it->second.rejectReason = reason;
             if (g_OrdersWindow)
                 g_OrdersWindow->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0, reason);
-            if (g_TradingWindow)
-                g_TradingWindow->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0);
-            UpdateChartPendingOrders();
+            for (auto& te : g_tradingEntries)
+                if (te.win) te.win->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0);
+            UpdateAllChartPendingOrders();
         }
 
         // News errors: if reqHistoricalNews or reqContractDetails fails (e.g. no news
@@ -1239,20 +1298,14 @@ static void WireIBCallbacks() {
             // Market-tab seed errors don't affect loading UI — market tab is push-based.
         }
 
-        if (!g_TradingWindow) return;
-
-        // Subscription errors for market data (NBBO)
-        // 354 = not subscribed, 10090 = partial subscription
-        if (reqId == MKT_REQID_BASE) {
-            if (code == 354 || code == 10090)
-                g_TradingWindow->OnMktDataError(code);
-        }
-
-        // Subscription / permission errors for Level II depth
-        // 354 = not subscribed, 10092 = deep book not allowed, 322 = no permissions
-        if (reqId == DEPTH_REQID) {
-            if (code == 354 || code == 10090 || code == 10092 || code == 322)
-                g_TradingWindow->OnDepthError(code);
+        // Subscription errors for market data (NBBO) and Level II depth per trading entry.
+        // 354 = not subscribed, 10090 = partial, 10092 = deep book not allowed, 322 = no perms
+        for (auto& te : g_tradingEntries) {
+            if (!te.win) continue;
+            if (reqId == te.mktId && (code == 354 || code == 10090))
+                te.win->OnMktDataError(code);
+            if (reqId == te.depthId && (code == 354 || code == 10090 || code == 10092 || code == 322))
+                te.win->OnDepthError(code);
         }
     };
 
@@ -1299,9 +1352,6 @@ static void Disconnect() {
     g_Login.state       = ConnectionState::Disconnected;
     g_Login.connectedAs.clear();
     g_Login.errorMsg.clear();
-    g_pendingBars       = core::BarSeries{};
-    g_pendingExtendBars = core::BarSeries{};
-    g_pendingScanResults.clear();
     g_scannerPrevClose.clear();
     g_scannerVolume.clear();
     g_tickerSymbols.clear();
@@ -1485,10 +1535,20 @@ static constexpr int kNumBuiltinPresets = static_cast<int>(
     sizeof(kBuiltinPresets) / sizeof(kBuiltinPresets[0]));
 
 static void ApplyPreset(const core::WindowPreset& p) {
-    if (g_ChartWindow)     { g_ChartWindow->open()     = p.chart.visible;     g_ChartWindow->setGroupId(p.chart.groupId); }
-    if (g_TradingWindow)   { g_TradingWindow->open()   = p.trading.visible;   g_TradingWindow->setGroupId(p.trading.groupId); }
+    // Apply to first instance of each multi-instance type
+    if (!g_chartEntries.empty() && g_chartEntries[0].win) {
+        g_chartEntries[0].win->open()       = p.chart.visible;
+        g_chartEntries[0].win->setGroupId(p.chart.groupId);
+    }
+    if (!g_tradingEntries.empty() && g_tradingEntries[0].win) {
+        g_tradingEntries[0].win->open()     = p.trading.visible;
+        g_tradingEntries[0].win->setGroupId(p.trading.groupId);
+    }
+    if (!g_scannerEntries.empty() && g_scannerEntries[0].win) {
+        g_scannerEntries[0].win->open()     = p.scanner.visible;
+        g_scannerEntries[0].win->setGroupId(p.scanner.groupId);
+    }
     if (g_NewsWindow)      { g_NewsWindow->open()      = p.news.visible;      g_NewsWindow->setGroupId(p.news.groupId); }
-    if (g_ScannerWindow)   { g_ScannerWindow->open()   = p.scanner.visible;   g_ScannerWindow->setGroupId(p.scanner.groupId); }
     if (g_PortfolioWindow) { g_PortfolioWindow->open() = p.portfolio.visible; }
     if (g_OrdersWindow)    { g_OrdersWindow->open()    = p.orders.visible; }
     // Reset group state so the next symbol change re-broadcasts correctly
@@ -1518,12 +1578,46 @@ static void RenderTradingUI() {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                if (g_ChartWindow)     ImGui::MenuItem("Chart",      nullptr, &g_ChartWindow->open());
-                if (g_TradingWindow)   ImGui::MenuItem("Order Book", nullptr, &g_TradingWindow->open());
-                if (g_OrdersWindow)    ImGui::MenuItem("Orders",     nullptr, &g_OrdersWindow->open());
-                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio",  nullptr, &g_PortfolioWindow->open());
-                if (g_NewsWindow)      ImGui::MenuItem("News",       nullptr, &g_NewsWindow->open());
-                if (g_ScannerWindow)   ImGui::MenuItem("Scanner",    nullptr, &g_ScannerWindow->open());
+                // Per-instance chart windows
+                for (auto& ce : g_chartEntries) {
+                    if (!ce.win) continue;
+                    char lbl[48];
+                    std::snprintf(lbl, sizeof(lbl), "Chart %d", ce.win->instanceId());
+                    ImGui::MenuItem(lbl, nullptr, &ce.win->open());
+                }
+                if ((int)g_chartEntries.size() < kMaxMultiWin) {
+                    if (ImGui::MenuItem("+ New Chart"))
+                        SpawnChartWindow((int)g_chartEntries.size());
+                }
+                ImGui::Separator();
+                // Per-instance trading windows
+                for (auto& te : g_tradingEntries) {
+                    if (!te.win) continue;
+                    char lbl[48];
+                    std::snprintf(lbl, sizeof(lbl), "Order Book %d", te.win->instanceId());
+                    ImGui::MenuItem(lbl, nullptr, &te.win->open());
+                }
+                if ((int)g_tradingEntries.size() < kMaxMultiWin) {
+                    if (ImGui::MenuItem("+ New Order Book"))
+                        SpawnTradingWindow((int)g_tradingEntries.size());
+                }
+                ImGui::Separator();
+                // Per-instance scanner windows
+                for (auto& se : g_scannerEntries) {
+                    if (!se.win) continue;
+                    char lbl[48];
+                    std::snprintf(lbl, sizeof(lbl), "Scanner %d", se.win->instanceId());
+                    ImGui::MenuItem(lbl, nullptr, &se.win->open());
+                }
+                if ((int)g_scannerEntries.size() < kMaxMultiWin) {
+                    if (ImGui::MenuItem("+ New Scanner"))
+                        SpawnScannerWindow((int)g_scannerEntries.size());
+                }
+                ImGui::Separator();
+                // Singleton windows
+                if (g_OrdersWindow)    ImGui::MenuItem("Orders",    nullptr, &g_OrdersWindow->open());
+                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio", nullptr, &g_PortfolioWindow->open());
+                if (g_NewsWindow)      ImGui::MenuItem("News",      nullptr, &g_NewsWindow->open());
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Presets")) {
@@ -1552,12 +1646,13 @@ static void RenderTradingUI() {
     }
     ImGui::End();
 
-    if (g_ChartWindow)    g_ChartWindow->Render();
-    if (g_NewsWindow)     g_NewsWindow->Render();
-    if (g_TradingWindow)  g_TradingWindow->Render();
-    if (g_ScannerWindow)  g_ScannerWindow->Render();
+    // Render all window instances
+    for (auto& ce : g_chartEntries)   if (ce.win) ce.win->Render();
+    for (auto& te : g_tradingEntries) if (te.win) te.win->Render();
+    for (auto& se : g_scannerEntries) if (se.win) se.win->Render();
+    if (g_NewsWindow)      g_NewsWindow->Render();
     if (g_PortfolioWindow) g_PortfolioWindow->Render();
-    if (g_OrdersWindow)   g_OrdersWindow->Render();
+    if (g_OrdersWindow)    g_OrdersWindow->Render();
 }
 
 // ============================================================================

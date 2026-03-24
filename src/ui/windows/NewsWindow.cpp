@@ -154,6 +154,8 @@ bool NewsWindow::Render() {
 // Toolbar
 // ============================================================================
 void NewsWindow::DrawToolbar() {
+    core::DrawGroupPicker(m_groupId, "##news_grp");
+    ImGui::SameLine(0, 10);
     ImGui::SetNextItemWidth(180);
     ImGui::InputTextWithHint("##filter", "Search headlines...",
                              m_filterText, sizeof(m_filterText));
@@ -162,9 +164,6 @@ void NewsWindow::DrawToolbar() {
     if (ImGui::Button("Refresh")) RefreshAll();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Re-request news for portfolio and current stock symbol");
-
-    ImGui::SameLine(0, 12);
-    core::DrawGroupPicker(m_groupId, "##news_grp");
 }
 
 // ============================================================================
