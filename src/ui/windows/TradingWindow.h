@@ -47,6 +47,7 @@ public:
     void OnMktDataError(int code);
     void OnDepthError(int code);
 
+    std::string getSymbol() const { return m_symbol; }
     void SetSymbol(const std::string& symbol, double midPrice);
     void UpdateMidPrice(double price);
     void SetNextOrderId(int id);

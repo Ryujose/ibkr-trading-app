@@ -88,7 +88,9 @@ static std::unordered_map<std::string, double> g_scannerVolume;
 // tickerId → symbol mapping (for routing tick data to windows)
 static std::unordered_map<int, std::string> g_tickerSymbols;
 
-static int g_nextOrderId   = 1;
+static int    g_nextOrderId          = 1;
+static double g_reconnectNextAttempt = 0.0;   // glfwGetTime() of next auto-reconnect try
+static constexpr double kReconnectIntervalSec = 5.0;
 
 // ---- Window groups (4 slots; index 0 = group id 1) -------------------------
 static std::array<core::GroupState, 4> g_groups;
@@ -217,7 +219,7 @@ static std::unordered_map<int,bool> g_newsConIdFired;
 // ============================================================================
 // Connection / Login state
 // ============================================================================
-enum class ConnectionState { Disconnected, Connecting, Connected, Error };
+enum class ConnectionState { Disconnected, Connecting, Connected, LostConnection, Error };
 enum class ApiType          { TWS = 0, Gateway };
 
 struct LoginState {
@@ -539,8 +541,8 @@ static void SpawnChartWindow(int idx) {
 
     e.win->OnExtendHistory = [idx](const std::string& sym, core::Timeframe tf,
                                    const std::string& endDT, bool useRTH) {
-        if (!g_IBClient) return;
         auto& ce = g_chartEntries[idx];
+        if (!g_IBClient) { ce.win->PrependHistoricalData({}); return; }
         g_IBClient->CancelHistoricalData(ce.extId);
         ce.pendingExtBars           = core::BarSeries{};
         ce.pendingExtBars.symbol    = sym;
@@ -799,11 +801,10 @@ static void WireIBCallbacks() {
     // ── Connection state ──────────────────────────────────────────────────
     g_IBClient->onConnectionChanged = [](bool connected, const std::string& info) {
         if (connected) {
+            bool isReconnect = (g_Login.state == ConnectionState::LostConnection);
             g_Login.state       = ConnectionState::Connected;
             g_Login.connectedAs = g_Login.isLive ? "[LIVE]" : "[PAPER]";
             printf("[IB] %s\n", info.c_str());
-
-            CreateTradingWindows();
 
             // Set market data type before any subscriptions.
             // Live:  type 1 (real-time, requires active data subscriptions).
@@ -811,49 +812,85 @@ static void WireIBCallbacks() {
             //        last known price outside RTH so NBBO doesn't go blank after hours).
             g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 4);
 
-            // Start subscriptions
-            g_IBClient->ReqAccountUpdates(true);
-            g_IBClient->ReqPositions();
-            // Fetch base currency via reqAccountSummary — more reliable than parsing
-            // updateAccountValue which also sends key="Currency", val="BASE".
-            g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
-            g_IBClient->ReqOpenOrders();
-            // Cancel stale scanner subscriptions from previous session (same clientId =
-            // session restored = old subscription still registered on the gateway).
-            for (auto& se : g_scannerEntries)
-                g_IBClient->CancelScannerData(se.activeScanId);
+            if (!isReconnect) {
+                // ── First connect: create all windows, load default symbol ────────
+                DestroyTradingWindows();
+                CreateTradingWindows();
 
-            // Default symbol for chart/trading window 0
-            const std::string sym = "AAPL";
-            if (!g_chartEntries.empty()) {
-                auto& ce = g_chartEntries[0];
-                ce.pendingBars.symbol    = sym;
-                ce.pendingBars.timeframe = core::Timeframe::D1;
-                g_tickerSymbols[ce.mktId] = sym;
-                g_IBClient->ReqHistoricalData(ce.histId, sym,
-                                              core::TimeframeIBDuration(core::Timeframe::D1),
-                                              core::TimeframeIBBarSize(core::Timeframe::D1),
-                                              true);
-                g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+                g_IBClient->ReqAccountUpdates(true);
+                g_IBClient->ReqPositions();
+                g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
+                g_IBClient->ReqOpenOrders();
+                for (auto& se : g_scannerEntries)
+                    g_IBClient->CancelScannerData(se.activeScanId);
+
+                const std::string sym = "AAPL";
+                if (!g_chartEntries.empty()) {
+                    auto& ce = g_chartEntries[0];
+                    ce.pendingBars.symbol    = sym;
+                    ce.pendingBars.timeframe = core::Timeframe::D1;
+                    g_tickerSymbols[ce.mktId] = sym;
+                    g_IBClient->ReqHistoricalData(ce.histId, sym,
+                                                  core::TimeframeIBDuration(core::Timeframe::D1),
+                                                  core::TimeframeIBBarSize(core::Timeframe::D1),
+                                                  true);
+                    g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+                }
+                if (!g_tradingEntries.empty())
+                    ApplyTradingSymbol(g_tradingEntries[0], sym);
+
+                g_IBClient->SubscribeToNews(NEWS_RT_REQID);
+                for (int i = 0; i < kMktSeedCount; ++i)
+                    g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
+            } else {
+                // ── Silent reconnect: windows already exist, re-subscribe data ───
+                printf("[IB] Reconnected — re-subscribing all windows.\n");
+                g_IBClient->ReqAccountUpdates(true);
+                g_IBClient->ReqPositions();
+                g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
+                g_IBClient->ReqOpenOrders();
+                // Cancel any stale scanner subs the gateway may have retained.
+                for (auto& se : g_scannerEntries)
+                    g_IBClient->CancelScannerData(se.activeScanId);
+
+                // Re-subscribe each chart window with its current symbol + timeframe.
+                for (auto& ce : g_chartEntries) {
+                    if (!ce.win) continue;
+                    std::string sym = ce.win->getSymbol();
+                    if (sym.empty()) continue;
+                    core::Timeframe tf = ce.win->getTimeframe();
+                    g_tickerSymbols[ce.mktId] = sym;
+                    ce.pendingBars.symbol    = sym;
+                    ce.pendingBars.timeframe = tf;
+                    g_IBClient->ReqHistoricalData(ce.histId, sym,
+                                                  core::TimeframeIBDuration(tf),
+                                                  core::TimeframeIBBarSize(tf),
+                                                  true);
+                    g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+                }
+
+                // Re-subscribe each trading window with its current symbol.
+                for (auto& te : g_tradingEntries) {
+                    if (!te.win) continue;
+                    std::string sym = te.win->getSymbol();
+                    if (!sym.empty()) ApplyTradingSymbol(te, sym);
+                }
+
+                g_IBClient->SubscribeToNews(NEWS_RT_REQID);
+                for (int i = 0; i < kMktSeedCount; ++i)
+                    g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
             }
-            if (!g_tradingEntries.empty())
-                ApplyTradingSymbol(g_tradingEntries[0], sym);
-
-            // Real-time news subscription (fires tickNews → onNewsItem).
-            // "mdoff;292:PROVIDERS" bypasses market-data subscription requirement.
-            g_IBClient->SubscribeToNews(NEWS_RT_REQID);
-
-            // Seed Market-tab with recent historical headlines from major symbols.
-            // Each reqContractDetails fires onContractConId → ReqHistoricalNews.
-            for (int i = 0; i < kMktSeedCount; ++i)
-                g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
         } else {
+            // Any disconnect while not in the normal "initial Connecting" flow
+            // → keep windows alive, null client, schedule a reconnect attempt.
             if (g_Login.state == ConnectionState::Connecting) {
                 g_Login.state    = ConnectionState::Error;
                 g_Login.errorMsg = info;
             } else {
-                g_Login.state = ConnectionState::Disconnected;
-                DestroyTradingWindows();
+                delete g_IBClient;
+                g_IBClient                = nullptr;
+                g_Login.state             = ConnectionState::LostConnection;
+                g_reconnectNextAttempt    = glfwGetTime() + kReconnectIntervalSec;
             }
             printf("[IB] Disconnected: %s\n", info.c_str());
         }
@@ -1342,6 +1379,25 @@ static void StartConnect() {
     }
 }
 
+// Silent background reconnect — called from the main loop when LostConnection.
+// State stays LostConnection until onConnectionChanged fires with connected=true.
+static void StartSilentReconnect() {
+    printf("[IB] Auto-reconnect attempt to %s:%d...\n", g_Login.host, g_Login.port);
+    delete g_IBClient;
+    g_IBClient = new core::services::IBKRClient();
+    WireIBCallbacks();
+
+    bool ok = g_IBClient->Connect(g_Login.host, g_Login.port, g_Login.clientId);
+    if (!ok) {
+        // Gateway still down — delete client and schedule next retry.
+        delete g_IBClient;
+        g_IBClient             = nullptr;
+        g_reconnectNextAttempt = glfwGetTime() + kReconnectIntervalSec;
+        printf("[IB] Reconnect failed — will retry in %.0fs.\n", kReconnectIntervalSec);
+    }
+    // On success the async onConnectionChanged(true) callback fires and sets Connected.
+}
+
 static void Disconnect() {
     if (g_IBClient) {
         g_IBClient->ReqAccountUpdates(false);
@@ -1630,8 +1686,25 @@ static void RenderTradingUI() {
 
             // Status indicator
             const std::string& who = g_Login.connectedAs;
+            bool lostConn = (g_Login.state == ConnectionState::LostConnection);
+            static const char* kDiscLabel = " DISCONNECTED ";
+            float discW = lostConn ? ImGui::CalcTextSize(kDiscLabel).x + 8.0f : 0.0f;
             ImGui::SameLine(ImGui::GetContentRegionAvail().x
-                            - ImGui::CalcTextSize(who.c_str()).x - 12.0f);
+                            - discW - ImGui::CalcTextSize(who.c_str()).x - 12.0f);
+            if (lostConn) {
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                ImVec2 sz = ImGui::CalcTextSize(kDiscLabel);
+                float pad = 4.0f;
+                ImDrawList* dl = ImGui::GetWindowDrawList();
+                dl->AddRectFilled(
+                    ImVec2(p.x - pad, p.y - 1),
+                    ImVec2(p.x + sz.x + pad, p.y + sz.y + 1),
+                    IM_COL32(180, 60, 0, 220), 3.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.3f, 1.0f));
+                ImGui::Text("%s", kDiscLabel);
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
             ImGui::PushStyleColor(ImGuiCol_Text,
                 g_Login.isLive ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
                                : ImVec4(0.4f, 1.0f, 0.5f, 1.0f));
@@ -1659,10 +1732,11 @@ static void RenderTradingUI() {
 // Top-level UI dispatcher
 // ============================================================================
 static void RenderMainUI() {
-    if (g_Login.state != ConnectionState::Connected)
-        RenderLoginWindow();
-    else
+    if (g_Login.state == ConnectionState::Connected ||
+        g_Login.state == ConnectionState::LostConnection)
         RenderTradingUI();
+    else
+        RenderLoginWindow();
 }
 
 // ============================================================================
@@ -1751,6 +1825,11 @@ int main(int argc, char* argv[]) {
 
         // Drain IB message queue each frame (when connected)
         if (g_IBClient) g_IBClient->ProcessMessages();
+
+        // Auto-reconnect when connection was lost unexpectedly
+        if (g_Login.state == ConnectionState::LostConnection && !g_IBClient &&
+            glfwGetTime() >= g_reconnectNextAttempt)
+            StartSilentReconnect();
 
         int cur_w, cur_h;
         glfwGetFramebufferSize(g_AppWindow, &cur_w, &cur_h);
