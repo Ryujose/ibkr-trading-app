@@ -48,7 +48,8 @@ public:
     bool Render();
     bool& open() { return m_open; }
     void SetSymbol(const std::string& symbol);
-    std::string getSymbol() const { return m_symbol; }
+    std::string     getSymbol()    const { return m_symbol; }
+    core::Timeframe getTimeframe() const { return m_timeframe; }
     void setGroupId(int id)    { m_groupId = id; }
     int  groupId() const       { return m_groupId; }
     void setInstanceId(int id);

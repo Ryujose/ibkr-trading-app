@@ -342,10 +342,13 @@ void ChartWindow::RequestNewData() {
     m_xs.clear(); m_opens.clear(); m_highs.clear();
     m_lows.clear(); m_closes.clear(); m_volumes.clear();
     m_vwap.clear();
+    m_loadingMore    = false;
+    m_historyAtStart = false;
 
     if (OnDataRequest) {
-        m_hasRealData = false;
-        m_loading     = true;
+        m_hasRealData  = false;
+        m_loading      = true;
+        m_needsRefresh = true;  // fallback: simulated data shows if IB never responds
         // For intraday timeframes, honour m_useRTH (user-toggleable).
         // For daily/weekly/monthly, always use RTH-only (no extended hours concept).
         bool rth = m_useRTH || !IsIntraday(m_timeframe);
@@ -921,6 +924,25 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         dl->AddRectFilled(ImVec2(lp1.x, lp0.y - 9),
                           ImVec2(lp1.x + eSz.x + 4, lp0.y + 9), kBeBg, 2.f);
         dl->AddText(ImVec2(lp1.x + 2, lp0.y - 7), kBeCol, edgeBuf);
+    }
+
+    // ── Current price line ────────────────────────────────────────────────────
+    if (!m_closes.empty()) {
+        double curPrice = m_closes.back();
+        static constexpr ImU32 kCurCol = IM_COL32(200, 200, 200, 200);
+        static constexpr ImU32 kCurBg  = IM_COL32( 45,  45,  45, 230);
+
+        float lineY = ImPlot::PlotToPixels(m_xMin, curPrice).y;
+        DrawDashedHLine(dl, pMin.x, pMax.x, lineY, kCurCol, 1.0f, 4.f, 3.f);
+
+        // Right-aligned price tag — stays inside the plot clip rect, flush to the right edge.
+        char curBuf[24];
+        std::snprintf(curBuf, sizeof(curBuf), " %.2f ", curPrice);
+        ImVec2 curSz = ImGui::CalcTextSize(curBuf);
+        float  tagX  = pMax.x - curSz.x - 2.f;
+        dl->AddRectFilled(ImVec2(tagX - 2,        lineY - 9),
+                          ImVec2(tagX + curSz.x + 2, lineY + 9), kCurBg, 2.f);
+        dl->AddText(ImVec2(tagX, lineY - 7), kCurCol, curBuf);
     }
 
     // ── Render stored drawings ─────────────────────────────────────────────
@@ -1810,7 +1832,14 @@ void ChartWindow::DrawRsiChart() {
 // ============================================================================
 void ChartWindow::RefreshData() {
     if (m_hasRealData) return;
-    m_series = GenerateSimulatedBars(m_symbol, m_timeframe, 200);
+    // For short intraday timeframes the fixed 200-bar window can land entirely
+    // in Overnight / weekend hours and be filtered out by RebuildFlatArrays,
+    // leaving the chart blank.  Always cover at least 3 calendar days so that
+    // regular-session bars are present regardless of what time the app runs.
+    int64_t tfSec = core::TimeframeSeconds(m_timeframe);
+    int      count = std::max((int)(3LL * 24 * 3600 / tfSec), 200);
+    m_series   = GenerateSimulatedBars(m_symbol, m_timeframe, count);
+    m_loading  = false;   // unblock render if IB never responded
     RebuildFlatArrays();
     ComputeIndicators();
 }
@@ -1952,11 +1981,11 @@ core::BarSeries ChartWindow::GenerateSimulatedBars(const std::string& symbol,
 
     struct SymConfig { double price, vol, drift, avgVol; };
     auto cfg = [&]() -> SymConfig {
-        if (symbol == "AAPL")  return {185.0, 0.015, 0.0003, 55e6};
-        if (symbol == "MSFT")  return {415.0, 0.013, 0.0004, 25e6};
-        if (symbol == "GOOGL") return {175.0, 0.016, 0.0003, 20e6};
-        if (symbol == "TSLA")  return {250.0, 0.030, 0.0002, 90e6};
-        if (symbol == "SPY")   return {520.0, 0.008, 0.0002, 80e6};
+        if (symbol == "AAPL")  return {253.0, 0.015, 0.0003, 55e6};
+        if (symbol == "MSFT")  return {380.0, 0.013, 0.0004, 25e6};
+        if (symbol == "GOOGL") return {190.0, 0.016, 0.0003, 20e6};
+        if (symbol == "TSLA")  return {320.0, 0.030, 0.0002, 90e6};
+        if (symbol == "SPY")   return {575.0, 0.008, 0.0002, 80e6};
         return {100.0, 0.020, 0.0002, 10e6};
     }();
 
@@ -1966,7 +1995,8 @@ core::BarSeries ChartWindow::GenerateSimulatedBars(const std::string& symbol,
 
     core::BarSeries series;
     series.symbol = symbol; series.timeframe = tf; series.bars.reserve(count);
-    double price = cfg.price;
+    // Walk from 1.0; rescale at the end so the last close always equals cfg.price.
+    double price = 1.0;
 
     for (int i = 0; i < count; i++) {
         double ts = (double)(startTs + (int64_t)i * tfSec);
@@ -1985,6 +2015,14 @@ core::BarSeries ChartWindow::GenerateSimulatedBars(const std::string& symbol,
         double vol   = cfg.avgVol * std::exp(0.4 * dist(rng));
         series.bars.push_back({ts, open, high, low, close, vol});
         price = close;
+    }
+    // Rescale every bar so the last close lands exactly at cfg.price.
+    if (!series.bars.empty() && price > 0.0) {
+        double scale = cfg.price / price;
+        for (auto& b : series.bars) {
+            b.open  *= scale;  b.high  *= scale;
+            b.low   *= scale;  b.close *= scale;
+        }
     }
     return series;
 }

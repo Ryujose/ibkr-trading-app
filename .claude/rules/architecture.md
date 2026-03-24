@@ -55,6 +55,26 @@ Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScanner
 - Scanner scan: 1000,1100,1200,1300 (+99 each) · mkt: 800,812,824,836 (+12 each)
 - News: 201(RT), 400-420, 500-520, 600-699, 700-759 · Account: 900
 
+## Connection State Machine
+
+`ConnectionState` enum in `main.cpp`:
+
+| State | Meaning |
+|---|---|
+| `Disconnected` | Not connected — login screen shown |
+| `Connecting` | Initial connect in progress |
+| `Connected` | Live session — trading UI shown |
+| `LostConnection` | Unexpected drop — trading UI stays alive, DISCONNECTED badge shown, auto-reconnect polling |
+| `Error` | Initial connect failed — login screen with error message |
+
+**Auto-reconnect** (`StartSilentReconnect()`):
+- Polled every frame from main loop when `LostConnection && !g_IBClient`
+- Timer: `g_reconnectNextAttempt` (5s interval via `kReconnectIntervalSec`)
+- On success (`onConnectionChanged(true)` with `isReconnect=true`): skips `DestroyTradingWindows`/`CreateTradingWindows`, re-subscribes each chart/trading window using `getSymbol()`/`getTimeframe()` accessors
+- On failure: schedules next retry in 5s, stays `LostConnection`
+
+**DISCONNECTED badge**: orange background rect + yellow text, left of `[LIVE]`/`[PAPER]` in menu bar.
+
 ## Window Groups & Symbol Sync
 
 `src/core/models/WindowGroup.h` provides:

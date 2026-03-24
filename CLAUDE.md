@@ -11,4 +11,4 @@ Detailed rules live in `.claude/rules/`:
 - [`ibkr-api.md`](.claude/rules/ibkr-api.md) — IB API quirks, ports, IBKRClient bridge, protobuf, bid_stubs
 - [`vulkan-imgui.md`](.claude/rules/vulkan-imgui.md) — ImGui version, valid/removed API calls, Vulkan pitfalls
 - [`cpp-style.md`](.claude/rules/cpp-style.md) — Language standard, naming, what to avoid
-- [`task-history.md`](.claude/rules/task-history.md) — Completed task list (phases 1–4)
+- [`task-history.md`](.claude/rules/task-history.md) — Completed task list (phases 1–6)
