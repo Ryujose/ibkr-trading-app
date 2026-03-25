@@ -226,11 +226,14 @@ private:
     std::mutex             m_queueMutex;
     std::vector<IBMessage> m_queue;
 
+protected:
+    // Exposed as protected so test subclasses can inject messages directly.
     void Push(IBMessage msg) {
         std::lock_guard<std::mutex> lk(m_queueMutex);
         m_queue.push_back(std::move(msg));
     }
 
+private:
     // ── Outgoing send thread (prevents PlaceOrder blocking the UI thread) ─
     // EClientSocket is not thread-safe for concurrent sends, so all outgoing
     // IB calls go through a single dedicated send thread via this queue.
@@ -249,8 +252,6 @@ private:
 
     // ── Helpers ───────────────────────────────────────────────────────────
     Contract MakeStockContract(const std::string& symbol) const;
-    static ::core::OrderStatus ParseStatus(const std::string& s);
-    static std::time_t         ParseIBTime(const std::string& ts);
 
     // ── EWrapper overrides (only non-trivial ones) ────────────────────────
     void connectAck() override;

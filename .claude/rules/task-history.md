@@ -1,6 +1,6 @@
 # Task History
 
-All planned tasks are complete through Phase 5.
+All planned tasks are complete through Phase 7.
 
 ## Phase 1: Infrastructure
 - [x] **Task #1** — CMake configuration with dependency validation
@@ -30,3 +30,12 @@ All planned tasks are complete through Phase 5.
 - [x] **Task #15** — Current price line — dashed grey horizontal line at last close price; right-aligned price tag inside the chart clip rect (`DrawOverlays()` in `ChartWindow.cpp`); uses `pMax.x` (actual pixel boundary) for correct placement
 - [x] **Task #16** — Disconnection badge — `LostConnection` added to `ConnectionState` enum; on unexpected disconnect keeps trading UI alive (nulls client, doesn't destroy windows); orange `DISCONNECTED` badge with background rect rendered left of `[LIVE]`/`[PAPER]` in menu bar
 - [x] **Task #17** — Auto-reconnect — `StartSilentReconnect()` in `main.cpp`; `g_reconnectNextAttempt` timer (5s interval) polled each frame when `LostConnection && !g_IBClient`; on reconnect success re-subscribes each chart/trading window with its current symbol+timeframe instead of recreating windows; `getTimeframe()` added to `ChartWindow`, `getSymbol()` added to `TradingWindow`
+
+## Phase 7: Testing Infrastructure
+- [x] **Task #18** — Extract `ParseStatus` / `ParseIBTime` to `src/core/services/IBKRUtils.h` as inline free functions; move `IBKRClient::Push()` from `private` to `protected`; remove private static declarations from `IBKRClient.h`
+- [x] **Task #19** — `tests/CMakeLists.txt` — Catch2 v3.7.1 via FetchContent; `tests-core` (no IB API dep) and `tests-ibkr` (links ibapi-lib) targets; `IBKR_SANITIZE` option applies ASan+UBSan to `tests-core`
+- [x] **Task #20** — `tests/test_market_data.cpp` — 20+ cases: all Timeframe label/seconds/barsize/duration helpers; `IsUSDST` DST boundary cases (March/November 2024); `BarSession` session classification at all transition boundaries (EDT and EST)
+- [x] **Task #21** — `tests/test_models.cpp` — enum string helpers (`OrderSideStr`, `OrderTypeStr`, `TIFStr`, `OrderStatusStr`, `ScanPresetLabel`, `AssetClassLabel`); struct default-value assertions for `Order`, `Fill`, `DepthLevel`, `ScanResult`, `ScanFilter`, `Position`, `AccountValues`, `Bar`
+- [x] **Task #22** — `tests/test_ibkr_utils.cpp` — `ParseStatus` all IB string variants including case-sensitivity; `ParseIBTime` for 8-digit date (noon UTC mapping), Unix timestamp round-trips, calendar correctness across multiple dates
+- [x] **Task #23** — `tests/test_ibkr_queue.cpp` — `TestableIBKRClient` subclass; dispatch tests for all major `IBMessage` variants; null-callback safety; ordering; queue-drain idempotency
+- [x] **Task #24** — CI: all three platform jobs (`build-linux`, `build-macos`, `build-windows`) now configure with `-DIBKR_BUILD_TESTS=ON` and run `ctest`; FetchContent dep cache added; new `sanitize-linux` job runs `tests-core` under ASan + UBSan

@@ -106,6 +106,47 @@ DISPLAY=:1 ./build/bin/ibkr-trading-app
 
 ---
 
+## Testing
+
+The test suite uses [Catch2 v3](https://github.com/catchorg/Catch2) and is fetched automatically by CMake. No extra install step needed.
+
+### Run tests locally
+
+```bash
+# Configure with tests enabled
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DIBKR_BUILD_TESTS=ON
+
+# Build
+cmake --build build -j$(nproc)
+
+# Run all tests
+ctest --test-dir build --output-on-failure
+```
+
+### Test targets
+
+| Target | What it covers |
+|---|---|
+| `tests-core` | Pure logic: Timeframe helpers, DST/session classification, model struct defaults, enum string helpers, `ParseStatus`, `ParseIBTime` |
+| `tests-ibkr` | IBKRClient message dispatch: inject `IBMessage` variants into the queue, assert callbacks fire correctly — no live IB connection required |
+
+### Sanitizers (Linux)
+
+```bash
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Debug -DIBKR_BUILD_TESTS=ON -DIBKR_SANITIZE=ON
+cmake --build build --target tests-core -j$(nproc)
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
+  ./build/tests/tests-core
+```
+
+### CI
+
+All three platform jobs (Linux, macOS, Windows) build and run the full test suite on every push and pull request. A dedicated `sanitize-linux` job runs `tests-core` under AddressSanitizer + UBSanitizer after the main Linux build passes.
+
+> UI rendering (ImGui/Vulkan) and live IB Gateway connectivity are not covered by automated tests — these require a real display and a running IB session.
+
+---
+
 ## IB Gateway / TWS Setup
 
 The app connects to either **IB Gateway** or **Trader Workstation (TWS)**. You must enable API access before connecting.
