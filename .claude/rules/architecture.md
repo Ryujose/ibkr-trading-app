@@ -5,13 +5,19 @@
 ```
 ├── src/
 │   ├── core/
-│   │   ├── services/         # IB Gateway integration (IBKRClient.h/.cpp)
+│   │   ├── services/         # IB Gateway integration (IBKRClient.h/.cpp, IBKRUtils.h)
 │   │   └── models/           # Data models: MarketData.h, NewsData.h, ScannerData.h,
 │   │                         #   PortfolioData.h, WindowGroup.h
 │   ├── ui/
 │   │   └── windows/          # One .h/.cpp pair per window
 │   ├── bid_stubs/            # bid_stubs.c — Intel BID64 double bit-cast
 │   └── main.cpp              # Vulkan/GLFW init, login state machine, top-level UI dispatch
+├── tests/                    # Catch2 test suite (see testing.md)
+│   ├── CMakeLists.txt
+│   ├── test_market_data.cpp  # Timeframe helpers, IsUSDST, BarSession
+│   ├── test_models.cpp       # Enum string helpers, struct defaults
+│   ├── test_ibkr_utils.cpp   # ParseStatus, ParseIBTime
+│   └── test_ibkr_queue.cpp   # IBKRClient message dispatch (component tests)
 ├── twsapi_macunix.1037.02/   # IB TWS API sources (in-tree)
 ├── CMakeLists.txt
 └── build/                    # Generated, not committed
@@ -24,6 +30,7 @@
 3. **Dependency Injection**: Services injected into window constructors for testability.
 4. **One window = one file**: Each UI window gets its own `.h`/`.cpp` in `src/ui/windows/`.
 5. **Models are POD-first**: Data models in `core/models/` are plain structs — no business logic.
+6. **Utility extraction**: Pure logic extracted from class privates into standalone headers (`IBKRUtils.h`) so it can be unit-tested without IB API linkage.
 
 ## Main Entry Point Pattern
 
@@ -54,6 +61,22 @@ Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScanner
 - Trading mkt: 110-113 · depth: 120-123
 - Scanner scan: 1000,1100,1200,1300 (+99 each) · mkt: 800,812,824,836 (+12 each)
 - News: 201(RT), 400-420, 500-520, 600-699, 700-759 · Account: 900
+
+## IBKRUtils
+
+`src/core/services/IBKRUtils.h` — standalone header with no IB API dependency:
+- `ParseStatus(const std::string&) → core::OrderStatus` — maps IB order-status strings to enum
+- `ParseIBTime(const std::string&) → std::time_t` — parses IB date/timestamp formats (YYYYMMDD, Unix string, formatted datetime)
+
+Both were previously private statics on `IBKRClient`. Extracting them allows unit testing without linking ibapi-lib.
+
+`IBKRClient::Push()` is **protected** (not private) so test subclasses can inject messages directly:
+```cpp
+class TestableIBKRClient : public IBKRClient {
+public:
+    void inject(IBMessage msg) { Push(std::move(msg)); }
+};
+```
 
 ## Connection State Machine
 

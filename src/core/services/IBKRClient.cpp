@@ -1,4 +1,5 @@
 #include "core/services/IBKRClient.h"
+#include "core/services/IBKRUtils.h"
 
 // IB API implementation headers
 #include "EClientSocket.h"
@@ -500,41 +501,6 @@ void IBKRClient::updateMktDepthL2(TickerId id, int position,
 
 // ── Historical data ────────────────────────────────────────────────────────
 
-std::time_t IBKRClient::ParseIBTime(const std::string& ts) {
-    if (ts.empty()) return 0;
-
-    bool allDigits = true;
-    for (char c : ts) if (!isdigit(static_cast<unsigned char>(c))) { allDigits = false; break; }
-
-    if (allDigits) {
-        if (ts.size() == 8) {
-            // "YYYYMMDD" — IB always returns this format for D1/W1/MN bars regardless
-            // of the formatDate=2 parameter (which only applies to intraday bars).
-            // Parse as noon UTC so gmtime() always maps back to the correct calendar
-            // date in any timezone (noon UTC ± 12 h offset never crosses midnight UTC).
-            struct tm t = {};
-            std::istringstream(ts) >> std::get_time(&t, "%Y%m%d");
-            t.tm_hour = 12; t.tm_min = t.tm_sec = 0;
-            t.tm_isdst = 0;
-#ifdef _WIN32
-            return _mkgmtime(&t);
-#else
-            return timegm(&t);
-#endif
-        }
-        // Unix timestamp string from IB (intraday bars with formatDate=2)
-        return static_cast<std::time_t>(std::stoll(ts));
-    }
-
-    // "YYYYMMDD  HH:MM:SS" or "YYYYMMDD HH:MM:SS [TZ]" — intraday bars with formatDate=1
-    struct tm t = {};
-    std::istringstream ss(ts);
-    ss >> std::get_time(&t, "%Y%m%d %H:%M:%S");
-    if (ss.fail()) { ss.clear(); std::istringstream(ts) >> std::get_time(&t, "%Y%m%d"); }
-    t.tm_isdst = -1;
-    return mktime(&t);
-}
-
 void IBKRClient::historicalData(TickerId reqId, const ::Bar& bar) {
     ::core::Bar b;
     b.timestamp = static_cast<double>(ParseIBTime(bar.time));
@@ -614,16 +580,6 @@ void IBKRClient::positionEnd() {
 }
 
 // ── Orders ─────────────────────────────────────────────────────────────────
-
-::core::OrderStatus IBKRClient::ParseStatus(const std::string& s) {
-    if (s == "Filled")                                                return ::core::OrderStatus::Filled;
-    if (s == "Cancelled" || s == "ApiCancelled" || s == "Inactive")  return ::core::OrderStatus::Cancelled;
-    if (s == "Submitted"  || s == "PreSubmitted" || s == "ApiPending") return ::core::OrderStatus::Working;
-    if (s == "PartiallyFilled")                                       return ::core::OrderStatus::PartialFill;
-    if (s == "Pending" || s == "PendingSubmit" || s == "PendingCancel") return ::core::OrderStatus::Pending;
-    if (s.empty())                                                    return ::core::OrderStatus::Pending;
-    return ::core::OrderStatus::Rejected;
-}
 
 void IBKRClient::orderStatus(OrderId orderId, const std::string& status,
                               Decimal filled, Decimal /*remaining*/,

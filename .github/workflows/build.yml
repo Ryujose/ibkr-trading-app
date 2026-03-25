@@ -33,11 +33,21 @@ jobs:
           tar -xzf twsapi_macunix.1037.02.tar.gz
           rm twsapi_macunix.1037.02.tar.gz
 
+      - name: Cache build dependencies (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: linux-deps-${{ hashFiles('CMakeLists.txt', 'tests/CMakeLists.txt') }}
+          restore-keys: linux-deps-
+
       - name: Configure
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DIBKR_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
 
       - name: Upload artifact
         if: github.ref == 'refs/heads/main'
@@ -66,13 +76,24 @@ jobs:
           tar -xzf twsapi_macunix.1037.02.tar.gz
           rm twsapi_macunix.1037.02.tar.gz
 
+      - name: Cache build dependencies (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: macos-deps-${{ hashFiles('CMakeLists.txt', 'tests/CMakeLists.txt') }}
+          restore-keys: macos-deps-
+
       - name: Configure
         run: |
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix protobuf@21);$(brew --prefix)"
+            -DCMAKE_PREFIX_PATH="$(brew --prefix protobuf@21);$(brew --prefix)" \
+            -DIBKR_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
 
       - name: Upload artifact
         if: github.ref == 'refs/heads/main'
@@ -125,15 +146,27 @@ jobs:
           }
         shell: pwsh
 
+      - name: Cache build dependencies (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: windows-deps-${{ hashFiles('CMakeLists.txt', 'tests/CMakeLists.txt') }}
+          restore-keys: windows-deps-
+
       - name: Configure
         run: >
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=x64-windows-static
+          -DIBKR_BUILD_TESTS=ON
         shell: pwsh
 
       - name: Build
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
+
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
         shell: pwsh
 
       - name: Upload artifact
@@ -143,3 +176,56 @@ jobs:
           name: ibkr-trading-app-windows
           path: build/Release/ibkr-trading-app.exe
           retention-days: 30
+
+  # ── Sanitizer job (Linux only) ────────────────────────────────────────────
+  # Builds tests-core with AddressSanitizer + UBSanitizer.
+  # tests-ibkr is excluded here to avoid false positives from third-party IB
+  # API code that we do not control.
+  sanitize-linux:
+    runs-on: ubuntu-latest
+    needs: build-linux  # only run if the main Linux build passes
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build \
+            libvulkan-dev vulkan-validationlayers \
+            libglfw3-dev \
+            libprotobuf-dev protobuf-compiler \
+            libgl1-mesa-dev
+
+      - name: Decrypt TWS API
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+            -in twsapi_macunix.1037.02.tar.gz.enc \
+            -out twsapi_macunix.1037.02.tar.gz \
+            -pass pass:${{ secrets.TWSAPI_DECRYPT_KEY }}
+          tar -xzf twsapi_macunix.1037.02.tar.gz
+          rm twsapi_macunix.1037.02.tar.gz
+
+      - name: Cache build dependencies (FetchContent)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: linux-deps-${{ hashFiles('CMakeLists.txt', 'tests/CMakeLists.txt') }}
+          restore-keys: linux-deps-
+
+      - name: Configure (Debug + ASan + UBSan on tests-core)
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DIBKR_BUILD_TESTS=ON \
+            -DIBKR_SANITIZE=ON
+
+      - name: Build tests-core only
+        run: cmake --build build -j$(nproc) --target tests-core
+
+      - name: Run tests-core with sanitizers
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 \
+          UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+          ./build/tests/tests-core
