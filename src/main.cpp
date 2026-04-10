@@ -65,7 +65,8 @@ struct ScannerEntry {
     std::vector<core::ScanResult> pendingResults;
 };
 
-static constexpr int kMaxMultiWin = 4;   // max instances per window type
+static constexpr int   kMaxMultiWin = 4;    // max instances per window type
+static constexpr float kTitleBarH   = 32.0f; // custom title bar height
 
 // ---- Multi-instance containers -----------------------------------------------
 static std::vector<ChartEntry>   g_chartEntries;
@@ -1419,159 +1420,287 @@ static void Disconnect() {
 // Login Window
 // ============================================================================
 static void RenderLoginWindow() {
-    // Dark overlay
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->Pos);
-    ImGui::SetNextWindowSize(vp->Size);
-    ImGui::SetNextWindowBgAlpha(0.75f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGuiViewport* vp  = ImGui::GetMainViewport();
+    const float    W   = vp->Size.x;
+    const float    H   = vp->Size.y - kTitleBarH;
+    const float    leftW  = W * 0.42f;
+    const float    rightW = W - leftW;
+
+    // ── Full-screen host window (below custom title bar) ──────────────────────
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + kTitleBarH));
+    ImGui::SetNextWindowSize(ImVec2(W, H));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,  ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::Begin("##overlay", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
-        ImGuiWindowFlags_NoNav        | ImGuiWindowFlags_NoMove   |
-        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
-    ImGui::End();
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.051f, 0.067f, 0.090f, 1.0f));
+
+    ImGui::Begin("##login", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* dl  = ImGui::GetWindowDrawList();
+    ImVec2      wp  = ImGui::GetWindowPos();
+
+    // ── Left panel background + decorations ──────────────────────────────────
+    dl->AddRectFilled(wp, ImVec2(wp.x + leftW, wp.y + H), IM_COL32(7, 10, 16, 255));
+
+    // Subtle grid overlay
+    for (int i = 1; i < 9; i++) {
+        float x = wp.x + leftW * (i / 9.0f);
+        dl->AddLine(ImVec2(x, wp.y), ImVec2(x, wp.y + H), IM_COL32(0, 180, 216, 7));
+    }
+    for (int i = 1; i < 12; i++) {
+        float y = wp.y + H * (i / 12.0f);
+        dl->AddLine(ImVec2(wp.x, y), ImVec2(wp.x + leftW, y), IM_COL32(0, 180, 216, 7));
+    }
+
+    // Top-left corner accent brackets
+    const float bk = 28.0f, bkT = 2.0f, bkOff = 32.0f;
+    dl->AddRectFilled(ImVec2(wp.x + bkOff,      wp.y + bkOff),
+                      ImVec2(wp.x + bkOff + bk,  wp.y + bkOff + bkT), IM_COL32(0,180,216,180));
+    dl->AddRectFilled(ImVec2(wp.x + bkOff,      wp.y + bkOff),
+                      ImVec2(wp.x + bkOff + bkT, wp.y + bkOff + bk),  IM_COL32(0,180,216,180));
+    // Bottom-right corner accent brackets (relative to left panel)
+    dl->AddRectFilled(ImVec2(wp.x + leftW - bkOff - bk, wp.y + H - bkOff - bkT),
+                      ImVec2(wp.x + leftW - bkOff,       wp.y + H - bkOff),       IM_COL32(0,180,216,180));
+    dl->AddRectFilled(ImVec2(wp.x + leftW - bkOff - bkT, wp.y + H - bkOff - bk),
+                      ImVec2(wp.x + leftW - bkOff,        wp.y + H - bkOff),      IM_COL32(0,180,216,180));
+
+    // Thin cyan separator between panels
+    dl->AddRectFilled(ImVec2(wp.x + leftW - 1, wp.y),
+                      ImVec2(wp.x + leftW + 1, wp.y + H), IM_COL32(0, 180, 216, 70));
+
+    // ── Left child: branding ──────────────────────────────────────────────────
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::BeginChild("##lp", ImVec2(leftW, H), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* ldl  = ImGui::GetWindowDrawList();
+    ImVec2      lwp  = ImGui::GetWindowPos();
+
+    // Vertical cyan accent bar left of brand text
+    const float brandTopY = H * 0.36f;
+    ldl->AddRectFilled(ImVec2(lwp.x + 58.0f, lwp.y + brandTopY),
+                       ImVec2(lwp.x + 62.0f, lwp.y + brandTopY + 72.0f),
+                       IM_COL32(0, 180, 216, 220));
+
+    // Large IBKR logotype
+    ImGui::SetCursorPos(ImVec2(76.0f, brandTopY));
+    ImGui::SetWindowFontScale(2.6f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.706f, 0.847f, 1.0f));
+    ImGui::Text("IBKR");
+    ImGui::PopStyleColor();
+    ImGui::SetWindowFontScale(1.0f);
+
+    ImGui::SetCursorPos(ImVec2(78.0f, brandTopY + 42.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.902f, 0.929f, 0.953f, 0.92f));
+    ImGui::Text("TRADING TERMINAL");
+    ImGui::PopStyleColor();
+
+    ImGui::SetCursorPos(ImVec2(78.0f, brandTopY + 62.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.471f, 0.522f, 1.0f));
+    ImGui::Text("Professional Market Access");
+    ImGui::PopStyleColor();
+
+    // Horizontal rule below tagline
+    float ruleY = lwp.y + brandTopY + 82.0f;
+    ldl->AddLine(ImVec2(lwp.x + 78.0f, ruleY),
+                 ImVec2(lwp.x + leftW * 0.72f, ruleY),
+                 IM_COL32(0, 180, 216, 55), 1.0f);
+
+    // Bottom attribution
+    ImGui::SetCursorPos(ImVec2(78.0f, H - 32.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.25f, 0.30f, 0.35f, 1.0f));
+    ImGui::Text("Interactive Brokers LLC");
+    ImGui::PopStyleColor();
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor(); // ChildBg
+
+    // ── Right panel: covers the full right side ──────────────────────────────
+    const float formW    = std::min(380.0f, rightW - 80.0f);
+    const float estFormH = 355.0f;
+    const float formX    = (rightW - formW) * 0.5f;
+    const float formY    = std::max(50.0f, (H - estFormH) * 0.5f);
+
+    ImGui::SetCursorPos(ImVec2(leftW, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.051f, 0.067f, 0.090f, 1.0f));
+    ImGui::BeginChild("##rp", ImVec2(rightW, H), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    // Form inner child — explicitly positioned at the visual center
+    ImGui::SetCursorPos(ImVec2(formX, formY));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(8.0f, 8.0f));
+    ImGui::BeginChild("##form", ImVec2(formW, H - formY - 20.0f), false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImDrawList* fdl = ImGui::GetWindowDrawList();
+
+    // Section title + cyan underline
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.471f, 0.522f, 1.0f));
+    ImGui::Text("CONNECT TO IBKR");
+    ImGui::PopStyleColor();
+    {
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        fdl->AddLine(ImVec2(sp.x, sp.y), ImVec2(sp.x + formW, sp.y),
+                     IM_COL32(0, 180, 216, 60), 1.0f);
+    }
+    ImGui::Spacing();
+    ImGui::Spacing();
+
+    bool isConnecting = (g_Login.state == ConnectionState::Connecting);
+    if (isConnecting) ImGui::BeginDisabled();
+
+    bool changedType = false;
+
+    // Segmented Paper | Live toggle
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 8.0f));
+    const float segW = (formW - 2.0f) * 0.5f;
+    auto segBtn = [&](const char* label, bool selected, bool isLiveBtn) -> bool {
+        ImVec4 bg, bgH, bgA, fg;
+        if (selected && isLiveBtn) {
+            bg = bgH = bgA = ImVec4(0.451f, 0.094f, 0.094f, 1.0f);
+            fg = ImVec4(1.000f, 0.420f, 0.420f, 1.0f);
+        } else if (selected) {
+            bg = bgH = bgA = ImVec4(0.000f, 0.353f, 0.424f, 1.0f);
+            fg = ImVec4(0.000f, 0.706f, 0.847f, 1.0f);
+        } else {
+            bg  = ImVec4(0.039f, 0.055f, 0.075f, 1.0f);
+            bgH = ImVec4(0.094f, 0.129f, 0.176f, 1.0f);
+            bgA = ImVec4(0.059f, 0.094f, 0.141f, 1.0f);
+            fg  = ImVec4(0.420f, 0.471f, 0.522f, 1.0f);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Button,        bg);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bgH);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bgA);
+        ImGui::PushStyleColor(ImGuiCol_Text,          fg);
+        bool clicked = ImGui::Button(label, ImVec2(segW, 28.0f));
+        ImGui::PopStyleColor(4);
+        return clicked;
+    };
+    if (segBtn("  Paper  ", !g_Login.isLive, false)) { g_Login.isLive = false; changedType = true; }
+    ImGui::SameLine(0.0f, 2.0f);
+    if (segBtn("  Live   ",  g_Login.isLive, true))  { g_Login.isLive = true;  changedType = true; }
     ImGui::PopStyleVar(2);
 
-    const ImVec2 loginSize = {460.0f, 340.0f};
-    ImGui::SetNextWindowPos(
-        ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f),
-        ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(loginSize, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(1.0f);
+    ImGui::Spacing();
 
-    ImGuiWindowFlags dlgFlags =
-        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    // API row
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.471f, 0.522f, 1.0f));
+    ImGui::Text("API");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 16.0f);
+    int apiIdx = (int)g_Login.apiType;
+    if (ImGui::RadioButton("TWS",        &apiIdx, 0)) { g_Login.apiType = ApiType::TWS;     changedType = true; }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("IB Gateway", &apiIdx, 1)) { g_Login.apiType = ApiType::Gateway; changedType = true; }
+    if (changedType) g_Login.UpdatePort();
 
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 18.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,    ImVec2(8.0f, 10.0f));
+    ImGui::Spacing();
+    {
+        ImVec2 sp = ImGui::GetCursorScreenPos();
+        fdl->AddLine(ImVec2(sp.x, sp.y), ImVec2(sp.x + formW, sp.y),
+                     IM_COL32(48, 55, 62, 255), 1.0f);
+    }
+    ImGui::Spacing();
+    ImGui::Spacing();
 
-    if (ImGui::Begin("Interactive Brokers Login", nullptr, dlgFlags)) {
+    // HOST label + input
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.471f, 0.522f, 1.0f));
+    ImGui::Text("HOST");
+    ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##host", g_Login.host, sizeof(g_Login.host));
+    ImGui::Spacing();
 
-        // Header
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.7f, 0.1f, 1.0f));
-        float tw = ImGui::CalcTextSize("Interactive Brokers").x;
-        ImGui::SetCursorPosX((loginSize.x - tw) * 0.5f);
-        ImGui::Text("Interactive Brokers");
-        ImGui::PopStyleColor();
-        float sw = ImGui::CalcTextSize("Trading Application").x;
-        ImGui::SetCursorPosX((loginSize.x - sw) * 0.5f);
-        ImGui::TextDisabled("Trading Application");
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
+    // PORT + CLIENT ID side by side
+    const float halfW = (formW - 12.0f) * 0.5f;
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.420f, 0.471f, 0.522f, 1.0f));
+    ImGui::Text("PORT");
+    ImGui::SameLine(0.0f, halfW - ImGui::CalcTextSize("PORT").x + 12.0f);
+    ImGui::Text("CLIENT ID");
+    ImGui::PopStyleColor();
+    ImGui::SetNextItemWidth(halfW);
+    ImGui::InputInt("##port", &g_Login.port, 0);
+    ImGui::SameLine(0.0f, 12.0f);
+    ImGui::SetNextItemWidth(halfW);
+    ImGui::InputInt("##cid", &g_Login.clientId, 1);
 
-        bool isConnecting = (g_Login.state == ConnectionState::Connecting);
-        if (isConnecting) ImGui::BeginDisabled();
+    if (isConnecting) ImGui::EndDisabled();
 
-        // Account type
-        ImGui::Text("Account Type");
-        ImGui::SameLine(140);
-        bool changedType = false;
-        if (ImGui::RadioButton("Paper", !g_Login.isLive)) { g_Login.isLive = false; changedType = true; }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("Live",   g_Login.isLive)) { g_Login.isLive = true;  changedType = true; }
+    ImGui::Spacing();
+    ImGui::Spacing();
 
-        // API type
-        ImGui::Text("API");
-        ImGui::SameLine(140);
-        int apiIdx = (int)g_Login.apiType;
-        if (ImGui::RadioButton("TWS",        &apiIdx, 0)) { g_Login.apiType = ApiType::TWS;     changedType = true; }
-        ImGui::SameLine();
-        if (ImGui::RadioButton("IB Gateway", &apiIdx, 1)) { g_Login.apiType = ApiType::Gateway; changedType = true; }
-        if (changedType) g_Login.UpdatePort();
+    // Info note
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.300f, 0.355f, 0.400f, 1.0f));
+    ImGui::PushTextWrapPos(formW);
+    ImGui::TextWrapped("IB Gateway or TWS must be running with API enabled. "
+                       "Credentials are managed by TWS/Gateway.");
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
 
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // Connection parameters
-        ImGui::Text("Host");
-        ImGui::SameLine(140);
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputText("##host", g_Login.host, sizeof(g_Login.host));
-
-        ImGui::Text("Port");
-        ImGui::SameLine(140);
-        ImGui::SetNextItemWidth(90);
-        ImGui::InputInt("##port", &g_Login.port, 0);
-        ImGui::SameLine();
-        ImGui::TextDisabled(g_Login.isLive ? "(live)" : "(paper)");
-
-        ImGui::Text("Client ID");
-        ImGui::SameLine(140);
-        ImGui::SetNextItemWidth(90);
-        ImGui::InputInt("##cid", &g_Login.clientId, 1);
-
-        if (isConnecting) ImGui::EndDisabled();
-
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        // Info note
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-        ImGui::TextWrapped("Ensure IB Gateway or TWS is running with API enabled on the port above. "
-                           "Username / password are handled by TWS/Gateway.");
+    // Error banner
+    if (g_Login.state == ConnectionState::Error) {
+        ImVec2 bMin = ImGui::GetCursorScreenPos();
+        ImVec2 bMax = ImVec2(bMin.x + formW, bMin.y + 28.0f);
+        fdl->AddRectFilled(bMin, bMax, IM_COL32(110, 18, 18, 200), 3.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
+        ImGui::Text("  ! %s", g_Login.errorMsg.c_str());
         ImGui::PopStyleColor();
         ImGui::Spacing();
+    }
 
-        // Error / status
-        if (g_Login.state == ConnectionState::Error) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-            ImGui::TextWrapped("Error: %s", g_Login.errorMsg.c_str());
-            ImGui::PopStyleColor();
+    // Connect button / progress bar
+    ImGui::Spacing();
+    if (isConnecting) {
+        using namespace std::chrono;
+        static auto s_connectStart = steady_clock::now();
+        float t = std::fmod((float)duration_cast<milliseconds>(
+            steady_clock::now() - s_connectStart).count() / 1500.0f, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.0f, 0.706f, 0.847f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,       ImVec4(0.039f, 0.055f, 0.075f, 1.0f));
+        ImGui::ProgressBar(t, ImVec2(-1, 36.0f), "Connecting...");
+        ImGui::PopStyleColor(2);
+    } else {
+        bool live = g_Login.isLive;
+        ImVec4 bC = live ? ImVec4(0.55f,0.12f,0.00f,1.0f) : ImVec4(0.00f,0.353f,0.424f,1.0f);
+        ImVec4 bH = live ? ImVec4(0.75f,0.18f,0.00f,1.0f) : ImVec4(0.00f,0.471f,0.565f,1.0f);
+        ImVec4 bA = live ? ImVec4(0.38f,0.08f,0.00f,1.0f) : ImVec4(0.00f,0.235f,0.282f,1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Button,        bC);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, bH);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  bA);
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
+        const char* lbl = live ? "Connect  —  Live Account" : "Connect  —  Paper Account";
+        if (ImGui::Button(lbl, ImVec2(-1, 38.0f))) StartConnect();
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+
+        if (live) {
             ImGui::Spacing();
-        }
-
-        if (isConnecting) {
-            using namespace std::chrono;
-            static auto startTime = steady_clock::now();
-            int dots = (int)(duration_cast<milliseconds>(
-                steady_clock::now() - startTime).count() / 400) % 4;
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Connecting%.*s", dots, "...");
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.8f, 1.0f, 1.0f));
-            float bw = ImGui::CalcTextSize(buf).x;
-            ImGui::SetCursorPosX((loginSize.x - bw) * 0.5f);
-            ImGui::Text("%s", buf);
+            ImVec2 wMin = ImGui::GetCursorScreenPos();
+            ImVec2 wMax = ImVec2(wMin.x + formW, wMin.y + 28.0f);
+            fdl->AddRectFilled(wMin, wMax, IM_COL32(75, 38, 0, 180), 3.0f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.0f, 1.0f));
+            ImGui::Text("  ! LIVE — real orders will be executed");
             ImGui::PopStyleColor();
-        }
-
-        // Connect button
-        if (!isConnecting) {
-            ImVec4 btnColor = g_Login.isLive ? ImVec4(0.7f, 0.1f, 0.1f, 1.0f)
-                                             : ImVec4(0.1f, 0.5f, 0.2f, 1.0f);
-            ImVec4 btnHover = g_Login.isLive ? ImVec4(0.9f, 0.2f, 0.2f, 1.0f)
-                                             : ImVec4(0.2f, 0.7f, 0.3f, 1.0f);
-            ImVec4 btnAct   = g_Login.isLive ? ImVec4(0.5f, 0.05f, 0.05f, 1.0f)
-                                             : ImVec4(0.08f, 0.35f, 0.15f, 1.0f);
-            ImGui::PushStyleColor(ImGuiCol_Button,        btnColor);
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, btnHover);
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btnAct);
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-
-            const char* lbl = g_Login.isLive ? "Connect to Live Account"
-                                             : "Connect to Paper Account";
-            float btnW = loginSize.x - 48.0f;
-            if (ImGui::Button(lbl, ImVec2(btnW, 32.0f)))
-                StartConnect();
-
-            ImGui::PopStyleColor(3);
-            ImGui::PopStyleVar();
-
-            if (g_Login.isLive) {
-                ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
-                ImGui::TextWrapped("WARNING: Live account — real orders will be executed.");
-                ImGui::PopStyleColor();
-            }
         }
     }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);  // form WindowPadding + ItemSpacing
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor(); // ChildBg (##rp)
+    ImGui::PopStyleVar();   // ##rp WindowPadding
+
     ImGui::End();
-    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(); // WindowBg
+    ImGui::PopStyleVar(2);  // WindowPadding + WindowBorderSize
 
     // Poll IB messages while connecting (connection is async)
     if (g_Login.state == ConnectionState::Connecting && g_IBClient)
@@ -1614,16 +1743,280 @@ static void ApplyPreset(const core::WindowPreset& p) {
 // ============================================================================
 // Trading UI (post-login)
 // ============================================================================
+// ============================================================================
+// Window resize (borderless window — manual edge/corner drag)
+// ============================================================================
+static void HandleWindowResize() {
+    // No custom resize when maximized — OS handles restore
+    if (glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED)) return;
+
+    constexpr int kBorder = 6; // px — detection zone width
+
+    double mx, my;
+    glfwGetCursorPos(g_AppWindow, &mx, &my);  // cursor relative to window client area
+
+    int ww, wh;
+    glfwGetWindowSize(g_AppWindow, &ww, &wh);
+
+    const bool nearL = (mx < kBorder);
+    const bool nearR = (mx > ww - kBorder);
+    const bool nearT = (my < kBorder);
+    const bool nearB = (my > wh - kBorder);
+
+    // Encode edge as bitmask: bit0=Left, bit1=Right, bit2=Top, bit3=Bottom
+    const int edge = (nearL ? 1 : 0) | (nearR ? 2 : 0) |
+                     (nearT ? 4 : 0) | (nearB ? 8 : 0);
+
+    // Resize cursors — GLFW 3.4 names with 3.3 fallback
+    static GLFWcursor* s_curEW = glfwCreateStandardCursor(
+#ifdef GLFW_RESIZE_EW_CURSOR
+        GLFW_RESIZE_EW_CURSOR
+#else
+        GLFW_HRESIZE_CURSOR
+#endif
+    );
+    static GLFWcursor* s_curNS = glfwCreateStandardCursor(
+#ifdef GLFW_RESIZE_NS_CURSOR
+        GLFW_RESIZE_NS_CURSOR
+#else
+        GLFW_VRESIZE_CURSOR
+#endif
+    );
+#ifdef GLFW_RESIZE_NWSE_CURSOR
+    static GLFWcursor* s_curNWSE = glfwCreateStandardCursor(GLFW_RESIZE_NWSE_CURSOR);
+    static GLFWcursor* s_curNESW = glfwCreateStandardCursor(GLFW_RESIZE_NESW_CURSOR);
+#else
+    static GLFWcursor* s_curNWSE = s_curEW;
+    static GLFWcursor* s_curNESW = s_curEW;
+#endif
+
+    // Update cursor shape when not already dragging
+    static bool s_resizing = false;
+    if (!s_resizing) {
+        GLFWcursor* cur = nullptr;
+        switch (edge) {
+            case 1: case 2:       cur = s_curEW;   break; // L / R
+            case 4: case 8:       cur = s_curNS;   break; // T / B
+            case 5: case 10:      cur = s_curNWSE; break; // TL / BR
+            case 6: case 9:       cur = s_curNESW; break; // TR / BL
+            default:              cur = nullptr;   break;
+        }
+        glfwSetCursor(g_AppWindow, cur); // nullptr = default arrow
+    }
+
+    // Track drag state using global mouse coords (io.MousePos = screen space)
+    static int  s_edge = 0;
+    static float s_startMX = 0, s_startMY = 0;
+    static int   s_startWX = 0, s_startWY = 0, s_startWW = 0, s_startWH = 0;
+
+    const ImGuiIO& io = ImGui::GetIO();
+    const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
+    if (!lmb) {
+        s_resizing = false;
+        s_edge     = 0;
+    }
+
+    if (!s_resizing && lmb && edge != 0) {
+        s_resizing = true;
+        s_edge     = edge;
+        s_startMX  = io.MousePos.x;
+        s_startMY  = io.MousePos.y;
+        glfwGetWindowPos (g_AppWindow, &s_startWX, &s_startWY);
+        glfwGetWindowSize(g_AppWindow, &s_startWW, &s_startWH);
+    }
+
+    if (s_resizing) {
+        constexpr int kMinW = 640, kMinH = 400;
+        const int dx = (int)(io.MousePos.x - s_startMX);
+        const int dy = (int)(io.MousePos.y - s_startMY);
+
+        int nx = s_startWX, ny = s_startWY;
+        int nw = s_startWW, nh = s_startWH;
+
+        if (s_edge & 2) nw = std::max(kMinW, s_startWW + dx);          // right
+        if (s_edge & 8) nh = std::max(kMinH, s_startWH + dy);          // bottom
+        if (s_edge & 1) {                                                // left
+            nw = std::max(kMinW, s_startWW - dx);
+            nx = s_startWX + (s_startWW - nw);
+        }
+        if (s_edge & 4) {                                                // top
+            nh = std::max(kMinH, s_startWH - dy);
+            ny = s_startWY + (s_startWH - nh);
+        }
+
+        glfwSetWindowPos (g_AppWindow, nx, ny);
+        glfwSetWindowSize(g_AppWindow, nw, nh);
+    }
+}
+
+// ============================================================================
+// Custom Title Bar
+// ============================================================================
+static void RenderCustomTitleBar() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGuiIO&       io = ImGui::GetIO();
+
+    ImGui::SetNextWindowPos(vp->Pos);
+    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, kTitleBarH));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,   ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.016f, 0.020f, 0.031f, 1.0f)); // #040508
+
+    ImGui::Begin("##titlebar", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove       |
+        ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2  wp = ImGui::GetWindowPos();
+    float   W  = vp->Size.x;
+
+    // Bottom border line
+    dl->AddLine(ImVec2(wp.x, wp.y + kTitleBarH - 1.0f),
+                ImVec2(wp.x + W, wp.y + kTitleBarH - 1.0f),
+                IM_COL32(0, 180, 216, 50), 1.0f);
+
+    // ── Left: branding ────────────────────────────────────────────────────────
+    // Cyan accent bar
+    dl->AddRectFilled(ImVec2(wp.x + 10.0f, wp.y + 9.0f),
+                      ImVec2(wp.x + 13.0f, wp.y + kTitleBarH - 9.0f),
+                      IM_COL32(0, 180, 216, 240));
+
+    float textY = (kTitleBarH - ImGui::GetFontSize()) * 0.5f;
+    ImGui::SetCursorPos(ImVec2(20.0f, textY));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.706f, 0.847f, 1.0f));
+    ImGui::Text("IBKR");
+    ImGui::PopStyleColor();
+    ImGui::SameLine(0.0f, 6.0f);
+    ImGui::SetCursorPosY(textY);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.61f, 0.67f, 1.0f));
+    ImGui::Text("TRADING TERMINAL");
+    ImGui::PopStyleColor();
+
+    // ── Right: window control buttons ────────────────────────────────────────
+    const float btnW = 46.0f;
+    const float btnH = kTitleBarH;
+    float btnX = W - btnW * 3.0f;
+
+    // Returns true if clicked; fills outHovered
+    auto ctrlBtn = [&](const char* id, float x, bool isClose,
+                       bool& outHovered) -> bool {
+        ImGui::SetCursorPos(ImVec2(x, 0.0f));
+        ImGui::InvisibleButton(id, ImVec2(btnW, btnH));
+        outHovered       = ImGui::IsItemHovered();
+        bool active      = ImGui::IsItemActive();
+        bool clicked     = ImGui::IsItemClicked();
+        ImU32 bg = 0;
+        if      (active)       bg = isClose ? IM_COL32(180, 28, 28, 255)
+                                            : IM_COL32(55, 68, 85, 255);
+        else if (outHovered)   bg = isClose ? IM_COL32(198, 40, 40, 230)
+                                            : IM_COL32(38, 50, 65, 255);
+        if (bg)
+            dl->AddRectFilled(ImVec2(wp.x + x, wp.y),
+                              ImVec2(wp.x + x + btnW, wp.y + btnH), bg);
+        return clicked;
+    };
+
+    bool hMin = false, hMax = false, hClose = false;
+
+    // Minimize
+    if (ctrlBtn("##min", btnX, false, hMin))
+        glfwIconifyWindow(g_AppWindow);
+    {
+        ImU32 ic = hMin ? IM_COL32(220, 230, 240, 255) : IM_COL32(140, 155, 170, 190);
+        float cx = wp.x + btnX + btnW * 0.5f;
+        float cy = wp.y + btnH * 0.5f + 2.0f;
+        dl->AddLine(ImVec2(cx - 5.0f, cy), ImVec2(cx + 5.0f, cy), ic, 1.5f);
+    }
+
+    // Maximize / restore
+    btnX += btnW;
+    if (ctrlBtn("##max", btnX, false, hMax)) {
+        if (glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED))
+            glfwRestoreWindow(g_AppWindow);
+        else
+            glfwMaximizeWindow(g_AppWindow);
+    }
+    {
+        ImU32 ic = hMax ? IM_COL32(220, 230, 240, 255) : IM_COL32(140, 155, 170, 190);
+        float cx = wp.x + btnX + btnW * 0.5f;
+        float cy = wp.y + btnH * 0.5f;
+        bool maximized = glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED);
+        if (maximized) {
+            // Restore icon: two overlapping squares
+            dl->AddRect(ImVec2(cx - 3.0f, cy - 5.0f),
+                        ImVec2(cx + 5.0f, cy + 3.0f), ic, 0.0f, 0, 1.0f);
+            dl->AddRect(ImVec2(cx - 5.0f, cy - 3.0f),
+                        ImVec2(cx + 3.0f, cy + 5.0f), ic, 0.0f, 0, 1.0f);
+        } else {
+            // Maximize icon: single square
+            dl->AddRect(ImVec2(cx - 5.0f, cy - 5.0f),
+                        ImVec2(cx + 5.0f, cy + 5.0f), ic, 0.0f, 0, 1.0f);
+        }
+    }
+
+    // Close
+    btnX += btnW;
+    if (ctrlBtn("##close", btnX, true, hClose))
+        glfwSetWindowShouldClose(g_AppWindow, GLFW_TRUE);
+    {
+        ImU32 ic = hClose ? IM_COL32(255, 255, 255, 255) : IM_COL32(140, 155, 170, 190);
+        float cx = wp.x + btnX + btnW * 0.5f;
+        float cy = wp.y + btnH * 0.5f;
+        dl->AddLine(ImVec2(cx - 5.0f, cy - 5.0f),
+                    ImVec2(cx + 5.0f, cy + 5.0f), ic, 1.5f);
+        dl->AddLine(ImVec2(cx + 5.0f, cy - 5.0f),
+                    ImVec2(cx - 5.0f, cy + 5.0f), ic, 1.5f);
+    }
+
+    // ── Drag to move ─────────────────────────────────────────────────────────
+    static bool s_tbDrag = false;
+    bool overBtns = (io.MousePos.x >= wp.x + W - btnW * 3.0f);
+
+    if (!overBtns && ImGui::IsWindowHovered() &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        s_tbDrag = true;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        s_tbDrag = false;
+    if (s_tbDrag && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f)) {
+        int wx, wy;
+        glfwGetWindowPos(g_AppWindow, &wx, &wy);
+        glfwSetWindowPos(g_AppWindow, wx + (int)io.MouseDelta.x,
+                                      wy + (int)io.MouseDelta.y);
+    }
+
+    // Double-click to maximize / restore
+    if (!overBtns && ImGui::IsWindowHovered() &&
+        ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED))
+            glfwRestoreWindow(g_AppWindow);
+        else
+            glfwMaximizeWindow(g_AppWindow);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor(); // WindowBg
+    ImGui::PopStyleVar(2);  // WindowPadding + WindowBorderSize
+}
+
+// ============================================================================
+// Trading UI
+// ============================================================================
 static void RenderTradingUI() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + kTitleBarH));
+    ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - kTitleBarH));
     ImGui::SetNextWindowBgAlpha(0.0f);
 
     ImGuiWindowFlags hostFlags =
         ImGuiWindowFlags_NoDecoration  | ImGuiWindowFlags_NoResize     |
         ImGuiWindowFlags_NoMove        | ImGuiWindowFlags_NoBringToFrontOnFocus |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
+
+    // Taller menu bar via FramePadding; distinct bar background
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 7.0f));
+    ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.020f, 0.027f, 0.039f, 1.0f)); // #050709
 
     if (ImGui::Begin("##TradingHost", nullptr, hostFlags)) {
         if (ImGui::BeginMenuBar()) {
@@ -1712,11 +2105,22 @@ static void RenderTradingUI() {
             ImGui::PopStyleColor();
 
             ImGui::EndMenuBar();
+
+            // Cyan accent line at the bottom of the menu bar
+            {
+                ImVec2 cs = ImGui::GetCursorScreenPos();
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(ImGui::GetWindowPos().x, cs.y),
+                    ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), cs.y),
+                    IM_COL32(0, 180, 216, 80), 1.0f);
+            }
         }
+        ImGui::PopStyleVar();   // FramePadding
 
         ImGuiID dockId = ImGui::GetID("TradingDock");
         ImGui::DockSpace(dockId, ImVec2(0, 0), ImGuiDockNodeFlags_PassthruCentralNode);
     }
+    ImGui::PopStyleColor(); // MenuBarBg
     ImGui::End();
 
     // Render all window instances
@@ -1737,6 +2141,7 @@ static void RenderMainUI() {
         RenderTradingUI();
     else
         RenderLoginWindow();
+    RenderCustomTitleBar(); // always last so it renders on top of everything
 }
 
 // ============================================================================
@@ -1763,8 +2168,9 @@ int main(int argc, char* argv[]) {
     SetupVulkan(extensions);
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
-    g_AppWindow = glfwCreateWindow(1920, 1080, "IBKR Trading App", nullptr, nullptr);
+    glfwWindowHint(GLFW_RESIZABLE,  GLFW_TRUE);
+    glfwWindowHint(GLFW_DECORATED,  GLFW_FALSE); // custom title bar replaces OS decoration
+    g_AppWindow = glfwCreateWindow(1920, 1080, "IBKR Trading Terminal", nullptr, nullptr);
     if (!g_AppWindow) {
         std::cerr << "Failed to create window\n";
         CleanupVulkan(); glfwTerminate(); return 1;
@@ -1788,11 +2194,114 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
+    // ── Terminal Dark theme ───────────────────────────────────────────────────
     ImGui::StyleColorsDark();
     {
         ImGuiStyle& s = ImGui::GetStyle();
-        s.WindowRounding              = 0.0f;
-        s.Colors[ImGuiCol_WindowBg].w = 1.0f;
+
+        // Geometry
+        s.WindowRounding    = 4.0f;
+        s.ChildRounding     = 4.0f;
+        s.FrameRounding     = 2.0f;
+        s.PopupRounding     = 4.0f;
+        s.ScrollbarRounding = 2.0f;
+        s.GrabRounding      = 2.0f;
+        s.TabRounding       = 2.0f;
+        s.WindowBorderSize  = 1.0f;
+        s.FrameBorderSize   = 0.0f;
+        s.PopupBorderSize   = 1.0f;
+        s.WindowPadding     = ImVec2(10.0f, 8.0f);
+        s.FramePadding      = ImVec2(6.0f, 3.0f);
+        s.ItemSpacing       = ImVec2(6.0f, 4.0f);
+        s.ItemInnerSpacing  = ImVec2(4.0f, 4.0f);
+        s.ScrollbarSize     = 10.0f;
+        s.GrabMinSize       = 8.0f;
+        s.IndentSpacing     = 14.0f;
+
+        // Palette
+        //   bg0  = near-black window bg
+        //   bg1  = panel / child bg (slightly lighter)
+        //   bg2  = frame / input bg
+        //   fg0  = primary text
+        //   fg1  = dimmed text
+        //   acc  = cyan accent
+        //   bdr  = border
+        ImVec4* c = s.Colors;
+
+        c[ImGuiCol_WindowBg]             = ImVec4(0.051f, 0.067f, 0.090f, 1.000f); // #0D1117
+        c[ImGuiCol_ChildBg]              = ImVec4(0.086f, 0.106f, 0.141f, 1.000f); // #161B24
+        c[ImGuiCol_PopupBg]              = ImVec4(0.063f, 0.082f, 0.110f, 1.000f); // #10151C
+        c[ImGuiCol_Border]               = ImVec4(0.188f, 0.216f, 0.243f, 1.000f); // #30373E
+        c[ImGuiCol_BorderShadow]         = ImVec4(0.000f, 0.000f, 0.000f, 0.000f);
+
+        c[ImGuiCol_FrameBg]              = ImVec4(0.039f, 0.055f, 0.075f, 1.000f); // #0A0E13
+        c[ImGuiCol_FrameBgHovered]       = ImVec4(0.094f, 0.129f, 0.176f, 1.000f);
+        c[ImGuiCol_FrameBgActive]        = ImVec4(0.059f, 0.094f, 0.141f, 1.000f);
+
+        c[ImGuiCol_TitleBg]              = ImVec4(0.039f, 0.055f, 0.078f, 1.000f); // #0A0E14
+        c[ImGuiCol_TitleBgActive]        = ImVec4(0.000f, 0.176f, 0.243f, 1.000f); // #002D3E (cyan-dark)
+        c[ImGuiCol_TitleBgCollapsed]     = ImVec4(0.039f, 0.055f, 0.078f, 0.800f);
+        c[ImGuiCol_MenuBarBg]            = ImVec4(0.027f, 0.039f, 0.055f, 1.000f); // #070A0E
+
+        c[ImGuiCol_ScrollbarBg]          = ImVec4(0.039f, 0.055f, 0.075f, 1.000f);
+        c[ImGuiCol_ScrollbarGrab]        = ImVec4(0.188f, 0.216f, 0.243f, 1.000f);
+        c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.000f, 0.706f, 0.847f, 0.600f);
+        c[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+
+        // Cyan accent: #00B4D8
+        c[ImGuiCol_CheckMark]            = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+        c[ImGuiCol_SliderGrab]           = ImVec4(0.000f, 0.600f, 0.720f, 1.000f);
+        c[ImGuiCol_SliderGrabActive]     = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+
+        c[ImGuiCol_Button]               = ImVec4(0.000f, 0.353f, 0.424f, 1.000f);
+        c[ImGuiCol_ButtonHovered]        = ImVec4(0.000f, 0.471f, 0.565f, 1.000f);
+        c[ImGuiCol_ButtonActive]         = ImVec4(0.000f, 0.235f, 0.282f, 1.000f);
+
+        c[ImGuiCol_Header]               = ImVec4(0.000f, 0.353f, 0.424f, 0.700f);
+        c[ImGuiCol_HeaderHovered]        = ImVec4(0.000f, 0.471f, 0.565f, 0.800f);
+        c[ImGuiCol_HeaderActive]         = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+
+        c[ImGuiCol_Separator]            = ImVec4(0.188f, 0.216f, 0.243f, 1.000f);
+        c[ImGuiCol_SeparatorHovered]     = ImVec4(0.000f, 0.706f, 0.847f, 0.600f);
+        c[ImGuiCol_SeparatorActive]      = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+
+        c[ImGuiCol_ResizeGrip]           = ImVec4(0.000f, 0.353f, 0.424f, 0.400f);
+        c[ImGuiCol_ResizeGripHovered]    = ImVec4(0.000f, 0.706f, 0.847f, 0.600f);
+        c[ImGuiCol_ResizeGripActive]     = ImVec4(0.000f, 0.706f, 0.847f, 0.900f);
+
+        c[ImGuiCol_Tab]                  = ImVec4(0.051f, 0.082f, 0.118f, 1.000f);
+        c[ImGuiCol_TabHovered]           = ImVec4(0.000f, 0.471f, 0.565f, 1.000f);
+        c[ImGuiCol_TabSelected]          = ImVec4(0.000f, 0.353f, 0.424f, 1.000f);
+        c[ImGuiCol_TabSelectedOverline]  = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+        c[ImGuiCol_TabDimmed]            = ImVec4(0.039f, 0.055f, 0.078f, 1.000f);
+        c[ImGuiCol_TabDimmedSelected]    = ImVec4(0.051f, 0.082f, 0.118f, 1.000f);
+        c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0.000f, 0.353f, 0.424f, 1.000f);
+
+        c[ImGuiCol_DockingPreview]       = ImVec4(0.000f, 0.706f, 0.847f, 0.400f);
+        c[ImGuiCol_DockingEmptyBg]       = ImVec4(0.027f, 0.039f, 0.055f, 1.000f);
+
+        c[ImGuiCol_PlotLines]            = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+        c[ImGuiCol_PlotLinesHovered]     = ImVec4(1.000f, 0.600f, 0.000f, 1.000f);
+        c[ImGuiCol_PlotHistogram]        = ImVec4(0.000f, 0.600f, 0.720f, 1.000f);
+        c[ImGuiCol_PlotHistogramHovered] = ImVec4(1.000f, 0.600f, 0.000f, 1.000f);
+
+        c[ImGuiCol_TableHeaderBg]        = ImVec4(0.027f, 0.043f, 0.063f, 1.000f);
+        c[ImGuiCol_TableBorderStrong]    = ImVec4(0.188f, 0.216f, 0.243f, 1.000f);
+        c[ImGuiCol_TableBorderLight]     = ImVec4(0.102f, 0.122f, 0.153f, 1.000f);
+        c[ImGuiCol_TableRowBg]           = ImVec4(0.000f, 0.000f, 0.000f, 0.000f);
+        c[ImGuiCol_TableRowBgAlt]        = ImVec4(1.000f, 1.000f, 1.000f, 0.030f);
+
+        c[ImGuiCol_TextLink]             = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+        c[ImGuiCol_TextSelectedBg]       = ImVec4(0.000f, 0.706f, 0.847f, 0.300f);
+
+        c[ImGuiCol_DragDropTarget]       = ImVec4(1.000f, 0.600f, 0.000f, 0.900f);
+        c[ImGuiCol_NavCursor]            = ImVec4(0.000f, 0.706f, 0.847f, 1.000f);
+        c[ImGuiCol_NavWindowingHighlight]= ImVec4(1.000f, 1.000f, 1.000f, 0.700f);
+        c[ImGuiCol_NavWindowingDimBg]    = ImVec4(0.800f, 0.800f, 0.800f, 0.200f);
+        c[ImGuiCol_ModalWindowDimBg]     = ImVec4(0.000f, 0.000f, 0.000f, 0.600f);
+
+        c[ImGuiCol_Text]                 = ImVec4(0.902f, 0.929f, 0.953f, 1.000f); // #E6EDF3
+        c[ImGuiCol_TextDisabled]         = ImVec4(0.420f, 0.471f, 0.522f, 1.000f); // #6B7885
     }
 
     ImGui_ImplGlfw_InitForVulkan(g_AppWindow, true);
@@ -1849,6 +2358,7 @@ int main(int argc, char* argv[]) {
 
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
+        HandleWindowResize(); // override cursor after ImGui sets it
         ImGui::NewFrame();
 
         RenderMainUI();

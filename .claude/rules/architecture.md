@@ -7,7 +7,7 @@
 │   ├── core/
 │   │   ├── services/         # IB Gateway integration (IBKRClient.h/.cpp, IBKRUtils.h)
 │   │   └── models/           # Data models: MarketData.h, NewsData.h, ScannerData.h,
-│   │                         #   PortfolioData.h, WindowGroup.h
+│   │                         #   PortfolioData.h, OrderData.h, WindowGroup.h
 │   ├── ui/
 │   │   └── windows/          # One .h/.cpp pair per window
 │   ├── bid_stubs/            # bid_stubs.c — Intel BID64 double bit-cast
