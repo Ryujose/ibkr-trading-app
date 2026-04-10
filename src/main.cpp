@@ -67,6 +67,7 @@ struct ScannerEntry {
 
 static constexpr int   kMaxMultiWin = 4;    // max instances per window type
 static constexpr float kTitleBarH   = 32.0f; // custom title bar height
+static bool            g_tbDragging = false; // title-bar drag in progress (shared with resize handler)
 
 // ---- Multi-instance containers -----------------------------------------------
 static std::vector<ChartEntry>   g_chartEntries;
@@ -1747,10 +1748,12 @@ static void ApplyPreset(const core::WindowPreset& p) {
 // Window resize (borderless window — manual edge/corner drag)
 // ============================================================================
 static void HandleWindowResize() {
-    // No custom resize when maximized — OS handles restore
+    // No resize while the title bar is being dragged, or when maximized
+    if (g_tbDragging) return;
     if (glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED)) return;
 
-    constexpr int kBorder = 6; // px — detection zone width
+    constexpr int kEdge   = 5;  // px — edge-only detection zone
+    constexpr int kCorner = 16; // px — corner detection zone (must be > kEdge)
 
     double mx, my;
     glfwGetCursorPos(g_AppWindow, &mx, &my);  // cursor relative to window client area
@@ -1758,14 +1761,24 @@ static void HandleWindowResize() {
     int ww, wh;
     glfwGetWindowSize(g_AppWindow, &ww, &wh);
 
-    const bool nearL = (mx < kBorder);
-    const bool nearR = (mx > ww - kBorder);
-    const bool nearT = (my < kBorder);
-    const bool nearB = (my > wh - kBorder);
+    // Edge flags (narrow zone)
+    const bool nearL = (mx < kEdge);
+    const bool nearR = (mx > ww - kEdge);
+    const bool nearB = (my > wh - kEdge);
+    // Top edge excluded — title bar owns it (would conflict with drag-to-move).
 
-    // Encode edge as bitmask: bit0=Left, bit1=Right, bit2=Top, bit3=Bottom
-    const int edge = (nearL ? 1 : 0) | (nearR ? 2 : 0) |
-                     (nearT ? 4 : 0) | (nearB ? 8 : 0);
+    // Corner flags (wider zone) — checked first so corners take priority over edges
+    const bool cnrL = (mx < kCorner);
+    const bool cnrR = (mx > ww - kCorner);
+    const bool cnrB = (my > wh - kCorner);
+
+    // bit0=Left, bit1=Right, bit3=Bottom — corners use the wider zone
+    int edge = 0;
+    if      (cnrR && cnrB) edge = 2 | 8; // BR
+    else if (cnrL && cnrB) edge = 1 | 8; // BL
+    else if (nearR)        edge = 2;      // right edge
+    else if (nearL)        edge = 1;      // left edge
+    else if (nearB)        edge = 8;      // bottom edge
 
     // Resize cursors — GLFW 3.4 names with 3.3 fallback
     static GLFWcursor* s_curEW = glfwCreateStandardCursor(
@@ -1795,13 +1808,13 @@ static void HandleWindowResize() {
     if (!s_resizing) {
         GLFWcursor* cur = nullptr;
         switch (edge) {
-            case 1: case 2:       cur = s_curEW;   break; // L / R
-            case 4: case 8:       cur = s_curNS;   break; // T / B
-            case 5: case 10:      cur = s_curNWSE; break; // TL / BR
-            case 6: case 9:       cur = s_curNESW; break; // TR / BL
-            default:              cur = nullptr;   break;
+            case 1: case 2:  cur = s_curEW;   break; // L / R
+            case 8:          cur = s_curNS;   break; // B
+            case 9:          cur = s_curNESW; break; // BL
+            case 10:         cur = s_curNWSE; break; // BR
+            default:         cur = nullptr;   break;
         }
-        glfwSetCursor(g_AppWindow, cur); // nullptr = default arrow
+        glfwSetCursor(g_AppWindow, cur);
     }
 
     // Track drag state using global mouse coords (io.MousePos = screen space)
@@ -1834,15 +1847,11 @@ static void HandleWindowResize() {
         int nx = s_startWX, ny = s_startWY;
         int nw = s_startWW, nh = s_startWH;
 
-        if (s_edge & 2) nw = std::max(kMinW, s_startWW + dx);          // right
-        if (s_edge & 8) nh = std::max(kMinH, s_startWH + dy);          // bottom
-        if (s_edge & 1) {                                                // left
+        if (s_edge & 2) nw = std::max(kMinW, s_startWW + dx);  // right
+        if (s_edge & 8) nh = std::max(kMinH, s_startWH + dy);  // bottom
+        if (s_edge & 1) {                                        // left
             nw = std::max(kMinW, s_startWW - dx);
             nx = s_startWX + (s_startWW - nw);
-        }
-        if (s_edge & 4) {                                                // top
-            nh = std::max(kMinH, s_startWH - dy);
-            ny = s_startWY + (s_startWH - nh);
         }
 
         glfwSetWindowPos (g_AppWindow, nx, ny);
@@ -1971,19 +1980,24 @@ static void RenderCustomTitleBar() {
     }
 
     // ── Drag to move ─────────────────────────────────────────────────────────
-    static bool s_tbDrag = false;
+    static float s_dragStartMX = 0, s_dragStartMY = 0;
+    static int   s_dragStartWX = 0, s_dragStartWY = 0;
+
     bool overBtns = (io.MousePos.x >= wp.x + W - btnW * 3.0f);
 
     if (!overBtns && ImGui::IsWindowHovered() &&
-        ImGui::IsMouseClicked(ImGuiMouseButton_Left))
-        s_tbDrag = true;
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        g_tbDragging   = true;
+        s_dragStartMX  = io.MousePos.x;
+        s_dragStartMY  = io.MousePos.y;
+        glfwGetWindowPos(g_AppWindow, &s_dragStartWX, &s_dragStartWY);
+    }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
-        s_tbDrag = false;
-    if (s_tbDrag && (io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f)) {
-        int wx, wy;
-        glfwGetWindowPos(g_AppWindow, &wx, &wy);
-        glfwSetWindowPos(g_AppWindow, wx + (int)io.MouseDelta.x,
-                                      wy + (int)io.MouseDelta.y);
+        g_tbDragging = false;
+    if (g_tbDragging) {
+        glfwSetWindowPos(g_AppWindow,
+            s_dragStartWX + (int)(io.MousePos.x - s_dragStartMX),
+            s_dragStartWY + (int)(io.MousePos.y - s_dragStartMY));
     }
 
     // Double-click to maximize / restore
