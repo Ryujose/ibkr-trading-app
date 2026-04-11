@@ -71,7 +71,7 @@ bool OrdersWindow::Render() {
     if (!m_open) return false;
 
     ImGui::SetNextWindowSize(ImVec2(880, 360), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Orders", &m_open)) { ImGui::End(); return m_open; }
+    if (!ImGui::Begin("Orders", &m_open, ImGuiWindowFlags_NoFocusOnAppearing)) { ImGui::End(); return m_open; }
 
     // ── Header bar ────────────────────────────────────────────────────────
     int nOpen = 0, nHistory = 0;

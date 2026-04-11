@@ -40,10 +40,11 @@ public:
     // Call once per frame. Returns false when window is closed.
     bool Render();
     bool& open() { return m_open; }
-    void setGroupId(int id)    { m_groupId = id; }
-    int  groupId() const       { return m_groupId; }
-    void setInstanceId(int id);
-    int  instanceId() const    { return m_instanceId; }
+    void        setGroupId(int id)    { m_groupId = id; }
+    int         groupId() const       { return m_groupId; }
+    void        setInstanceId(int id);
+    int         instanceId() const    { return m_instanceId; }
+    const char* getPresetLabel() const;
 
     // --- IB Gateway callbacks (future integration) ---
     void OnScanData(int reqId, const std::vector<core::ScanResult>& results);

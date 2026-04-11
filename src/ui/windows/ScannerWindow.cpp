@@ -1,3 +1,4 @@
+#include "ui/UiScale.h"
 #include "ScannerWindow.h"
 
 #include "imgui.h"
@@ -226,6 +227,10 @@ void ScannerWindow::setInstanceId(int id) {
     std::snprintf(m_title, sizeof(m_title), "Market Scanner %d##scanner%d", id, id);
 }
 
+const char* ScannerWindow::getPresetLabel() const {
+    return core::ScanPresetLabel(kPresets[m_presetIdx]);
+}
+
 // ============================================================================
 // Render
 // ============================================================================
@@ -264,8 +269,15 @@ bool ScannerWindow::Render()
 
     ImGui::SetNextWindowSize(ImVec2(1100, 660), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin(m_title, &m_open, flags)) {
+                             ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoFocusOnAppearing;
+    char grp[8];
+    if (m_groupId > 0) std::snprintf(grp, sizeof(grp), "G%d", m_groupId);
+    else                std::strncpy(grp, "G-", sizeof(grp));
+    char title[80];
+    std::snprintf(title, sizeof(title), "Scanner %s %s###scanner%d",
+        core::ScanPresetLabel(kPresets[m_presetIdx]), grp, m_instanceId);
+    if (!ImGui::Begin(title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -286,17 +298,21 @@ bool ScannerWindow::Render()
 
 void ScannerWindow::DrawToolbar()
 {
+    FlexRow row;
+
+    // Group picker
+    row.item(FlexRow::buttonW("G1"), 0);
     core::DrawGroupPicker(m_groupId, "##scanner_grp");
-    ImGui::SameLine(0, 10);
 
     // Asset class tabs
-    const core::AssetClass classes[] = {
+    static constexpr core::AssetClass kClasses[] = {
         core::AssetClass::Stocks,
         core::AssetClass::Indexes,
         core::AssetClass::ETFs,
         core::AssetClass::Futures,
     };
-    for (auto ac : classes) {
+    for (auto ac : kClasses) {
+        row.item(FlexRow::buttonW(core::AssetClassLabel(ac)), 6);
         bool active = (ac == m_activeClass);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button,
                         ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
@@ -305,15 +321,14 @@ void ScannerWindow::DrawToolbar()
             RunScan();
         }
         if (active) ImGui::PopStyleColor();
-        ImGui::SameLine();
     }
 
-    ImGui::SameLine(0, 8);
+    row.item(FlexRow::textW("|"), 8);
     ImGui::TextDisabled("|");
-    ImGui::SameLine(0, 8);
 
     // Preset combo
-    ImGui::SetNextItemWidth(180);
+    row.item(em(180), 8);
+    ImGui::SetNextItemWidth(em(180));
     const char* previewLabel = core::ScanPresetLabel(kPresets[m_presetIdx]);
     if (ImGui::BeginCombo("##preset", previewLabel)) {
         for (int i = 0; i < kNumPresets; ++i) {
@@ -325,33 +340,35 @@ void ScannerWindow::DrawToolbar()
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
 
     // Scan button
+    row.item(FlexRow::buttonW("  Scan  "), 6);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.18f, 0.55f, 0.18f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.22f, 0.70f, 0.22f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.12f, 0.40f, 0.12f, 1.f));
     if (ImGui::Button("  Scan  ")) RunScan();
     ImGui::PopStyleColor(3);
-    ImGui::SameLine();
 
     // Symbol search
-    ImGui::SetNextItemWidth(140);
+    row.item(em(140), 6);
+    ImGui::SetNextItemWidth(em(140));
     ImGui::InputTextWithHint("##search", "Search symbol/name…",
                               m_searchBuf, sizeof(m_searchBuf));
-    ImGui::SameLine();
 
     // Filters toggle
-    if (ImGui::Button(m_showFilters ? "Filters [-]" : "Filters [+]"))
+    const char* filterLabel = m_showFilters ? "Filters [-]" : "Filters [+]";
+    row.item(FlexRow::buttonW(filterLabel), 6);
+    if (ImGui::Button(filterLabel))
         m_showFilters = !m_showFilters;
-    ImGui::SameLine();
 
     // Column chooser
+    row.item(FlexRow::buttonW("Cols"), 6);
     if (ImGui::Button("Cols")) ImGui::OpenPopup("##ColChooser");
     DrawColumnChooserPopup();
-    ImGui::SameLine();
 
     // Auto refresh toggle
+    const char* autoLabel = m_autoRefresh ? "Auto ON" : "Auto OFF";
+    row.item(FlexRow::buttonW("Auto OFF"), 6);  // use wider label for stable layout
     if (m_autoRefresh) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.35f, 0.60f, 1.f));
         if (ImGui::Button("Auto ON")) m_autoRefresh = false;
@@ -362,12 +379,11 @@ void ScannerWindow::DrawToolbar()
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Auto-refresh every %.0f seconds", m_autoRefreshSec);
     }
-    ImGui::SameLine();
 
     // Refresh interval slider
-    ImGui::SetNextItemWidth(80);
+    row.item(em(80), 6);
+    ImGui::SetNextItemWidth(em(80));
     ImGui::SliderFloat("##interval", &m_autoRefreshSec, 5.f, 120.f, "%.0fs");
-
 }
 
 // ============================================================================
@@ -397,12 +413,12 @@ void ScannerWindow::DrawFilterBar()
     ImGui::SameLine(0, 16);
 
     ImGui::TextUnformatted("Min Vol");  ImGui::SameLine(0, 4);
-    ImGui::SetNextItemWidth(80);
+    ImGui::SetNextItemWidth(em(80));
     ImGui::InputText("##minVol", m_minVolBuf, sizeof(m_minVolBuf));
     ImGui::SameLine(0, 16);
 
     ImGui::TextUnformatted("Sector");  ImGui::SameLine(0, 4);
-    ImGui::SetNextItemWidth(100);
+    ImGui::SetNextItemWidth(em(100));
     ImGui::InputText("##sector", m_sectorBuf, sizeof(m_sectorBuf));
     ImGui::SameLine(0, 16);
 

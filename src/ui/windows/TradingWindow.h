@@ -147,6 +147,10 @@ private:
     std::deque<core::Tick> m_ticks;
     void DrawTimeSales();
 
+    // ── Layout ratios (user-draggable splitters) ─────────────────────────────
+    float m_topHeightRatio  = 0.65f;   // top / total height
+    float m_bookWidthRatio  = 0.54f;   // book panel / total width
+
     // ── Helpers ──────────────────────────────────────────────────────────────
     static std::string FmtTime(std::time_t t);
     static double      RoundTick(double price, double tick = 0.01);

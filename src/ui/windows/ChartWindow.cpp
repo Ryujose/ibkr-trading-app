@@ -1,3 +1,4 @@
+#include "ui/UiScale.h"
 #include "ui/windows/ChartWindow.h"
 
 #include "imgui.h"
@@ -371,8 +372,15 @@ bool ChartWindow::Render() {
     if (m_ind.volume) minH += 90.0f;
     if (m_ind.rsi)    minH += 90.0f;
     ImGui::SetNextWindowSizeConstraints(ImVec2(500.0f, minH), ImVec2(FLT_MAX, FLT_MAX));
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin(m_title, &m_open, flags)) {
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+                           | ImGuiWindowFlags_NoFocusOnAppearing;
+    char grp[8];
+    if (m_groupId > 0) std::snprintf(grp, sizeof(grp), "G%d", m_groupId);
+    else                std::strncpy(grp, "G-", sizeof(grp));
+    char title[80];
+    std::snprintf(title, sizeof(title), "Chart %s %s###chart%d",
+        m_symbol[0] == '\0' ? "--" : m_symbol, grp, m_instanceId);
+    if (!ImGui::Begin(title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -411,9 +419,15 @@ bool ChartWindow::Render() {
 // Toolbar row 1 — symbol, timeframe, zoom, indicators
 // ============================================================================
 void ChartWindow::DrawToolbar() {
+    FlexRow row;
+
+    // Group picker
+    row.item(FlexRow::buttonW("G1"), 0);
     core::DrawGroupPicker(m_groupId, "##chart_grp");
-    ImGui::SameLine(0, 8);
-    ImGui::SetNextItemWidth(80);
+
+    // Symbol input
+    row.item(em(80), 8);
+    ImGui::SetNextItemWidth(em(80));
     if (ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
                          ImGuiInputTextFlags_EnterReturnsTrue)) {
         m_viewInitialized = false;
@@ -421,7 +435,8 @@ void ChartWindow::DrawToolbar() {
         RequestNewData();
     }
 
-    ImGui::SameLine(0, 2);
+    // History dropdown button
+    row.item(FlexRow::buttonW("v"), 2);
     if (ImGui::SmallButton("v##hist")) ImGui::OpenPopup("##symhist");
     if (ImGui::BeginPopup("##symhist")) {
         ImGui::TextDisabled("Recent symbols");
@@ -446,10 +461,10 @@ void ChartWindow::DrawToolbar() {
         ImGui::EndPopup();
     }
 
-    ImGui::SameLine(0, 8);
-    const char* syms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY"};
-    for (const char* s : syms) {
-        ImGui::SameLine();
+    // Quick symbol buttons
+    static constexpr const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY"};
+    for (const char* s : kQuickSyms) {
+        row.item(FlexRow::buttonW(s), 4);
         bool active = (std::strcmp(m_symbol, s) == 0);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.5f, 0.9f, 1.f));
         if (ImGui::SmallButton(s)) {
@@ -462,8 +477,9 @@ void ChartWindow::DrawToolbar() {
         if (active) ImGui::PopStyleColor();
     }
 
-    ImGui::SameLine(0, 16);
-    ImGui::SetNextItemWidth(55);
+    // Timeframe combo
+    row.item(em(55), 16);
+    ImGui::SetNextItemWidth(em(55));
     if (ImGui::BeginCombo("##tf", core::TimeframeLabel(m_timeframe))) {
         for (core::Timeframe tf : kAllTimeframes) {
             bool sel = (m_timeframe == tf);
@@ -480,14 +496,14 @@ void ChartWindow::DrawToolbar() {
     }
 
     // Horizontal zoom buttons — contract/expand the visible X window by 25%
-    ImGui::SameLine(0, 8);
+    row.item(FlexRow::buttonW("[+]"), 8);
     if (ImGui::SmallButton("[+]") && m_viewInitialized) {
         double center = (m_xMin + m_xMax) * 0.5;
         double half   = (m_xMax - m_xMin) * 0.5 * 0.75;
         m_xMin = center - half;
         m_xMax = center + half;
     }
-    ImGui::SameLine(0, 2);
+    row.item(FlexRow::buttonW("[-]"), 2);
     if (ImGui::SmallButton("[-]") && m_viewInitialized) {
         double center = (m_xMin + m_xMax) * 0.5;
         double half   = (m_xMax - m_xMin) * 0.5 * 1.333;
@@ -497,7 +513,7 @@ void ChartWindow::DrawToolbar() {
 
     // Extended hours toggles (intraday only)
     if (IsIntraday(m_timeframe)) {
-        ImGui::SameLine(0, 16);
+        row.item(FlexRow::checkboxW("Ext.Hrs"), 16);
         bool extHours = !m_useRTH;
         if (ImGui::Checkbox("Ext.Hrs", &extHours)) {
             m_useRTH = !extHours;
@@ -508,7 +524,7 @@ void ChartWindow::DrawToolbar() {
             ImGui::SetTooltip("Include pre-market & after-hours bars");
 
         if (!m_useRTH) {
-            ImGui::SameLine(0, 4);
+            row.item(FlexRow::checkboxW("Overnight"), 4);
             if (ImGui::Checkbox("Overnight", &m_showOvernight)) {
                 RebuildFlatArrays();
                 ComputeIndicators();
@@ -518,21 +534,27 @@ void ChartWindow::DrawToolbar() {
                 ImGui::SetTooltip("Include overnight bars (00:00-04:00 ET)");
         }
 
-        ImGui::SameLine(0, 4);
+        row.item(FlexRow::checkboxW("Sessions"), 4);
         ImGui::Checkbox("Sessions", &m_showSessions);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Highlight trading session backgrounds");
     }
 
-    ImGui::SameLine(0, 16);
-    ImGui::Checkbox("SMA20",  &m_ind.sma20);  ImGui::SameLine();
-    ImGui::Checkbox("SMA50",  &m_ind.sma50);  ImGui::SameLine();
-    ImGui::Checkbox("EMA20",  &m_ind.ema20);  ImGui::SameLine();
-    ImGui::Checkbox("BB",     &m_ind.bbands); ImGui::SameLine();
-    ImGui::Checkbox("VWAP",   &m_ind.vwap);   ImGui::SameLine();
-    ImGui::Checkbox("Vol",    &m_ind.volume); ImGui::SameLine();
+    // Indicator checkboxes
+    row.item(FlexRow::checkboxW("SMA20"), 16);
+    ImGui::Checkbox("SMA20",  &m_ind.sma20);
+    row.item(FlexRow::checkboxW("SMA50"));
+    ImGui::Checkbox("SMA50",  &m_ind.sma50);
+    row.item(FlexRow::checkboxW("EMA20"));
+    ImGui::Checkbox("EMA20",  &m_ind.ema20);
+    row.item(FlexRow::checkboxW("BB"));
+    ImGui::Checkbox("BB",     &m_ind.bbands);
+    row.item(FlexRow::checkboxW("VWAP"));
+    ImGui::Checkbox("VWAP",   &m_ind.vwap);
+    row.item(FlexRow::checkboxW("Vol"));
+    ImGui::Checkbox("Vol",    &m_ind.volume);
+    row.item(FlexRow::checkboxW("RSI"));
     ImGui::Checkbox("RSI",    &m_ind.rsi);
-
 }
 
 // ============================================================================
@@ -550,9 +572,11 @@ void ChartWindow::DrawAnalysisToolbar() {
         { DrawTool::Erase,     "Erase",    "Click near a drawing to remove it"      },
     };
 
+    FlexRow row;
+    row.item(FlexRow::textW("Analysis:"), 0);
     ImGui::TextDisabled("Analysis:");
     for (const auto& e : kTools) {
-        ImGui::SameLine(0, 4);
+        row.item(FlexRow::buttonW(e.label), 4);
         bool active = (m_drawTool == e.tool);
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.f));
         if (ImGui::SmallButton(e.label)) {
@@ -568,7 +592,7 @@ void ChartWindow::DrawAnalysisToolbar() {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", e.tooltip);
     }
 
-    ImGui::SameLine(0, 12);
+    row.item(FlexRow::buttonW("Clear All"), 12);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.15f, 0.15f, 1.f));
     if (ImGui::SmallButton("Clear All")) {
         m_drawings.clear();
@@ -578,7 +602,7 @@ void ChartWindow::DrawAnalysisToolbar() {
     ImGui::PopStyleColor();
 
     if (m_drawPending) {
-        ImGui::SameLine(0, 16);
+        row.item(FlexRow::textW("(click second point...)"), 16);
         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "(click second point...)");
     }
 }
@@ -596,15 +620,20 @@ void ChartWindow::DrawTradePanel() {
 
     ImGui::Spacing();
 
+    FlexRow row;
+    const float kBtnW = em(56);  // BUY / SELL button width
+
     // ── Qty ─────────────────────────────────────────────────────────────────
-    ImGui::TextDisabled("Trade:"); ImGui::SameLine(0, 6);
-    ImGui::SetNextItemWidth(62);
+    row.item(FlexRow::textW("Trade:"), 0);
+    ImGui::TextDisabled("Trade:");
+    row.item(em(62), 6);
+    ImGui::SetNextItemWidth(em(62));
     ImGui::InputInt("Qty##ord", &m_orderQty, 0, 0);
     if (m_orderQty < 1) m_orderQty = 1;
 
     // ── Order type ──────────────────────────────────────────────────────────
-    ImGui::SameLine(0, 8);
-    ImGui::SetNextItemWidth(170);
+    row.item(em(170), 8);
+    ImGui::SetNextItemWidth(em(170));
     if (ImGui::BeginCombo("##otype", kOrderTypes[m_orderTypeIdx].label)) {
         for (int i = 0; i < kNumOrderTypes; i++) {
             bool sel = (i == m_orderTypeIdx);
@@ -622,17 +651,17 @@ void ChartWindow::DrawTradePanel() {
 
     // ── Trail amount (only for trailing types) ───────────────────────────
     if (kOrderTypes[m_orderTypeIdx].needsTrail) {
-        ImGui::SameLine(0, 6);
+        row.item(FlexRow::textW("Trail $:"), 6);
         ImGui::TextDisabled("Trail $:");
-        ImGui::SameLine(0, 4);
-        ImGui::SetNextItemWidth(72);
+        row.item(em(72), 4);
+        ImGui::SetNextItemWidth(em(72));
         ImGui::InputDouble("##trail", &m_trailAmount, 0.0, 0.0, "%.2f");
         if (m_trailAmount <= 0.0) m_trailAmount = 0.01;
     }
 
     // ── Session ─────────────────────────────────────────────────────────────
-    ImGui::SameLine(0, 10);
-    ImGui::SetNextItemWidth(95);
+    row.item(em(95), 10);
+    ImGui::SetNextItemWidth(em(95));
     if (ImGui::BeginCombo("##sess", kSessions[m_sessionIdx])) {
         for (int i = 0; i < 4; i++) {
             bool sel = (i == m_sessionIdx);
@@ -643,8 +672,8 @@ void ChartWindow::DrawTradePanel() {
     }
 
     // ── TIF ─────────────────────────────────────────────────────────────────
-    ImGui::SameLine(0, 6);
-    ImGui::SetNextItemWidth(52);
+    row.item(em(52), 6);
+    ImGui::SetNextItemWidth(em(52));
     if (ImGui::BeginCombo("##tif", kTIFs[m_tifIdx])) {
         for (int i = 0; i < 3; i++) {
             bool sel = (i == m_tifIdx);
@@ -654,36 +683,33 @@ void ChartWindow::DrawTradePanel() {
         ImGui::EndCombo();
     }
 
-    // ── BUY / SELL buttons (right-aligned, larger) ───────────────────────
-    ImGui::SameLine(0, 14);
+    // ── BUY / SELL buttons ────────────────────────────────────────────────
+    row.item(kBtnW, 14);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.52f, 0.08f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.15f, 0.72f, 0.15f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.04f, 0.38f, 0.04f, 1.f));
-    bool buyClicked = ImGui::Button("  BUY  ##ord", ImVec2(72, 26));
+    bool buyClicked = ImGui::Button("  BUY  ##ord", ImVec2(kBtnW, 0));
     ImGui::PopStyleColor(3);
 
-    ImGui::SameLine(0, 4);
+    row.item(kBtnW, 4);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.52f, 0.08f, 0.08f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.72f, 0.15f, 0.15f, 1.f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.38f, 0.04f, 0.04f, 1.f));
-    bool sellClicked = ImGui::Button(" SELL  ##ord", ImVec2(72, 26));
+    bool sellClicked = ImGui::Button(" SELL  ##ord", ImVec2(kBtnW, 0));
     ImGui::PopStyleColor(3);
 
     // ── Status hint when armed ───────────────────────────────────────────────
     if (m_limitArmed) {
-        ImGui::SameLine(0, 12);
         ImVec4 hintCol = (m_limitSide == "BUY")
                          ? ImVec4(0.4f, 0.7f, 1.f, 1.f)
                          : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-        if (m_firstPricePlaced)
-            ImGui::TextColored(hintCol,
-                "Stop set — click chart to set limit price | Esc=cancel");
-        else if (kOrderTypes[m_orderTypeIdx].isDualPrice)
-            ImGui::TextColored(hintCol,
-                "Click chart to set STOP price | Esc=cancel");
-        else
-            ImGui::TextColored(hintCol,
-                "Click to send | Ctrl+click for confirmation | Esc=cancel");
+        const char* hint = m_firstPricePlaced
+            ? "Stop set — click chart to set limit price | Esc=cancel"
+            : kOrderTypes[m_orderTypeIdx].isDualPrice
+                ? "Click chart to set STOP price | Esc=cancel"
+                : "Click to send | Ctrl+click for confirmation | Esc=cancel";
+        row.item(FlexRow::textW(hint), 12);
+        ImGui::TextColored(hintCol, "%s", hint);
     }
 
     // ── Ctrl+Click price confirmation popup ─────────────────────────────────
@@ -698,9 +724,9 @@ void ChartWindow::DrawTradePanel() {
         ImGui::TextColored(titleCol, "Confirm %s Order", m_limitSide.c_str());
         ImGui::Separator();
         ImGui::Text("Type: %s", kOrderTypes[m_orderTypeIdx].label);
-        ImGui::SetNextItemWidth(100);
+        ImGui::SetNextItemWidth(em(100));
         ImGui::InputDouble("Price##confirm", &m_pendingPrice, 0.01, 0.10, "$%.2f");
-        ImGui::SetNextItemWidth(80);
+        ImGui::SetNextItemWidth(em(80));
         int qty = m_orderQty;
         ImGui::InputInt("Qty##confirm", &qty, 1, 10);
         if (qty < 1) qty = 1;
@@ -778,16 +804,29 @@ void ChartWindow::DrawInfoBar() {
     bool   bull      = change >= 0.0;
     ImVec4 chgCol    = bull ? ImVec4(0.2f, 0.9f, 0.4f, 1.f) : ImVec4(0.9f, 0.3f, 0.3f, 1.f);
 
-    ImGui::TextDisabled("%s  [%s]", m_symbol, dateBuf);
-    ImGui::SameLine(0, 12);
-    ImGui::TextDisabled("O:%.2f  H:%.2f  L:%.2f  C:%.2f",
-                        m_opens[idx], m_highs[idx], m_lows[idx], m_closes[idx]);
-    ImGui::SameLine(0, 12);
-    ImGui::TextColored(chgCol, "%+.2f  (%+.2f%%)", change, changePct);
+    FlexRow row;
+
+    char symDateBuf[64];
+    std::snprintf(symDateBuf, sizeof(symDateBuf), "%s  [%s]", m_symbol, dateBuf);
+    row.item(FlexRow::textW(symDateBuf), 0);
+    ImGui::TextDisabled("%s", symDateBuf);
+
+    char ohlcBuf[64];
+    std::snprintf(ohlcBuf, sizeof(ohlcBuf), "O:%.2f  H:%.2f  L:%.2f  C:%.2f",
+                  m_opens[idx], m_highs[idx], m_lows[idx], m_closes[idx]);
+    row.item(FlexRow::textW(ohlcBuf), 12);
+    ImGui::TextDisabled("%s", ohlcBuf);
+
+    char chgBuf[32];
+    std::snprintf(chgBuf, sizeof(chgBuf), "%+.2f  (%+.2f%%)", change, changePct);
+    row.item(FlexRow::textW(chgBuf), 12);
+    ImGui::TextColored(chgCol, "%s", chgBuf);
 
     if (m_ind.vwap && idx < (int)m_vwap.size() && m_vwap[idx] > 0.0) {
-        ImGui::SameLine(0, 12);
-        ImGui::TextColored(ImVec4(1.f, 1.f, 1.f, 1.f), "VWAP:%.2f", m_vwap[idx]);
+        char vwapBuf[24];
+        std::snprintf(vwapBuf, sizeof(vwapBuf), "VWAP:%.2f", m_vwap[idx]);
+        row.item(FlexRow::textW(vwapBuf), 12);
+        ImGui::TextColored(ImVec4(1.f, 1.f, 1.f, 1.f), "%s", vwapBuf);
     }
 
     if (m_position.hasPosition && std::abs(m_position.qty) >= 1e-9) {
@@ -795,10 +834,15 @@ void ChartWindow::DrawInfoBar() {
         ImVec4 pnlCol = netPnL >= 0.0
             ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
             : ImVec4(0.90f, 0.28f, 0.28f, 1.f);
-        ImGui::SameLine(0, 18);
-        ImGui::TextColored(pnlCol, "PnL:%+.2f", netPnL);
-        ImGui::SameLine(0, 6);
-        ImGui::TextDisabled("(comm -%.2f)", m_position.commission);
+        char pnlBuf[24];
+        std::snprintf(pnlBuf, sizeof(pnlBuf), "PnL:%+.2f", netPnL);
+        row.item(FlexRow::textW(pnlBuf), 18);
+        ImGui::TextColored(pnlCol, "%s", pnlBuf);
+
+        char commBuf[28];
+        std::snprintf(commBuf, sizeof(commBuf), "(comm -%.2f)", m_position.commission);
+        row.item(FlexRow::textW(commBuf), 6);
+        ImGui::TextDisabled("%s", commBuf);
     }
 }
 
@@ -1394,45 +1438,71 @@ void ChartWindow::DrawPositionStrip() {
         unreal = (last - entry) * qty;
     double net    = unreal - comm;
 
+    // Height accommodates up to 2 wrapped lines
+    float stripH = ImGui::GetTextLineHeightWithSpacing() * 2.0f
+                 + ImGui::GetStyle().WindowPadding.y;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.12f, 1.0f));
-    ImGui::BeginChild("##posstrip", ImVec2(-1, 28), ImGuiChildFlags_None,
+    ImGui::BeginChild("##posstrip", ImVec2(-1, stripH), ImGuiChildFlags_None,
                       ImGuiWindowFlags_NoScrollbar |
                       ImGuiWindowFlags_NoScrollWithMouse);
 
-    float cy = (ImGui::GetWindowHeight() - ImGui::GetTextLineHeight()) * 0.5f;
-    ImGui::SetCursorPosY(cy);
+    FlexRow row;
 
+    row.item(FlexRow::textW("Position:"), 0);
     ImGui::TextDisabled("Position:");
-    ImGui::SameLine(0, 6);
+
+    char qtyBuf[24];
+    std::snprintf(qtyBuf, sizeof(qtyBuf), "%.0f sh", qty);
+    row.item(FlexRow::textW(qtyBuf), 6);
     ImGui::PushStyleColor(ImGuiCol_Text,
         qty >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
                  : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::Text("%.0f sh", qty);
+    ImGui::TextUnformatted(qtyBuf);
     ImGui::PopStyleColor();
 
-    ImGui::SameLine(0, 12); ImGui::TextDisabled("Entry:"); ImGui::SameLine(0, 4);
-    ImGui::Text("$%.2f", entry);
+    row.item(FlexRow::textW("Entry:"), 12);
+    ImGui::TextDisabled("Entry:");
+    char entryBuf[16];
+    std::snprintf(entryBuf, sizeof(entryBuf), "$%.2f", entry);
+    row.item(FlexRow::textW(entryBuf), 4);
+    ImGui::TextUnformatted(entryBuf);
 
-    ImGui::SameLine(0, 12); ImGui::TextDisabled("Last:"); ImGui::SameLine(0, 4);
-    ImGui::Text("$%.2f", last);
+    row.item(FlexRow::textW("Last:"), 12);
+    ImGui::TextDisabled("Last:");
+    char lastBuf[16];
+    std::snprintf(lastBuf, sizeof(lastBuf), "$%.2f", last);
+    row.item(FlexRow::textW(lastBuf), 4);
+    ImGui::TextUnformatted(lastBuf);
 
-    ImGui::SameLine(0, 16); ImGui::TextDisabled("Unreal P&L:"); ImGui::SameLine(0, 4);
+    row.item(FlexRow::textW("Unreal P&L:"), 16);
+    ImGui::TextDisabled("Unreal P&L:");
+    char unrealBuf[16];
+    std::snprintf(unrealBuf, sizeof(unrealBuf), "%+.2f", unreal);
+    row.item(FlexRow::textW(unrealBuf), 4);
     ImGui::PushStyleColor(ImGuiCol_Text,
         unreal >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
                     : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::Text("%+.2f", unreal);
+    ImGui::TextUnformatted(unrealBuf);
     ImGui::PopStyleColor();
 
     if (comm > 0.0) {
-        ImGui::SameLine(0, 12); ImGui::TextDisabled("Comm:"); ImGui::SameLine(0, 4);
-        ImGui::Text("-$%.2f", comm);
+        row.item(FlexRow::textW("Comm:"), 12);
+        ImGui::TextDisabled("Comm:");
+        char commBuf[16];
+        std::snprintf(commBuf, sizeof(commBuf), "-$%.2f", comm);
+        row.item(FlexRow::textW(commBuf), 4);
+        ImGui::TextUnformatted(commBuf);
     }
 
-    ImGui::SameLine(0, 16); ImGui::TextDisabled("Net:"); ImGui::SameLine(0, 4);
+    row.item(FlexRow::textW("Net:"), 16);
+    ImGui::TextDisabled("Net:");
+    char netBuf[16];
+    std::snprintf(netBuf, sizeof(netBuf), "%+.2f", net);
+    row.item(FlexRow::textW(netBuf), 4);
     ImGui::PushStyleColor(ImGuiCol_Text,
         net >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
                  : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::Text("%+.2f", net);
+    ImGui::TextUnformatted(netBuf);
     ImGui::PopStyleColor();
 
     ImGui::EndChild();

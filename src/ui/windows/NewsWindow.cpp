@@ -1,3 +1,4 @@
+#include "ui/UiScale.h"
 #include "ui/windows/NewsWindow.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
@@ -119,7 +120,13 @@ bool NewsWindow::Render() {
     if (!m_open) return false;
 
     ImGui::SetNextWindowSize(ImVec2(600, 520), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("News Feed", &m_open)) {
+    char grp[8];
+    if (m_groupId > 0) std::snprintf(grp, sizeof(grp), "G%d", m_groupId);
+    else                std::strncpy(grp, "G-", sizeof(grp));
+    char title[80];
+    std::snprintf(title, sizeof(title), "News %s %s###news%d",
+        m_stockSymbol[0] == '\0' ? "--" : m_stockSymbol, grp, m_instanceId);
+    if (!ImGui::Begin(title, &m_open, ImGuiWindowFlags_NoFocusOnAppearing)) {
         ImGui::End();
         return m_open;
     }
@@ -154,13 +161,17 @@ bool NewsWindow::Render() {
 // Toolbar
 // ============================================================================
 void NewsWindow::DrawToolbar() {
+    FlexRow row;
+
+    row.item(FlexRow::buttonW("G1"), 0);
     core::DrawGroupPicker(m_groupId, "##news_grp");
-    ImGui::SameLine(0, 10);
-    ImGui::SetNextItemWidth(180);
+
+    row.item(em(180), 10);
+    ImGui::SetNextItemWidth(em(180));
     ImGui::InputTextWithHint("##filter", "Search headlines...",
                              m_filterText, sizeof(m_filterText));
 
-    ImGui::SameLine(0, 12);
+    row.item(FlexRow::buttonW("Refresh"), 12);
     if (ImGui::Button("Refresh")) RefreshAll();
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Re-request news for portfolio and current stock symbol");
@@ -221,7 +232,7 @@ void NewsWindow::DrawTabPortfolio() {
 void NewsWindow::DrawTabStock() {
     ImGui::Text("Symbol:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(80);
+    ImGui::SetNextItemWidth(em(80));
     bool entered = ImGui::InputText("##stocksym", m_stockSymbol, sizeof(m_stockSymbol),
                                     ImGuiInputTextFlags_EnterReturnsTrue |
                                     ImGuiInputTextFlags_CharsUppercase);

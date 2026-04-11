@@ -1,3 +1,4 @@
+#include "ui/UiScale.h"
 #include "PortfolioWindow.h"
 
 #include "imgui.h"
@@ -147,7 +148,8 @@ bool PortfolioWindow::Render()
 
     ImGui::SetNextWindowSize(ImVec2(1200, 700), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoScrollWithMouse;
+                             ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoFocusOnAppearing;
 
     if (!ImGui::Begin("Portfolio & Account", &m_open, flags)) {
         ImGui::End();
@@ -740,7 +742,7 @@ void PortfolioWindow::DrawBottomTabs()
 void PortfolioWindow::DrawTradeHistory()
 {
     // Filter bar
-    ImGui::SetNextItemWidth(140);
+    ImGui::SetNextItemWidth(em(140));
     ImGui::InputTextWithHint("##tradeFilter", "Filter symbol…",
                               m_tradeFilterBuf, sizeof(m_tradeFilterBuf));
     ImGui::SameLine();
