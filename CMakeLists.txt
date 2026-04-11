@@ -320,6 +320,7 @@ target_link_libraries(ibkr-trading-app PRIVATE
 target_compile_definitions(ibkr-trading-app PRIVATE
     $<$<CONFIG:DEBUG>:DEBUG_MODE>
     $<$<CONFIG:RELEASE>:NDEBUG>
+    $<$<CXX_COMPILER_ID:MSVC>:NOMINMAX>  # prevent Windows.h min/max macros clashing with std::min/max
 )
 
 # ============================================================================

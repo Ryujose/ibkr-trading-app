@@ -116,14 +116,16 @@ jobs:
           vulkan_version: latest
           cache: true
 
-      - name: Cache vcpkg binary packages
+      - name: Cache vcpkg installed packages
+        id: cache-vcpkg
         uses: actions/cache@v4
         with:
-          path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          path: C:\vcpkg\installed
           key: vcpkg-x64-windows-static-${{ hashFiles('.github/workflows/build.yml') }}
           restore-keys: vcpkg-x64-windows-static-
 
       - name: Install dependencies via vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
         run: vcpkg install glfw3:x64-windows-static protobuf:x64-windows-static
 
       - name: Decrypt TWS API
