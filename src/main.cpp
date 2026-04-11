@@ -65,17 +65,25 @@ struct ScannerEntry {
     std::vector<core::ScanResult> pendingResults;
 };
 
-static constexpr int   kMaxMultiWin = 4;    // max instances per window type
+static constexpr int   kMaxMultiWin = 10;   // max instances per window type
 static constexpr float kTitleBarH   = 32.0f; // custom title bar height
 static bool            g_tbDragging = false; // title-bar drag in progress (shared with resize handler)
+
+struct NewsEntry {
+    ui::NewsWindow*              win          = nullptr;
+    int                          nextArtReqId = 0;
+    int                          artEnd       = 0;
+    std::unordered_map<int,int>  artReqToItemId;
+    std::unordered_map<int,bool> newsConIdFired;
+};
 
 // ---- Multi-instance containers -----------------------------------------------
 static std::vector<ChartEntry>   g_chartEntries;
 static std::vector<TradingEntry> g_tradingEntries;
 static std::vector<ScannerEntry> g_scannerEntries;
+static std::vector<NewsEntry>    g_newsEntries;
 
 // ---- Singleton windows (one each) --------------------------------------------
-static ui::NewsWindow*      g_NewsWindow      = nullptr;
 static ui::PortfolioWindow* g_PortfolioWindow = nullptr;
 static ui::OrdersWindow*    g_OrdersWindow    = nullptr;
 
@@ -93,6 +101,14 @@ static std::unordered_map<int, std::string> g_tickerSymbols;
 static int    g_nextOrderId          = 1;
 static double g_reconnectNextAttempt = 0.0;   // glfwGetTime() of next auto-reconnect try
 static constexpr double kReconnectIntervalSec = 5.0;
+
+// ---- Settings ---------------------------------------------------------------
+enum class FontSize { Small = 0, Medium = 1, Large = 2 };
+static FontSize g_fontSize     = FontSize::Medium;
+static bool     g_settingsOpen = false;
+
+static constexpr float kFontScales[] = { 0.85f, 1.0f, 1.5f }; // Small / Medium / Large
+static ImGuiStyle      g_baseStyle;   // saved after initial style setup; used to re-scale cleanly
 
 // ---- Window groups (4 slots; index 0 = group id 1) -------------------------
 static std::array<core::GroupState, 4> g_groups;
@@ -174,49 +190,44 @@ static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 
 // Request IDs (reserved ranges — no overlaps)
 // Per-instance helpers: each window type has its own slot.
-//   Chart   hist:  1,3,5,7       ext: 2,4,6,8     mkt: 100-103
-//   Trading mkt:   110-113       depth: 120-123
-//   Scanner scan:  1000,1100,1200,1300 (+99 ea)    mkt: 800,812,824,836 (+12 ea)
+//   Chart   hist:  1,3,5,...,19  ext: 2,4,6,...,20  mkt: 100-109
+//   Trading mkt:   110-119       depth: 120-129
+//   Scanner scan:  1000,1100,...,1900 (+99 ea)  mkt: 800,812,...,908 (+12 ea, 12 slots each)
 //   News:          201(RT), 400-420(conId), 500-520(hist), 600-699(art), 700-759(mkt)
 //   Account:       900
 static constexpr int NEWS_RT_REQID       = 201;  // real-time news subscription (mdoff;292)
 
 // Inline helpers — idx is 0-based instance index
-inline int ChartHistId   (int idx) { return 1    + idx * 2; }   // 1,3,5,7
-inline int ChartExtId    (int idx) { return 2    + idx * 2; }   // 2,4,6,8
-inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-103
-inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-113
-inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-123
-inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,1200,1300
-inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,824,836
+inline int ChartHistId   (int idx) { return 1    + idx * 2; }   // 1,3,5,...,19
+inline int ChartExtId    (int idx) { return 2    + idx * 2; }   // 2,4,6,...,20
+inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-109
+inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119
+inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
+inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,...,1900
+inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,...,908
 
 static constexpr int ACCT_SUMMARY_REQID  = 900;  // reqAccountSummary for base currency
 
-// News reqId layout:
-//   400        — contract-details lookup for stock tab
-//   401..420   — contract-details lookup for portfolio symbols (up to 20)
-//   500        — historical news for stock tab
-//   501..520   — historical news for portfolio symbols
-//   600..699   — article body fetches (rolling counter)
-//   750..759   — contract-details lookup for Market-tab seed symbols (up to 10)
-//   700..709   — historical news for Market tab (seeded on connection)
-static constexpr int NEWS_CONID_STOCK    = 400;
-static constexpr int NEWS_CONID_PORT     = 401;  // base; +i per portfolio symbol
-static constexpr int NEWS_HIST_STOCK     = 500;
-static constexpr int NEWS_HIST_PORT      = 501;  // base; +i per portfolio symbol
-static constexpr int NEWS_ART_BASE       = 600;
-static constexpr int NEWS_ART_END        = 699;
-static constexpr int NEWS_HIST_MKT       = 700;  // base; +i per seed symbol
-static constexpr int NEWS_CONID_MKT      = 750;  // base; +i per seed symbol
+// News reqId layout (per-instance, idx 0-9):
+//   Stock conId:   2000+idx
+//   Port conId:    2010+idx*20  (+19 per entry, 20 portfolio symbols)
+//   Stock hist:    2210+idx
+//   Port hist:     2220+idx*20  (+19 per entry)
+//   Article base:  2500+idx*100 (+99 per entry, rolling)
+//   Mkt hist:      3500+idx*10  (+9 per entry, kMktSeedCount seed symbols)
+//   Mkt conId:     3600+idx*10  (+9 per entry)
+inline int NewsStockConId(int idx) { return 2000 + idx; }
+inline int NewsPortConId (int idx) { return 2010 + idx * 20; }
+inline int NewsHistStock (int idx) { return 2210 + idx; }
+inline int NewsHistPort  (int idx) { return 2220 + idx * 20; }
+inline int NewsArtBase   (int idx) { return 2500 + idx * 100; }
+inline int NewsArtEnd    (int idx) { return 2599 + idx * 100; }
+inline int NewsHistMkt   (int idx) { return 3500 + idx * 10; }
+inline int NewsConIdMkt  (int idx) { return 3600 + idx * 10; }
 
 // Symbols fetched on connection to seed the Market-tab news feed.
 static const char* kMktSeedSymbols[] = { "AAPL", "SPY", "MSFT", "TSLA", "NVDA" };
 static constexpr int kMktSeedCount   = 5;
-static int           g_nextArtReqId      = NEWS_ART_BASE;
-static std::unordered_map<int,int> g_artReqToItemId;  // reqId → NewsItem.id
-// Tracks which contract-detail reqIds have already triggered reqHistoricalNews,
-// preventing duplicate calls when IB returns multiple exchange matches per symbol.
-static std::unordered_map<int,bool> g_newsConIdFired;
 
 // ============================================================================
 // Connection / Login state
@@ -494,7 +505,8 @@ static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
         if (e.win && e.win->groupId() == groupId) e.win->SetSymbol(sym);
     for (auto& te : g_tradingEntries)
         if (te.win && te.win->groupId() == groupId) ApplyTradingSymbol(te, sym);
-    if (g_NewsWindow && g_NewsWindow->groupId() == groupId) g_NewsWindow->SetSymbol(sym);
+    for (auto& ne : g_newsEntries)
+        if (ne.win && ne.win->groupId() == groupId) ne.win->SetSymbol(sym);
     // ScannerWindow is a symbol source only — no inbound SetSymbol
     g_groupSyncInProgress = false;
 }
@@ -722,10 +734,48 @@ static void SpawnScannerWindow(int idx) {
     g_scannerEntries.push_back(std::move(e));
 }
 
+static void SpawnNewsWindow(int idx) {
+    NewsEntry e;
+    e.win          = new ui::NewsWindow();
+    e.nextArtReqId = NewsArtBase(idx);
+    e.artEnd       = NewsArtEnd(idx);
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+
+    e.win->SetStockNewsReqId(NewsHistStock(idx));
+    e.win->SetPortNewsReqIdBase(NewsHistPort(idx));
+    e.win->SetMktNewsReqIdBase(NewsHistMkt(idx));
+
+    e.win->OnStockNewsRequested = [idx](const std::string& symbol) {
+        if (g_IBClient && g_IBClient->IsConnected())
+            g_IBClient->ReqContractDetails(NewsStockConId(idx), symbol);
+    };
+    e.win->OnPortfolioNewsRequested = [idx](const std::vector<std::string>& syms) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        for (int i = 0; i < (int)syms.size() && i < 20; ++i)
+            g_IBClient->ReqContractDetails(NewsPortConId(idx) + i, syms[i]);
+    };
+    e.win->OnArticleRequested = [idx](int itemId, const std::string& provider,
+                                      const std::string& articleId) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        auto& ne = g_newsEntries[idx];
+        int reqId = ne.nextArtReqId++;
+        if (ne.nextArtReqId > ne.artEnd) ne.nextArtReqId = NewsArtBase(idx);
+        ne.artReqToItemId[reqId] = itemId;
+        g_IBClient->ReqNewsArticle(reqId, provider, articleId);
+    };
+
+    g_newsEntries.push_back(std::move(e));
+
+    // If already connected, seed market news for this new window
+    if (g_IBClient && g_IBClient->IsConnected()) {
+        for (int i = 0; i < kMktSeedCount; ++i)
+            g_IBClient->ReqContractDetails(NewsConIdMkt(idx) + i, kMktSeedSymbols[i]);
+    }
+}
+
 static void CreateTradingWindows() {
     // Singleton windows
-    delete g_NewsWindow;      g_NewsWindow      = new ui::NewsWindow();
-    g_NewsWindow->setGroupId(1);
     delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
     delete g_OrdersWindow;    g_OrdersWindow    = new ui::OrdersWindow();
 
@@ -733,6 +783,7 @@ static void CreateTradingWindows() {
     SpawnChartWindow(0);
     SpawnTradingWindow(0);
     SpawnScannerWindow(0);
+    SpawnNewsWindow(0);
 
     // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
@@ -740,29 +791,6 @@ static void CreateTradingWindows() {
     };
     g_OrdersWindow->OnRefresh = []() {
         if (g_IBClient) g_IBClient->ReqOpenOrders();
-    };
-
-    // Wire NewsWindow
-    g_NewsWindow->SetStockNewsReqId(NEWS_HIST_STOCK);
-    g_NewsWindow->SetPortNewsReqIdBase(NEWS_HIST_PORT);
-    g_NewsWindow->SetMktNewsReqIdBase(NEWS_HIST_MKT);
-
-    g_NewsWindow->OnStockNewsRequested = [](const std::string& symbol) {
-        if (g_IBClient && g_IBClient->IsConnected())
-            g_IBClient->ReqContractDetails(NEWS_CONID_STOCK, symbol);
-    };
-    g_NewsWindow->OnPortfolioNewsRequested = [](const std::vector<std::string>& syms) {
-        if (!g_IBClient || !g_IBClient->IsConnected()) return;
-        for (int i = 0; i < (int)syms.size() && i < 20; ++i)
-            g_IBClient->ReqContractDetails(NEWS_CONID_PORT + i, syms[i]);
-    };
-    g_NewsWindow->OnArticleRequested = [](int itemId, const std::string& provider,
-                                          const std::string& articleId) {
-        if (!g_IBClient || !g_IBClient->IsConnected()) return;
-        int reqId = g_nextArtReqId++;
-        if (g_nextArtReqId > NEWS_ART_END) g_nextArtReqId = NEWS_ART_BASE;
-        g_artReqToItemId[reqId] = itemId;
-        g_IBClient->ReqNewsArticle(reqId, provider, articleId);
     };
 }
 
@@ -774,14 +802,12 @@ static void DestroyTradingWindows() {
     g_tradingEntries.clear();
     g_scannerEntries.clear();
 
-    delete g_NewsWindow;      g_NewsWindow      = nullptr;
+    for (auto& ne : g_newsEntries) { delete ne.win; ne.win = nullptr; }
+    g_newsEntries.clear();
     delete g_PortfolioWindow; g_PortfolioWindow = nullptr;
     delete g_OrdersWindow;    g_OrdersWindow    = nullptr;
 
     g_portfolioSymbols.clear();
-    g_artReqToItemId.clear();
-    g_nextArtReqId = NEWS_ART_BASE;
-    g_newsConIdFired.clear();
     g_liveOrders.clear();
     g_positions.clear();
     g_symbolCommissions.clear();
@@ -842,8 +868,9 @@ static void WireIBCallbacks() {
                     ApplyTradingSymbol(g_tradingEntries[0], sym);
 
                 g_IBClient->SubscribeToNews(NEWS_RT_REQID);
-                for (int i = 0; i < kMktSeedCount; ++i)
-                    g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
+                for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
+                    for (int i = 0; i < kMktSeedCount; ++i)
+                        g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
             } else {
                 // ── Silent reconnect: windows already exist, re-subscribe data ───
                 printf("[IB] Reconnected — re-subscribing all windows.\n");
@@ -879,8 +906,9 @@ static void WireIBCallbacks() {
                 }
 
                 g_IBClient->SubscribeToNews(NEWS_RT_REQID);
-                for (int i = 0; i < kMktSeedCount; ++i)
-                    g_IBClient->ReqContractDetails(NEWS_CONID_MKT + i, kMktSeedSymbols[i]);
+                for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
+                    for (int i = 0; i < kMktSeedCount; ++i)
+                        g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
             }
         } else {
             // Any disconnect while not in the normal "initial Connecting" flow
@@ -1133,7 +1161,8 @@ static void WireIBCallbacks() {
         } else {
             for (auto& se : g_scannerEntries)
                 if (se.win) se.win->SetPortfolioSymbols(g_portfolioSymbols);
-            if (g_NewsWindow) g_NewsWindow->SetPortfolioSymbols(g_portfolioSymbols);
+            for (auto& ne : g_newsEntries)
+                if (ne.win) ne.win->SetPortfolioSymbols(g_portfolioSymbols);
         }
     };
 
@@ -1235,7 +1264,6 @@ static void WireIBCallbacks() {
     g_IBClient->onNewsItem = [](std::time_t ts, const std::string& provider,
                                 const std::string& articleId,
                                 const std::string& headline) {
-        if (!g_NewsWindow) return;
         core::NewsItem item;
         item.id        = ++g_newsItemId;
         item.headline  = headline;
@@ -1244,7 +1272,8 @@ static void WireIBCallbacks() {
         item.timestamp = ts;
         item.sentiment = core::NewsSentiment::Neutral;
         item.category  = core::NewsCategory::Market;
-        g_NewsWindow->OnMarketNewsItem(item);
+        for (auto& ne : g_newsEntries)
+            if (ne.win) ne.win->OnMarketNewsItem(item);
     };
 
     // ── News — contract details → historical news chain ───────────────────
@@ -1252,16 +1281,26 @@ static void WireIBCallbacks() {
         if (!g_IBClient) return;
         // IB may call contractDetails multiple times (one per exchange match).
         // Only use the first conId per reqId so we don't issue duplicate news requests.
-        if (g_newsConIdFired[reqId]) return;
-        g_newsConIdFired[reqId] = true;
-        if (reqId == NEWS_CONID_STOCK) {
-            g_IBClient->ReqHistoricalNews(NEWS_HIST_STOCK, (int)conId, 30);
-        } else if (reqId >= NEWS_CONID_PORT && reqId < NEWS_CONID_PORT + 20) {
-            int i = reqId - NEWS_CONID_PORT;
-            g_IBClient->ReqHistoricalNews(NEWS_HIST_PORT + i, (int)conId, 10);
-        } else if (reqId >= NEWS_CONID_MKT && reqId < NEWS_CONID_MKT + kMktSeedCount) {
-            int i = reqId - NEWS_CONID_MKT;
-            g_IBClient->ReqHistoricalNews(NEWS_HIST_MKT + i, (int)conId, 20);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
+            auto& ne = g_newsEntries[ni];
+            if (reqId == NewsStockConId(ni)) {
+                if (ne.newsConIdFired[reqId]) return;
+                ne.newsConIdFired[reqId] = true;
+                g_IBClient->ReqHistoricalNews(NewsHistStock(ni), (int)conId, 30);
+                return;
+            }
+            if (reqId >= NewsPortConId(ni) && reqId < NewsPortConId(ni) + 20) {
+                if (ne.newsConIdFired[reqId]) return;
+                ne.newsConIdFired[reqId] = true;
+                g_IBClient->ReqHistoricalNews(NewsHistPort(ni) + (reqId - NewsPortConId(ni)), (int)conId, 10);
+                return;
+            }
+            if (reqId >= NewsConIdMkt(ni) && reqId < NewsConIdMkt(ni) + kMktSeedCount) {
+                if (ne.newsConIdFired[reqId]) return;
+                ne.newsConIdFired[reqId] = true;
+                g_IBClient->ReqHistoricalNews(NewsHistMkt(ni) + (reqId - NewsConIdMkt(ni)), (int)conId, 20);
+                return;
+            }
         }
     };
 
@@ -1269,34 +1308,55 @@ static void WireIBCallbacks() {
                                       const std::string& provider,
                                       const std::string& articleId,
                                       const std::string& headline) {
-        if (!g_NewsWindow) return;
-        core::NewsItem item;
-        item.id        = ++g_histNewsId;
-        item.headline  = headline;
-        item.source    = provider;    // providerCode needed for reqNewsArticle
-        item.summary   = articleId;   // transport: window extracts → m_itemArticleIds
-        item.timestamp = ts;
-        item.sentiment = core::NewsSentiment::Neutral;
-        if (reqId == NEWS_HIST_STOCK)
-            item.category = core::NewsCategory::Stock;
-        else if (reqId >= NEWS_HIST_MKT && reqId < NEWS_HIST_MKT + kMktSeedCount)
-            item.category = core::NewsCategory::Market;
-        else
-            item.category = core::NewsCategory::Portfolio;
-        g_NewsWindow->OnHistoricalNewsItem(reqId, item);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
+            auto& ne = g_newsEntries[ni];
+            if (!ne.win) continue;
+            core::NewsCategory cat;
+            bool found = false;
+            if (reqId == NewsHistStock(ni)) {
+                cat = core::NewsCategory::Stock; found = true;
+            } else if (reqId >= NewsHistMkt(ni) && reqId < NewsHistMkt(ni) + kMktSeedCount) {
+                cat = core::NewsCategory::Market; found = true;
+            } else if (reqId >= NewsHistPort(ni) && reqId < NewsHistPort(ni) + 20) {
+                cat = core::NewsCategory::Portfolio; found = true;
+            }
+            if (!found) continue;
+            core::NewsItem item;
+            item.id        = ++g_histNewsId;
+            item.headline  = headline;
+            item.source    = provider;
+            item.summary   = articleId;
+            item.timestamp = ts;
+            item.sentiment = core::NewsSentiment::Neutral;
+            item.category  = cat;
+            ne.win->OnHistoricalNewsItem(reqId, item);
+            return;
+        }
     };
 
     g_IBClient->onHistoricalNewsEnd = [](int reqId) {
-        if (g_NewsWindow) g_NewsWindow->OnHistoricalNewsEnd(reqId);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
+            auto& ne = g_newsEntries[ni];
+            if (!ne.win) continue;
+            if (reqId == NewsHistStock(ni) ||
+                (reqId >= NewsHistMkt(ni)  && reqId < NewsHistMkt(ni)  + kMktSeedCount) ||
+                (reqId >= NewsHistPort(ni) && reqId < NewsHistPort(ni) + 20)) {
+                ne.win->OnHistoricalNewsEnd(reqId);
+                return;
+            }
+        }
     };
 
     g_IBClient->onNewsArticle = [](int reqId, int /*articleType*/,
                                    const std::string& text) {
-        auto it = g_artReqToItemId.find(reqId);
-        if (it == g_artReqToItemId.end()) return;
-        int itemId = it->second;
-        g_artReqToItemId.erase(it);
-        if (g_NewsWindow) g_NewsWindow->OnArticleReceived(itemId, text);
+        for (auto& ne : g_newsEntries) {
+            auto it = ne.artReqToItemId.find(reqId);
+            if (it == ne.artReqToItemId.end()) continue;
+            int itemId = it->second;
+            ne.artReqToItemId.erase(it);
+            if (ne.win) ne.win->OnArticleReceived(itemId, text);
+            return;
+        }
     };
 
     // ── Errors ────────────────────────────────────────────────────────────
@@ -1325,16 +1385,21 @@ static void WireIBCallbacks() {
         // News errors: if reqHistoricalNews or reqContractDetails fails (e.g. no news
         // subscription, code 321/10197), IB sends an error instead of historicalNewsEnd.
         // Clear the loading state so the UI doesn't hang on "Loading..." indefinitely.
-        if (g_NewsWindow) {
-            if (reqId == NEWS_HIST_STOCK || reqId == NEWS_CONID_STOCK) {
-                g_NewsWindow->OnHistoricalNewsEnd(NEWS_HIST_STOCK);
-            } else if (reqId >= NEWS_HIST_PORT && reqId < NEWS_HIST_PORT + 20) {
-                g_NewsWindow->OnHistoricalNewsEnd(reqId);
-            } else if (reqId >= NEWS_CONID_PORT && reqId < NEWS_CONID_PORT + 20) {
-                int i = reqId - NEWS_CONID_PORT;
-                g_NewsWindow->OnHistoricalNewsEnd(NEWS_HIST_PORT + i);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
+            auto& ne = g_newsEntries[ni];
+            if (!ne.win) continue;
+            if (reqId == NewsHistStock(ni) || reqId == NewsStockConId(ni)) {
+                ne.win->OnHistoricalNewsEnd(NewsHistStock(ni));
+                break;
             }
-            // Market-tab seed errors don't affect loading UI — market tab is push-based.
+            if (reqId >= NewsHistPort(ni) && reqId < NewsHistPort(ni) + 20) {
+                ne.win->OnHistoricalNewsEnd(reqId);
+                break;
+            }
+            if (reqId >= NewsPortConId(ni) && reqId < NewsPortConId(ni) + 20) {
+                ne.win->OnHistoricalNewsEnd(NewsHistPort(ni) + (reqId - NewsPortConId(ni)));
+                break;
+            }
         }
 
         // Subscription errors for market data (NBBO) and Level II depth per trading entry.
@@ -1734,7 +1799,10 @@ static void ApplyPreset(const core::WindowPreset& p) {
         g_scannerEntries[0].win->open()     = p.scanner.visible;
         g_scannerEntries[0].win->setGroupId(p.scanner.groupId);
     }
-    if (g_NewsWindow)      { g_NewsWindow->open()      = p.news.visible;      g_NewsWindow->setGroupId(p.news.groupId); }
+    if (!g_newsEntries.empty() && g_newsEntries[0].win) {
+        g_newsEntries[0].win->open() = p.news.visible;
+        g_newsEntries[0].win->setGroupId(p.news.groupId);
+    }
     if (g_PortfolioWindow) { g_PortfolioWindow->open() = p.portfolio.visible; }
     if (g_OrdersWindow)    { g_OrdersWindow->open()    = p.orders.visible; }
     // Reset group state so the next symbol change re-broadcasts correctly
@@ -2015,6 +2083,37 @@ static void RenderCustomTitleBar() {
 }
 
 // ============================================================================
+// Settings window
+// ============================================================================
+static void RenderSettingsWindow() {
+    if (!g_settingsOpen) return;
+    ImGui::SetNextWindowSize(ImVec2(300, 140), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+    if (!ImGui::Begin("Settings", &g_settingsOpen,
+            ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::SeparatorText("Font Size");
+    ImGui::Spacing();
+
+    static const char* kLabels[] = { "Small", "Medium", "Large" };
+    for (int i = 0; i < 3; ++i) {
+        if (i > 0) ImGui::SameLine(0, 16);
+        if (ImGui::RadioButton(kLabels[i], (int)g_fontSize == i)) {
+            g_fontSize = static_cast<FontSize>(i);
+            ImGui::GetIO().FontGlobalScale = kFontScales[i];
+            ImGui::GetStyle() = g_baseStyle;
+            ImGui::GetStyle().ScaleAllSizes(kFontScales[i]);
+        }
+    }
+
+    ImGui::End();
+}
+
+// ============================================================================
 // Trading UI
 // ============================================================================
 static void RenderTradingUI() {
@@ -2041,46 +2140,82 @@ static void RenderTradingUI() {
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                // Per-instance chart windows
-                for (auto& ce : g_chartEntries) {
-                    if (!ce.win) continue;
-                    char lbl[48];
-                    std::snprintf(lbl, sizeof(lbl), "Chart %d", ce.win->instanceId());
-                    ImGui::MenuItem(lbl, nullptr, &ce.win->open());
+                if (ImGui::BeginMenu("IBKR")) {
+                    ImGui::PushItemFlag(ImGuiItemFlags_AutoClosePopups, false);
+                    // Per-instance chart windows
+                    for (auto& ce : g_chartEntries) {
+                        if (!ce.win) continue;
+                        char lbl[64];
+                        const std::string sym = ce.win->getSymbol();
+                        const int gid = ce.win->groupId();
+                        std::snprintf(lbl, sizeof(lbl), "Chart %s %s###chart_menu_%d",
+                            sym.empty() ? "--" : sym.c_str(),
+                            gid > 0 ? ("G" + std::to_string(gid)).c_str() : "G-",
+                            ce.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &ce.win->open());
+                    }
+                    if ((int)g_chartEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New Chart"))
+                            SpawnChartWindow((int)g_chartEntries.size());
+                    }
+                    ImGui::Separator();
+                    // Per-instance trading windows
+                    for (auto& te : g_tradingEntries) {
+                        if (!te.win) continue;
+                        char lbl[64];
+                        const std::string sym = te.win->getSymbol();
+                        const int gid = te.win->groupId();
+                        std::snprintf(lbl, sizeof(lbl), "Order Book %s %s###ob_menu_%d",
+                            sym.empty() ? "--" : sym.c_str(),
+                            gid > 0 ? ("G" + std::to_string(gid)).c_str() : "G-",
+                            te.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &te.win->open());
+                    }
+                    if ((int)g_tradingEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New Order Book"))
+                            SpawnTradingWindow((int)g_tradingEntries.size());
+                    }
+                    ImGui::Separator();
+                    // Per-instance scanner windows
+                    for (auto& se : g_scannerEntries) {
+                        if (!se.win) continue;
+                        char lbl[64];
+                        const int gid = se.win->groupId();
+                        std::snprintf(lbl, sizeof(lbl), "Scanner %s %s###sc_menu_%d",
+                            se.win->getPresetLabel(),
+                            gid > 0 ? ("G" + std::to_string(gid)).c_str() : "G-",
+                            se.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &se.win->open());
+                    }
+                    if ((int)g_scannerEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New Scanner"))
+                            SpawnScannerWindow((int)g_scannerEntries.size());
+                    }
+                    ImGui::Separator();
+                    // Per-instance news windows
+                    for (auto& ne : g_newsEntries) {
+                        if (!ne.win) continue;
+                        char lbl[64];
+                        const char* sym = ne.win->getSymbol();
+                        const int gid = ne.win->groupId();
+                        char grp[8];
+                        if (gid > 0) std::snprintf(grp, sizeof(grp), "G%d", gid);
+                        else         std::strncpy(grp, "G-", sizeof(grp));
+                        std::snprintf(lbl, sizeof(lbl), "News %s %s###news_menu_%d",
+                            sym[0] == '\0' ? "--" : sym, grp, ne.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &ne.win->open());
+                    }
+                    if ((int)g_newsEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New News"))
+                            SpawnNewsWindow((int)g_newsEntries.size());
+                    }
+                    ImGui::Separator();
+                    // Singleton windows
+                    if (g_OrdersWindow)    ImGui::MenuItem("Orders",    nullptr, &g_OrdersWindow->open());
+                    if (g_PortfolioWindow) ImGui::MenuItem("Portfolio", nullptr, &g_PortfolioWindow->open());
+                    ImGui::PopItemFlag();
+                    ImGui::EndMenu();
                 }
-                if ((int)g_chartEntries.size() < kMaxMultiWin) {
-                    if (ImGui::MenuItem("+ New Chart"))
-                        SpawnChartWindow((int)g_chartEntries.size());
-                }
-                ImGui::Separator();
-                // Per-instance trading windows
-                for (auto& te : g_tradingEntries) {
-                    if (!te.win) continue;
-                    char lbl[48];
-                    std::snprintf(lbl, sizeof(lbl), "Order Book %d", te.win->instanceId());
-                    ImGui::MenuItem(lbl, nullptr, &te.win->open());
-                }
-                if ((int)g_tradingEntries.size() < kMaxMultiWin) {
-                    if (ImGui::MenuItem("+ New Order Book"))
-                        SpawnTradingWindow((int)g_tradingEntries.size());
-                }
-                ImGui::Separator();
-                // Per-instance scanner windows
-                for (auto& se : g_scannerEntries) {
-                    if (!se.win) continue;
-                    char lbl[48];
-                    std::snprintf(lbl, sizeof(lbl), "Scanner %d", se.win->instanceId());
-                    ImGui::MenuItem(lbl, nullptr, &se.win->open());
-                }
-                if ((int)g_scannerEntries.size() < kMaxMultiWin) {
-                    if (ImGui::MenuItem("+ New Scanner"))
-                        SpawnScannerWindow((int)g_scannerEntries.size());
-                }
-                ImGui::Separator();
-                // Singleton windows
-                if (g_OrdersWindow)    ImGui::MenuItem("Orders",    nullptr, &g_OrdersWindow->open());
-                if (g_PortfolioWindow) ImGui::MenuItem("Portfolio", nullptr, &g_PortfolioWindow->open());
-                if (g_NewsWindow)      ImGui::MenuItem("News",      nullptr, &g_NewsWindow->open());
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Presets")) {
@@ -2090,6 +2225,8 @@ static void RenderTradingUI() {
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::MenuItem("Settings"))
+                g_settingsOpen = !g_settingsOpen;
 
             // Status indicator
             const std::string& who = g_Login.connectedAs;
@@ -2141,9 +2278,10 @@ static void RenderTradingUI() {
     for (auto& ce : g_chartEntries)   if (ce.win) ce.win->Render();
     for (auto& te : g_tradingEntries) if (te.win) te.win->Render();
     for (auto& se : g_scannerEntries) if (se.win) se.win->Render();
-    if (g_NewsWindow)      g_NewsWindow->Render();
+    for (auto& ne : g_newsEntries)    if (ne.win) ne.win->Render();
     if (g_PortfolioWindow) g_PortfolioWindow->Render();
     if (g_OrdersWindow)    g_OrdersWindow->Render();
+    RenderSettingsWindow();
 }
 
 // ============================================================================
@@ -2207,6 +2345,10 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+
+    // Font sizes are applied via FontGlobalScale at runtime (no atlas rebuild needed)
+    // g_fonts[0..2] unused — scale factors applied in RenderSettingsWindow
+    io.Fonts->AddFontDefault();
 
     // ── Terminal Dark theme ───────────────────────────────────────────────────
     ImGui::StyleColorsDark();
@@ -2317,6 +2459,7 @@ int main(int argc, char* argv[]) {
         c[ImGuiCol_Text]                 = ImVec4(0.902f, 0.929f, 0.953f, 1.000f); // #E6EDF3
         c[ImGuiCol_TextDisabled]         = ImVec4(0.420f, 0.471f, 0.522f, 1.000f); // #6B7885
     }
+    g_baseStyle = ImGui::GetStyle(); // snapshot before any scaling
 
     ImGui_ImplGlfw_InitForVulkan(g_AppWindow, true);
 

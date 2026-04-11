@@ -1,3 +1,4 @@
+#include "ui/UiScale.h"
 #include "ui/windows/TradingWindow.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
@@ -162,8 +163,15 @@ bool TradingWindow::Render() {
     if (!m_open) return false;
 
     ImGui::SetNextWindowSize(ImVec2(1100, 620), ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
-    if (!ImGui::Begin(m_title, &m_open, flags)) {
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+                           | ImGuiWindowFlags_NoFocusOnAppearing;
+    char grp[8];
+    if (m_groupId > 0) std::snprintf(grp, sizeof(grp), "G%d", m_groupId);
+    else                std::strncpy(grp, "G-", sizeof(grp));
+    char title[80];
+    std::snprintf(title, sizeof(title), "Order Book %s %s###trading%d",
+        m_symbol[0] == '\0' ? "--" : m_symbol, grp, m_instanceId);
+    if (!ImGui::Begin(title, &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -184,44 +192,70 @@ bool TradingWindow::Render() {
         }),
         m_domOrders.end());
 
-    float totalW = ImGui::GetContentRegionAvail().x;
-    float totalH = ImGui::GetContentRegionAvail().y;
-    float topH   = totalH * 0.65f;
-    float botH   = totalH - topH - ImGui::GetStyle().ItemSpacing.y;
+    float totalW    = ImGui::GetContentRegionAvail().x;
+    float totalH    = ImGui::GetContentRegionAvail().y;
+    float splitterW = 4.0f;
+    float splitterH = 4.0f;
+    float itemSpX   = ImGui::GetStyle().ItemSpacing.x;
+    float itemSpY   = ImGui::GetStyle().ItemSpacing.y;
 
-    // Guard: if the content area is too small (window being dragged to an edge
-    // or squeezed by the OS), skip rendering child panels this frame.
-    // A BeginChild/BeginTable with zero or negative height corrupts ImGui state.
-    if (topH < 10.f || botH < 10.f) {
+    float topH  = totalH * m_topHeightRatio;
+    float botH  = totalH - topH - splitterH - 2.0f * itemSpY;
+    float bookW = totalW * m_bookWidthRatio;
+    float entryW = totalW - bookW - splitterW - 2.0f * itemSpX;
+
+    // Guard: if the content area is too small, skip rendering this frame.
+    if (topH < 10.f || botH < 10.f || entryW < 10.f) {
         DrawConfirmationPopup();
         ImGui::End();
         return m_open;
     }
 
-    float bookW  = totalW * 0.54f;
-    float entryW = totalW - bookW - ImGui::GetStyle().ItemSpacing.x;
+    ImDrawList* wdl = ImGui::GetWindowDrawList();
 
-    // ---- Top: DOM ladder + order entry side by side -------------------------
-    // NoScrollbar + NoScrollWithMouse on the outer panel so that only the inner
-    // ##dom table (which has ImGuiTableFlags_ScrollY) owns scroll input.
-    // Without this the outer child window competes for mouse capture on every
-    // click, making the entire window appear frozen while the button is held.
+    // ---- Top-left: DOM ladder -----------------------------------------------
     ImGui::BeginChild("##book_panel", ImVec2(bookW, topH), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DrawOrderBook();
     ImGui::EndChild();
 
+    // ---- Vertical splitter (left | right) -----------------------------------
     ImGui::SameLine();
+    ImGui::InvisibleButton("##vsplit", ImVec2(splitterW, topH));
+    if (ImGui::IsItemActive()) {
+        m_bookWidthRatio = std::clamp(
+            m_bookWidthRatio + ImGui::GetIO().MouseDelta.x / totalW, 0.15f, 0.85f);
+    }
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    {
+        ImVec2 p = ImGui::GetItemRectMin(), q = ImGui::GetItemRectMax();
+        wdl->AddRectFilled(p, q,
+            (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ? IM_COL32(160, 160, 160, 255) : IM_COL32(70, 70, 70, 200));
+    }
 
-    // Same rationale as ##book_panel: none of these outer panels need their own
-    // scroll — the inner tables and DOM ladder own scrolling.  Without this flag
-    // ImGui's child-window scroll logic captures the mouse on any click inside
-    // the panel, blocking title-bar drag, tab close, and every other interaction
-    // for as long as the mouse button is held.
+    // ---- Top-right: order entry ---------------------------------------------
+    ImGui::SameLine();
     ImGui::BeginChild("##entry_panel", ImVec2(entryW, topH), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     DrawOrderEntry();
     ImGui::EndChild();
+
+    // ---- Horizontal splitter (top | bottom) ---------------------------------
+    ImGui::InvisibleButton("##hsplit", ImVec2(-1, splitterH));
+    if (ImGui::IsItemActive()) {
+        m_topHeightRatio = std::clamp(
+            m_topHeightRatio + ImGui::GetIO().MouseDelta.y / totalH, 0.15f, 0.85f);
+    }
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    {
+        ImVec2 p = ImGui::GetItemRectMin(), q = ImGui::GetItemRectMax();
+        wdl->AddRectFilled(p, q,
+            (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                ? IM_COL32(160, 160, 160, 255) : IM_COL32(70, 70, 70, 200));
+    }
 
     // ---- Bottom: tabbed ─────────────────────────────────────────────────────
     ImGui::BeginChild("##bottom_panel", ImVec2(-1, botH), ImGuiChildFlags_Borders,
@@ -305,31 +339,38 @@ void TradingWindow::DrawOrderBook() {
     const bool panelHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
 
     // ── Title + last price + click-to-trade toggle ────────────────────────────
+    FlexRow hdr;
+    char domLabel[32];
+    std::snprintf(domLabel, sizeof(domLabel), "DOM  %s", m_symbol);
+    hdr.item(FlexRow::textW(domLabel), 0);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.90f, 1.0f));
-    ImGui::Text("DOM  %s", m_symbol);
+    ImGui::Text("%s", domLabel);
     ImGui::PopStyleColor();
-    ImGui::SameLine(0, 12);
     {
         bool priceUp = (m_midPrice >= m_prevMidPrice);
+        char priceLabel[32];
+        std::snprintf(priceLabel, sizeof(priceLabel), "%s $%.2f",
+                      priceUp ? "^ " : "v ", m_midPrice);
+        hdr.item(FlexRow::textW(priceLabel), 12);
         ImGui::PushStyleColor(ImGuiCol_Text, priceUp ? kBuyGreen : kSellRed);
-        ImGui::Text("%s $%.2f", priceUp ? "▲" : "▼", m_midPrice);
+        ImGui::Text("%s", priceLabel);
         ImGui::PopStyleColor();
     }
-    ImGui::SameLine(0, 20);
+    hdr.item(FlexRow::checkboxW("Click-to-Trade"), 20);
     ImGui::Checkbox("Click-to-Trade", &m_clickToTrade);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "Click any ask row → BUY limit order at that price.\n"
             "Click any bid row → SELL limit order at that price.\n"
             "Uses Quantity and TIF from the Order Entry panel.");
-    ImGui::SameLine(0, 16);
+    hdr.item(FlexRow::textW("Levels:"), 16);
     ImGui::TextDisabled("Levels:");
-    ImGui::SameLine(0, 4);
     {
         static constexpr int  kLadderOptions[] = {5, 10, 15, 20, 25, 30, 40, 50};
         static const char*    kLadderLabels[]  = {"5","10","15","20","25","30","40","50"};
         static constexpr int  kLadderCount = 8;
-        ImGui::SetNextItemWidth(58);
+        hdr.item(em(58), 4);
+        ImGui::SetNextItemWidth(em(58));
         if (ImGui::Combo("##ladder_rows", &m_ladderRowsIdx, kLadderLabels, kLadderCount))
             m_ladderRows = kLadderOptions[m_ladderRowsIdx];
         if (ImGui::IsItemHovered())
@@ -367,17 +408,24 @@ void TradingWindow::DrawOrderBook() {
     // ── NBBO compact bar ──────────────────────────────────────────────────────
     ImGui::Separator();
     if (m_mktDataStatus == SubStatus::Ok) {
+        FlexRow nbbo;
+        char bidBuf[32], askBuf[32];
+        std::snprintf(bidBuf, sizeof(bidBuf), "BID $%.2f x %.0f", m_nbboBid, m_nbboBidSz);
+        std::snprintf(askBuf, sizeof(askBuf), "ASK $%.2f x %.0f", m_nbboAsk, m_nbboAskSz);
+        nbbo.item(FlexRow::textW(bidBuf), 0);
         ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
-        ImGui::Text("BID $%.2f x %.0f", m_nbboBid, m_nbboBidSz);
+        ImGui::TextUnformatted(bidBuf);
         ImGui::PopStyleColor();
-        ImGui::SameLine(0, 20);
+        nbbo.item(FlexRow::textW(askBuf), 20);
         ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
-        ImGui::Text("ASK $%.2f x %.0f", m_nbboAsk, m_nbboAskSz);
+        ImGui::TextUnformatted(askBuf);
         ImGui::PopStyleColor();
         if (m_nbboAsk > 0 && m_nbboBid > 0) {
-            ImGui::SameLine(0, 20);
+            char sprdBuf[24];
+            std::snprintf(sprdBuf, sizeof(sprdBuf), "sprd $%.2f", m_nbboAsk - m_nbboBid);
+            nbbo.item(FlexRow::textW(sprdBuf), 20);
             ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-            ImGui::Text("sprd $%.2f", m_nbboAsk - m_nbboBid);
+            ImGui::TextUnformatted(sprdBuf);
             ImGui::PopStyleColor();
         }
     } else {
@@ -731,39 +779,48 @@ void TradingWindow::DrawOrderBook() {
 // Draw — Order Entry
 // ============================================================================
 void TradingWindow::DrawOrderEntry() {
-    // ---- Symbol row ---------------------------------------------------------
-    core::DrawGroupPicker(m_groupId, "##trading_grp");
-    ImGui::SameLine(0, 8);
-    ImGui::Text("Symbol");
-    ImGui::SameLine(75);
-    ImGui::SetNextItemWidth(72);
-    bool symEntered = ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
-                                       ImGuiInputTextFlags_CharsUppercase |
-                                       ImGuiInputTextFlags_EnterReturnsTrue);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Type a symbol and press Enter to subscribe");
-    if (symEntered && m_symbol[0] != '\0') {
-        // Clear stale book data for the old symbol
-        m_bids.clear();
-        m_asks.clear();
-        m_volAtPrice.clear();
-        m_maxVolAtPrice  = 1.0;
-        m_maxDepthSize   = 1.0;
-        m_nbboBid        = 0.0;
-        m_nbboAsk        = 0.0;
-        m_nbboBidSz      = 0.0;
-        m_nbboAskSz      = 0.0;
-        m_midPrice       = 0.0;
-        m_prevMidPrice   = 0.0;
-        m_mktDataStatus  = SubStatus::Unknown;
-        m_depthStatus    = SubStatus::Unknown;
-        if (OnSymbolChanged) OnSymbolChanged(m_symbol);
-    }
+    // Label column width scales with font so labels never overflow their column
+    const float labelCol = em(75);
+    const float btnW     = em(62);
+    const float btnH     = em(22);
 
-    ImGui::SameLine(0, 8);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.65f, 1.0f));
-    ImGui::Text("Mid: $%.2f", m_midPrice);
-    ImGui::PopStyleColor();
+    // ---- Symbol row ---------------------------------------------------------
+    {
+        FlexRow row;
+        row.item(FlexRow::buttonW("G1"), 0);
+        core::DrawGroupPicker(m_groupId, "##trading_grp");
+        row.item(FlexRow::textW("Symbol"), 8);
+        ImGui::Text("Symbol");
+        row.item(em(72), 6);
+        ImGui::SetNextItemWidth(em(72));
+        bool symEntered = ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
+                                           ImGuiInputTextFlags_CharsUppercase |
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Type a symbol and press Enter to subscribe");
+        if (symEntered && m_symbol[0] != '\0') {
+            m_bids.clear();
+            m_asks.clear();
+            m_volAtPrice.clear();
+            m_maxVolAtPrice  = 1.0;
+            m_maxDepthSize   = 1.0;
+            m_nbboBid        = 0.0;
+            m_nbboAsk        = 0.0;
+            m_nbboBidSz      = 0.0;
+            m_nbboAskSz      = 0.0;
+            m_midPrice       = 0.0;
+            m_prevMidPrice   = 0.0;
+            m_mktDataStatus  = SubStatus::Unknown;
+            m_depthStatus    = SubStatus::Unknown;
+            if (OnSymbolChanged) OnSymbolChanged(m_symbol);
+        }
+        char midBuf[24];
+        std::snprintf(midBuf, sizeof(midBuf), "Mid: $%.2f", m_midPrice);
+        row.item(FlexRow::textW(midBuf), 8);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.65f, 1.0f));
+        ImGui::TextUnformatted(midBuf);
+        ImGui::PopStyleColor();
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -775,7 +832,7 @@ void TradingWindow::DrawOrderEntry() {
         isBuy ? ImVec4(0.12f, 0.60f, 0.28f, 1.0f) : ImVec4(0.25f, 0.25f, 0.28f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         isBuy ? ImVec4(0.20f, 0.75f, 0.38f, 1.0f) : ImVec4(0.35f, 0.35f, 0.38f, 1.0f));
-    if (ImGui::Button("  BUY  ", ImVec2(80, 28))) m_sideIdx = 0;
+    if (ImGui::Button("  BUY  ", ImVec2(btnW, btnH))) m_sideIdx = 0;
     ImGui::PopStyleColor(2);
 
     ImGui::SameLine();
@@ -784,7 +841,7 @@ void TradingWindow::DrawOrderEntry() {
         !isBuy ? ImVec4(0.68f, 0.18f, 0.18f, 1.0f) : ImVec4(0.25f, 0.25f, 0.28f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
         !isBuy ? ImVec4(0.85f, 0.25f, 0.25f, 1.0f) : ImVec4(0.35f, 0.35f, 0.38f, 1.0f));
-    if (ImGui::Button("  SELL  ", ImVec2(80, 28))) m_sideIdx = 1;
+    if (ImGui::Button("  SELL  ", ImVec2(btnW, btnH))) m_sideIdx = 1;
     ImGui::PopStyleColor(2);
 
     ImGui::Spacing();
@@ -792,14 +849,14 @@ void TradingWindow::DrawOrderEntry() {
     // ---- Order Type ---------------------------------------------------------
     const char* types[] = {"Market", "Limit", "Stop", "Stop Limit"};
     ImGui::Text("Type");
-    ImGui::SameLine(75);
-    ImGui::SetNextItemWidth(130);
+    ImGui::SameLine(labelCol);
+    ImGui::SetNextItemWidth(em(130));
     ImGui::Combo("##type", &m_typeIdx, types, IM_ARRAYSIZE(types));
 
     // ---- Quantity -----------------------------------------------------------
     ImGui::Text("Quantity");
-    ImGui::SameLine(75);
-    ImGui::SetNextItemWidth(100);
+    ImGui::SameLine(labelCol);
+    ImGui::SetNextItemWidth(em(100));
     ImGui::InputText("##qty", m_qtyBuf, sizeof(m_qtyBuf),
                      ImGuiInputTextFlags_CharsDecimal);
 
@@ -807,12 +864,11 @@ void TradingWindow::DrawOrderEntry() {
     bool needsLimit = (m_typeIdx == 1 || m_typeIdx == 3);
     if (needsLimit) {
         ImGui::Text("Lmt Price");
-        ImGui::SameLine(75);
-        ImGui::SetNextItemWidth(100);
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
         ImGui::InputText("##lmt", m_lmtBuf, sizeof(m_lmtBuf),
                          ImGuiInputTextFlags_CharsDecimal);
         ImGui::SameLine();
-        // Quick-fill from book
         if (ImGui::SmallButton(isBuy ? "Ask" : "Bid")) {
             double fillPrice = isBuy ? (m_asks.empty() ? m_midPrice : m_asks[0].price)
                                      : (m_bids.empty() ? m_midPrice : m_bids[0].price);
@@ -825,8 +881,8 @@ void TradingWindow::DrawOrderEntry() {
     bool needsStop  = (m_typeIdx == 2 || m_typeIdx == 3);
     if (needsStop) {
         ImGui::Text("Stp Price");
-        ImGui::SameLine(75);
-        ImGui::SetNextItemWidth(100);
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
         ImGui::InputText("##stp", m_stpBuf, sizeof(m_stpBuf),
                          ImGuiInputTextFlags_CharsDecimal);
     }
@@ -834,8 +890,8 @@ void TradingWindow::DrawOrderEntry() {
     // ---- Time In Force ------------------------------------------------------
     const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
     ImGui::Text("TIF");
-    ImGui::SameLine(75);
-    ImGui::SetNextItemWidth(80);
+    ImGui::SameLine(labelCol);
+    ImGui::SetNextItemWidth(em(80));
     ImGui::Combo("##tif", &m_tifIdx, tifs, IM_ARRAYSIZE(tifs));
 
     // ---- Outside RTH --------------------------------------------------------
@@ -888,8 +944,8 @@ void TradingWindow::DrawOrderEntry() {
                   types[m_typeIdx], qty,
                   m_typeIdx == 0 ? "MKT" : m_lmtBuf);
 
-    float btnW = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button(submitLabel, ImVec2(btnW, 32))) {
+    float submitW = ImGui::GetContentRegionAvail().x;
+    if (ImGui::Button(submitLabel, ImVec2(submitW, em(25)))) {
         std::string err;
         if (ValidateOrder(err))
             m_showConfirm = true;
