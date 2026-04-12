@@ -517,40 +517,78 @@ void PortfolioWindow::DrawEquityCurve()
 
     // Build arrays for ImPlot
     std::vector<double> xs(n), equity(n), cash(n), pos(n);
+    double yMin = m_equityCurve[0].equity;
+    double yMax = m_equityCurve[0].equity;
     for (int i = 0; i < n; ++i) {
         xs[i]     = static_cast<double>(m_equityCurve[i].date);
         equity[i] = m_equityCurve[i].equity;
         cash[i]   = m_equityCurve[i].cash;
         pos[i]    = m_equityCurve[i].positions;
+        if (equity[i] < yMin) yMin = equity[i];
+        if (equity[i] > yMax) yMax = equity[i];
+    }
+
+    // Pad Y axis so a flat line is still visible.
+    // Use 10% of the range when there is variance; fall back to 0.1% of the
+    // absolute value (minimum $1) when all samples are identical.
+    {
+        double range = yMax - yMin;
+        double pad   = (range > 1e-6) ? range * 0.10 : yMax * 0.001;
+        if (pad < 1.0) pad = 1.0;
+        yMin -= pad;
+        yMax += pad;
     }
 
     ImPlot::PushStyleVar(ImPlotStyleVar_PlotPadding, ImVec2(6, 6));
-    ImPlotFlags pf = ImPlotFlags_NoMenus;
+    ImPlotFlags     pf  = ImPlotFlags_NoMenus;
     ImPlotAxisFlags xaf = ImPlotAxisFlags_AutoFit;
-    ImPlotAxisFlags yaf = ImPlotAxisFlags_AutoFit;
 
     float h = ImGui::GetContentRegionAvail().y;
-    if (ImPlot::BeginPlot("Equity Curve (90d)", ImVec2(-1, h), pf)) {
-        ImPlot::SetupAxes("Date", "USD", xaf, yaf);
+    if (ImPlot::BeginPlot("Equity Curve##ec", ImVec2(-1, h), pf)) {
+        ImPlot::SetupAxes("Time", nullptr, xaf, ImPlotAxisFlags_None);
         ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Time);
         ImPlot::SetupAxisFormat(ImAxis_Y1, "$%.0f");
+        // Apply the padded range so the curve is visible even when flat
+        ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImPlotCond_Always);
 
-        // Shaded area: positions stack
-        ImPlot::PushStyleColor(ImPlotCol_Fill, ImVec4(0.2f, 0.6f, 0.2f, 0.25f));
-        ImPlot::PlotShaded("Positions", xs.data(), pos.data(), n, 0.0);
-        ImPlot::PopStyleColor();
+        if (n == 1) {
+            // Single data point — PlotLine draws nothing with n=1.
+            // Show a horizontal reference line at the current equity value
+            // so the user sees something meaningful straight after connect.
+            double yVal = equity[0];
+            ImPlot::SetupAxisLimits(ImAxis_X1,
+                xs[0] - 60.0, xs[0] + 60.0, ImPlotCond_Always);
 
-        // Shaded area: equity above positions (cash layer)
-        ImPlot::PushStyleColor(ImPlotCol_Fill, ImVec4(0.2f, 0.4f, 0.8f, 0.15f));
-        ImPlot::PlotShaded("Cash", xs.data(), equity.data(), pos.data(), n);
-        ImPlot::PopStyleColor();
+            ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(0.4f, 0.8f, 1.0f, 0.7f));
+            ImPlot::PlotInfLines("##ref", &yVal, 1, ImPlotInfLinesFlags_Horizontal);
+            ImPlot::PopStyleColor();
 
-        // Equity line
-        ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
-        ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 2.0f);
-        ImPlot::PlotLine("Total Equity", xs.data(), equity.data(), n);
-        ImPlot::PopStyleVar();
-        ImPlot::PopStyleColor();
+            // Annotate with the equity value
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), " $%.0f", yVal);
+            ImPlot::Annotation(xs[0], yVal, ImVec4(0,0,0,0), ImVec2(4,-8), true, "%s", lbl);
+
+            ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(0.7f, 0.7f, 0.7f, 0.5f));
+            ImPlot::TagY(yVal, ImVec4(0.15f, 0.35f, 0.6f, 1.f), "$%.0f", yVal);
+            ImPlot::PopStyleColor();
+        } else {
+            // Shaded area: positions stack
+            ImPlot::PushStyleColor(ImPlotCol_Fill, ImVec4(0.2f, 0.6f, 0.2f, 0.25f));
+            ImPlot::PlotShaded("Positions", xs.data(), pos.data(), n, 0.0);
+            ImPlot::PopStyleColor();
+
+            // Shaded area: equity above positions (cash layer)
+            ImPlot::PushStyleColor(ImPlotCol_Fill, ImVec4(0.2f, 0.4f, 0.8f, 0.15f));
+            ImPlot::PlotShaded("Cash", xs.data(), equity.data(), pos.data(), n);
+            ImPlot::PopStyleColor();
+
+            // Equity line
+            ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
+            ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 2.0f);
+            ImPlot::PlotLine("Total Equity", xs.data(), equity.data(), n);
+            ImPlot::PopStyleVar();
+            ImPlot::PopStyleColor();
+        }
 
         ImPlot::EndPlot();
     }
@@ -563,144 +601,144 @@ void PortfolioWindow::DrawEquityCurve()
 
 void PortfolioWindow::DrawAllocationDonut()
 {
-    if (m_positions.empty()) return;
+    const bool hasCash = m_account.totalCashValue > 1e-9;
+    if (!hasCash && m_positions.empty()) return;
 
     ImGui::TextDisabled("Portfolio Allocation");
 
     ImVec2 avail    = ImGui::GetContentRegionAvail();
     float  diameter = std::min(avail.x * 0.45f, avail.y - 4.f);
     if (diameter < 20.f) return;
-    float radius    = diameter * 0.5f;
-    float innerR    = radius * 0.52f;  // donut hole
+    float  radius = diameter * 0.5f;
+    float  innerR = radius * 0.52f;
 
-    ImVec2 canvasPos = ImGui::GetCursorScreenPos();
-    ImVec2 center    = ImVec2(canvasPos.x + radius + 4, canvasPos.y + radius);
+    ImVec2     canvasPos = ImGui::GetCursorScreenPos();
+    ImVec2     center    = {canvasPos.x + radius + 4, canvasPos.y + radius};
+    ImDrawList* dl       = ImGui::GetWindowDrawList();
 
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Palette
-    static const ImVec4 kPalette[] = {
-        {0.26f,0.63f,0.96f,1.f}, {0.18f,0.80f,0.44f,1.f},
-        {0.95f,0.61f,0.07f,1.f}, {0.91f,0.30f,0.24f,1.f},
-        {0.61f,0.35f,0.71f,1.f}, {0.17f,0.76f,0.76f,1.f},
-        {0.90f,0.49f,0.13f,1.f}, {0.45f,0.47f,0.51f,1.f},
+    // ── Colour palette ────────────────────────────────────────────────────────
+    // Cash always gets gold; equities cycle through the rest.
+    static const ImVec4 kCashColor  = {0.92f, 0.78f, 0.20f, 1.f};
+    static const ImVec4 kPalette[]  = {
+        {0.26f, 0.63f, 0.96f, 1.f},   // blue
+        {0.18f, 0.80f, 0.44f, 1.f},   // green
+        {0.91f, 0.30f, 0.24f, 1.f},   // red
+        {0.61f, 0.35f, 0.71f, 1.f},   // purple
+        {0.17f, 0.76f, 0.76f, 1.f},   // teal
+        {0.95f, 0.61f, 0.07f, 1.f},   // orange
+        {0.90f, 0.49f, 0.13f, 1.f},   // amber
+        {0.45f, 0.47f, 0.51f, 1.f},   // grey
     };
     int nPal = static_cast<int>(std::size(kPalette));
 
-    // Compute total weight
-    double totalW = 0.0;
-    for (auto& p : m_positions) totalW += std::abs(p.portfolioWeight);
-    if (totalW < 1e-9) totalW = 1.0;
+    // ── Build slice list ──────────────────────────────────────────────────────
+    struct Slice {
+        std::string            label;
+        double                 value;   // absolute dollar amount
+        ImVec4                 color;
+        const core::Position*  pos;     // nullptr for cash slice
+    };
+    std::vector<Slice> slices;
 
-    // Draw segments
-    float startAngle = -M_PI * 0.5f; // start at 12 o'clock
-    int   hovered    = -1;
-    ImVec2 mousePos  = ImGui::GetMousePos();
-    float  mx        = mousePos.x - center.x;
-    float  my        = mousePos.y - center.y;
-    float  mouseDist = std::sqrt(mx*mx + my*my);
-    float  mouseAngle = std::atan2(my, mx);
+    // Cash first — label is the base currency code (USD / EUR / …)
+    if (hasCash) {
+        std::string lbl = m_account.baseCurrency.empty() ? "Cash"
+                                                         : m_account.baseCurrency;
+        slices.push_back({lbl, m_account.totalCashValue, kCashColor, nullptr});
+    }
 
-    for (int i = 0; i < static_cast<int>(m_positions.size()); ++i) {
-        const core::Position& p = m_positions[i];
-        float sweep = static_cast<float>(
-            std::abs(p.portfolioWeight) / totalW * 2.0 * M_PI);
+    // One slice per position, cycling the palette
+    for (int i = 0; i < (int)m_positions.size(); ++i) {
+        const auto& p = m_positions[i];
+        if (std::abs(p.marketValue) < 1e-9) continue;
+        slices.push_back({p.symbol, std::abs(p.marketValue),
+                          kPalette[i % nPal], &p});
+    }
 
+    if (slices.empty()) return;
+
+    double total = 0.0;
+    for (auto& s : slices) total += s.value;
+    if (total < 1e-9) return;
+
+    // ── Draw segments ─────────────────────────────────────────────────────────
+    float  startAngle  = -M_PI * 0.5f;   // 12 o'clock
+    int    hoveredIdx  = -1;
+    ImVec2 mousePos    = ImGui::GetMousePos();
+    float  mx          = mousePos.x - center.x;
+    float  my          = mousePos.y - center.y;
+    float  mouseDist   = std::sqrt(mx * mx + my * my);
+    float  mouseAngle  = std::atan2(my, mx);
+
+    for (int i = 0; i < (int)slices.size(); ++i) {
+        float sweep    = (float)(slices[i].value / total * 2.0 * M_PI);
         float endAngle = startAngle + sweep;
 
-        // Check hover
+        // Hover
         if (mouseDist >= innerR && mouseDist <= radius + 4) {
-            float a = mouseAngle;
-            if (a < startAngle) a += 2.f * M_PI;
-            float e = endAngle;
-            if (e < startAngle) e += 2.f * M_PI;
-            float s = startAngle;
-            if (a >= s && a <= e) hovered = i;
+            float a = mouseAngle, s = startAngle, e = endAngle;
+            if (a < s) a += 2.f * M_PI;
+            if (e < s) e += 2.f * M_PI;
+            if (a >= s && a <= e) hoveredIdx = i;
         }
 
-        ImVec4 col4 = kPalette[i % nPal];
-        float  rOuter = (i == hovered) ? radius + 5 : radius;
+        float  rOuter = (i == hoveredIdx) ? radius + 5.f : radius;
+        ImU32  col    = ImGui::ColorConvertFloat4ToU32(slices[i].color);
+        int    kSegs  = std::max(4, (int)(sweep * 20.f));
+        float  dA     = sweep / kSegs;
 
-        // Draw arc as filled segments (approximate with triangles)
-        const int kSegs = std::max(4, static_cast<int>(sweep * 20.f));
-        float dA = sweep / kSegs;
-        for (int s = 0; s < kSegs; ++s) {
-            float a0 = startAngle + s * dA;
-            float a1 = a0 + dA;
-
-            ImVec2 p0 = center;
-            ImVec2 p1 = ImVec2(center.x + std::cos(a0) * innerR,
-                               center.y + std::sin(a0) * innerR);
-            ImVec2 p2 = ImVec2(center.x + std::cos(a1) * innerR,
-                               center.y + std::sin(a1) * innerR);
-            ImVec2 p3 = ImVec2(center.x + std::cos(a1) * rOuter,
-                               center.y + std::sin(a1) * rOuter);
-            ImVec2 p4 = ImVec2(center.x + std::cos(a0) * rOuter,
-                               center.y + std::sin(a0) * rOuter);
-
-            ImU32 c = ImGui::ColorConvertFloat4ToU32(col4);
-            dl->AddQuadFilled(p1, p2, p3, p4, c);
-            (void)p0;
+        for (int seg = 0; seg < kSegs; ++seg) {
+            float a0 = startAngle + seg * dA, a1 = a0 + dA;
+            ImVec2 p1{center.x + std::cos(a0) * innerR,  center.y + std::sin(a0) * innerR};
+            ImVec2 p2{center.x + std::cos(a1) * innerR,  center.y + std::sin(a1) * innerR};
+            ImVec2 p3{center.x + std::cos(a1) * rOuter,  center.y + std::sin(a1) * rOuter};
+            ImVec2 p4{center.x + std::cos(a0) * rOuter,  center.y + std::sin(a0) * rOuter};
+            dl->AddQuadFilled(p1, p2, p3, p4, col);
         }
 
         // Gap line between segments
-        dl->AddLine(
-            ImVec2(center.x + std::cos(startAngle) * innerR,
-                   center.y + std::sin(startAngle) * innerR),
-            ImVec2(center.x + std::cos(startAngle) * radius,
-                   center.y + std::sin(startAngle) * radius),
-            IM_COL32(10,10,12,255), 1.5f);
+        dl->AddLine({center.x + std::cos(startAngle) * innerR,
+                     center.y + std::sin(startAngle) * innerR},
+                    {center.x + std::cos(startAngle) * radius,
+                     center.y + std::sin(startAngle) * radius},
+                    IM_COL32(10, 10, 12, 255), 1.5f);
 
         startAngle = endAngle;
     }
 
-    // Center label
-    {
-        char buf1[32], buf2[32];
-        std::snprintf(buf1, sizeof(buf1), "%s%s",
-                      CurrSym(m_account.baseCurrency),
-                      FmtDollar(m_account.netLiquidation).c_str());
-        std::snprintf(buf2, sizeof(buf2), "Net Liq");
-        ImVec2 sz1 = ImGui::CalcTextSize(buf1);
-        ImVec2 sz2 = ImGui::CalcTextSize(buf2);
-        dl->AddText(ImVec2(center.x - sz1.x * 0.5f, center.y - sz1.y - 1),
-                    IM_COL32(220,220,220,255), buf1);
-        dl->AddText(ImVec2(center.x - sz2.x * 0.5f, center.y + 1),
-                    IM_COL32(160,160,160,255), buf2);
-    }
-
-    // Hover tooltip
-    if (hovered >= 0) {
-        const core::Position& hp = m_positions[hovered];
+    // ── Hover tooltip ─────────────────────────────────────────────────────────
+    if (hoveredIdx >= 0) {
+        const Slice& hs  = slices[hoveredIdx];
+        double       pct = hs.value / total * 100.0;
+        const char*  cs  = CurrSym(m_account.baseCurrency);
         ImGui::BeginTooltip();
-        ImGui::Text("%s — %.1f%%", hp.symbol.c_str(), hp.portfolioWeight * 100.0);
-        ImGui::Text("Mkt Value: %s%s", CurrSym(m_account.baseCurrency), FmtDollar(hp.marketValue).c_str());
-        ImGui::TextColored(PnLColor(hp.unrealizedPnL),
-                           "Unreal P&L: %s%s%s",
-                           hp.unrealizedPnL >= 0 ? "+" : "-",
-                           CurrSym(m_account.baseCurrency),
-                           FmtDollar(std::abs(hp.unrealizedPnL)).c_str());
+        ImGui::Text("%s  %.1f%%", hs.label.c_str(), pct);
+        ImGui::Text("Value: %s%s", cs, FmtDollar(hs.value).c_str());
+        if (hs.pos) {
+            ImGui::TextColored(PnLColor(hs.pos->unrealizedPnL),
+                "Unreal P&L: %s%s%s",
+                hs.pos->unrealizedPnL >= 0 ? "+" : "-",
+                cs, FmtDollar(std::abs(hs.pos->unrealizedPnL)).c_str());
+        }
         ImGui::EndTooltip();
     }
 
-    // Legend to the right of donut
+    // ── Legend ────────────────────────────────────────────────────────────────
     float legendX = canvasPos.x + diameter + 12.f;
     float legendY = canvasPos.y;
     float lineH   = ImGui::GetTextLineHeightWithSpacing();
 
-    for (int i = 0; i < static_cast<int>(m_positions.size()); ++i) {
-        const core::Position& p = m_positions[i];
-        ImVec4 col4 = kPalette[i % nPal];
-        ImU32  c    = ImGui::ColorConvertFloat4ToU32(col4);
-        dl->AddRectFilled(ImVec2(legendX, legendY + 3),
-                          ImVec2(legendX + 10, legendY + 13), c, 2.f);
+    for (int i = 0; i < (int)slices.size(); ++i) {
+        ImU32 c = ImGui::ColorConvertFloat4ToU32(slices[i].color);
+        dl->AddRectFilled({legendX,      legendY + 3},
+                          {legendX + 10, legendY + 13}, c, 2.f);
 
         char legBuf[48];
         std::snprintf(legBuf, sizeof(legBuf), "%s  %.1f%%",
-                      p.symbol.c_str(), p.portfolioWeight * 100.0);
-        dl->AddText(ImVec2(legendX + 14, legendY),
-                    i == hovered ? IM_COL32(255,255,180,255)
-                                 : IM_COL32(200,200,200,255),
+                      slices[i].label.c_str(), slices[i].value / total * 100.0);
+        dl->AddText({legendX + 14, legendY},
+                    i == hoveredIdx ? IM_COL32(255, 255, 180, 255)
+                                    : IM_COL32(200, 200, 200, 255),
                     legBuf);
         legendY += lineH;
     }

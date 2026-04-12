@@ -51,6 +51,8 @@ public:
     void SetSymbol(const std::string& symbol, double midPrice);
     void UpdateMidPrice(double price);
     void SetNextOrderId(int id);
+    // Inject position from IB portfolio data (qty>0 long, <0 short, 0 flat)
+    void SetPosition(double qty, double avgCost);
 
     std::function<void(int orderId, const std::string& sym,
                        const std::string& action,
@@ -86,6 +88,10 @@ private:
     double m_midPrice     = 0.0;
     double m_prevMidPrice = 0.0;
 
+    // ── Position tracking (updated from OnFill) ──────────────────────────────
+    double m_positionQty   = 0.0;   // + = long, - = short, 0 = flat
+    double m_avgEntryPrice = 0.0;
+
     // ── Order Book (Level II) ────────────────────────────────────────────────
     static constexpr int kDepthLevels = 50;
     std::vector<core::DepthLevel> m_asks;
@@ -99,6 +105,7 @@ private:
 
     // ── Click-to-trade ───────────────────────────────────────────────────────
     bool m_clickToTrade  = false;
+    bool m_expandSpread  = true;    // show individual tick rows inside the spread
     int  m_ladderRows    = 25;    // virtual price levels above ask / below bid
     int  m_ladderRowsIdx = 4;     // index into kLadderOptions[] — default 25 (index 4)
 

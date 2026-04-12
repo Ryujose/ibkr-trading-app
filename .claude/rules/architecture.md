@@ -9,6 +9,7 @@
 │   │   └── models/           # Data models: MarketData.h, NewsData.h, ScannerData.h,
 │   │                         #   PortfolioData.h, OrderData.h, WindowGroup.h
 │   ├── ui/
+│   │   ├── UiScale.h         # em() font-scale helper + FlexRow CSS-flex-wrap struct
 │   │   └── windows/          # One .h/.cpp pair per window
 │   ├── bid_stubs/            # bid_stubs.c — Intel BID64 double bit-cast
 │   └── main.cpp              # Vulkan/GLFW init, login state machine, top-level UI dispatch
@@ -42,25 +43,79 @@
 
 ## Multi-Instance Windows
 
-Chart, Order Book (Trading), and Scanner support up to 4 simultaneous instances each.
-Singleton windows (News, Portfolio, Orders) have one instance.
+Chart, Order Book (Trading), Scanner, and News support up to **10 simultaneous instances** each.
+Singleton windows (Portfolio, Orders) have one instance.
+
+`kMaxMultiWin = 10` in `main.cpp`.
 
 Entry structs in `main.cpp` hold per-instance state:
 ```cpp
 struct ChartEntry   { ui::ChartWindow* win; int histId, extId, mktId; core::BarSeries pendingBars, pendingExtBars; };
 struct TradingEntry { ui::TradingWindow* win; int depthId, mktId; double nbboBid, nbboAsk, ...; };
 struct ScannerEntry { ui::ScannerWindow* win; int scanBase, activeScanId, mktBase; ... };
+struct NewsEntry    { ui::NewsWindow* win; int nextArtReqId, artEnd;
+                      std::unordered_map<int,int> artReqToItemId;
+                      std::unordered_map<int,bool> newsConIdFired; };
 ```
 
-Vectors: `g_chartEntries`, `g_tradingEntries`, `g_scannerEntries` (max 4 each).
+Vectors: `g_chartEntries`, `g_tradingEntries`, `g_scannerEntries`, `g_newsEntries` (max 10 each).
 
-Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScannerWindow(idx)` — create the window, wire all callbacks with `idx` capture, push to the vector.
+Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScannerWindow(idx)`, `SpawnNewsWindow(idx)` — create the window, wire all callbacks with `idx` capture, push to the vector.
 
-**ReqId layout (no overlaps):**
-- Chart hist: 1,3,5,7 · ext: 2,4,6,8 · mkt: 100-103
-- Trading mkt: 110-113 · depth: 120-123
-- Scanner scan: 1000,1100,1200,1300 (+99 each) · mkt: 800,812,824,836 (+12 each)
-- News: 201(RT), 400-420, 500-520, 600-699, 700-759 · Account: 900
+**ReqId layout (no overlaps, 10 instances each):**
+- Chart hist: 1,3,5,7,9,11,13,15,17,19 · ext: 2,4,6,8,10,12,14,16,18,20 · mkt: 100-109
+- Trading mkt: 110-119 · depth: 120-129
+- Scanner scan: 1000,1100,...,1900 (+99 each) · mkt: 800,812,...,908 (+12 each)
+- News stock conId: 2000-2009 · port conId: 2010-2199 · hist stock: 2210-2219 · hist port: 2220-2399
+- News articles: 2500-3499 (100 per instance) · hist market: 3500-3599 · market conId: 3600-3699
+- Account: 900
+
+## UiScale — Responsive Toolbar Helpers
+
+`src/ui/UiScale.h` provides two tools for font-scale-aware responsive layout:
+
+```cpp
+// Convert design-time px (authored at 13 px base font) to scaled value
+inline float em(float px) { return px * ImGui::GetFontSize() / 13.0f; }
+```
+
+Use `em()` everywhere a pixel width or height is hardcoded for a widget:
+```cpp
+ImGui::SetNextItemWidth(em(80));   // scales with font size
+ImGui::Button("OK", ImVec2(em(62), em(22)));
+```
+
+```cpp
+struct FlexRow { ... };
+```
+
+`FlexRow` is a CSS `flex-wrap: wrap` equivalent for ImGui toolbars. Call `row.item(width)` **before** each widget — it calls `SameLine()` only if the item fits on the current line, otherwise wraps to the next line. Static helpers `buttonW`, `checkboxW`, `textW` estimate item widths from `CalcTextSize`.
+
+All window toolbars use `FlexRow` so items wrap rather than overflow when the window is narrow.
+
+## Settings
+
+`main.cpp` globals for font size settings:
+```cpp
+enum class FontSize { Small = 0, Medium = 1, Large = 2 };
+static FontSize       g_fontSize     = FontSize::Medium;
+static bool           g_settingsOpen = false;
+static constexpr float kFontScales[] = { 0.85f, 1.0f, 1.5f };
+static ImGuiStyle     g_baseStyle;   // saved once after style setup
+```
+
+`RenderSettingsWindow()` renders a floating panel with Small/Medium/Large radio buttons.
+On change: sets `io.FontGlobalScale`, restores `g_baseStyle`, then calls `ScaleAllSizes(scale)`.
+`g_baseStyle` must be saved *before* any `ScaleAllSizes` call to prevent compounding.
+
+## Windows Menu
+
+`Windows → IBKR → <instance list>` submenu hierarchy.
+`ImGuiItemFlags_AutoClosePopups = false` is pushed inside the IBKR submenu so clicking window toggles or "+ New" buttons does not close the menu.
+`ImGuiWindowFlags_NoFocusOnAppearing` on all windows prevents newly shown windows from stealing focus and collapsing the menu.
+
+Window title format: `"<Type> <Symbol> <Group>###<type><id>"` (e.g. `"Chart AAPL G1###chart0"`).
+The `###` triple-hash gives ImGui a stable identity while the display label changes every frame.
 
 ## IBKRUtils
 
@@ -109,7 +164,16 @@ public:
 - Guard: `g_groupSyncInProgress` prevents re-entrant loops
 - For chart entries: calls `win->SetSymbol(sym)` → fires `OnDataRequest` → `ReqChartData`
 - For trading entries: calls `ApplyTradingSymbol(te, sym)` — updates display AND re-subscribes IB mkt data + depth
-- For News window: calls `win->SetSymbol(sym)` → switches to Stock tab
+- For news entries: calls `win->SetSymbol(sym)` → switches to Stock tab
 
-Default group assignment: instance N → group N (e.g. Chart 1 / Order Book 1 / Scanner 1 all start in G1).
+Default group assignment: instance N → group N (e.g. Chart 1 / Order Book 1 / Scanner 1 / News 1 all start in G1).
 Group picker button (`G1`–`G4` / `G-`) is the leftmost item in every window's toolbar.
+
+## TradingWindow Layout
+
+Three panels with user-draggable splitters:
+- **Top-left**: DOM ladder (`DrawOrderBook`) — width controlled by `m_bookWidthRatio` (default 0.54)
+- **Top-right**: Order entry (`DrawOrderEntry`) — takes remaining top width
+- **Bottom**: Tabbed panel (Open Orders / Execution Log / Time & Sales) — height controlled by `m_topHeightRatio` (default 0.65)
+
+Splitters are 4px `InvisibleButton` widgets; dragging updates the ratio stored on the window instance. Resize cursors (`ResizeEW` / `ResizeNS`) shown on hover.

@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/jose-luis-guerra-infante/git/cplusplusprojects/ibkr-trading-app/.claude/hooks/doc-reminder.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
