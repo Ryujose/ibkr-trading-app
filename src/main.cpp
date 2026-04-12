@@ -483,7 +483,13 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 // Update a trading entry's displayed symbol AND re-subscribe IB market data + depth.
 // Used both from BroadcastGroupSymbol and from OnSymbolChanged so the logic is in one place.
 static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
-    if (te.win) te.win->SetSymbol(sym, 0.0);
+    if (te.win) {
+        te.win->SetSymbol(sym, 0.0);
+        // Re-inject position from portfolio cache for the new symbol
+        auto it = g_positions.find(sym);
+        if (it != g_positions.end())
+            te.win->SetPosition(it->second.quantity, it->second.avgCost);
+    }
     if (!g_IBClient) return;
     g_IBClient->CancelMarketData(te.mktId);
     g_IBClient->CancelMktDepth(te.depthId);
@@ -746,6 +752,10 @@ static void SpawnNewsWindow(int idx) {
     e.win->SetPortNewsReqIdBase(NewsHistPort(idx));
     e.win->SetMktNewsReqIdBase(NewsHistMkt(idx));
 
+    e.win->OnSymbolChanged = [idx](const std::string& sym) {
+        if (idx < (int)g_newsEntries.size() && g_newsEntries[idx].win)
+            BroadcastGroupSymbol(g_newsEntries[idx].win->groupId(), sym);
+    };
     e.win->OnStockNewsRequested = [idx](const std::string& symbol) {
         if (g_IBClient && g_IBClient->IsConnected())
             g_IBClient->ReqContractDetails(NewsStockConId(idx), symbol);
@@ -1171,6 +1181,10 @@ static void WireIBCallbacks() {
         if (g_PortfolioWindow) g_PortfolioWindow->OnPositionUpdate(pos);
         g_positions[pos.symbol] = pos;
         UpdateAllChartPositions();
+        // Keep order book windows in sync with live position data
+        for (auto& te : g_tradingEntries)
+            if (te.win && te.win->getSymbol() == pos.symbol)
+                te.win->SetPosition(pos.quantity, pos.avgCost);
     };
 
     // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
@@ -1203,7 +1217,7 @@ static void WireIBCallbacks() {
     // ── Fills ─────────────────────────────────────────────────────────────
     g_IBClient->onFillReceived = [](const core::Fill& fill) {
         for (auto& te : g_tradingEntries)
-            if (te.win) te.win->OnFill(fill);
+            if (te.win && te.win->getSymbol() == fill.symbol) te.win->OnFill(fill);
         if (g_OrdersWindow) g_OrdersWindow->OnFill(fill);
         // Accumulate commission per symbol for the P&L strip
         g_symbolCommissions[fill.symbol] += fill.commission;

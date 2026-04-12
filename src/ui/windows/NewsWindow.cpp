@@ -241,8 +241,10 @@ void NewsWindow::DrawTabStock() {
     ImGui::SameLine();
     bool clicked = ImGui::Button("Load");
 
-    if (entered || clicked)
+    if (entered || clicked) {
         RefreshStock(m_stockSymbol);
+        if (OnSymbolChanged) OnSymbolChanged(m_stockSymbol);
+    }
 
     const char* syms[] = {"AAPL","MSFT","GOOGL","TSLA","AMZN","NVDA","SPY"};
     for (const char* s : syms) {
@@ -252,6 +254,7 @@ void NewsWindow::DrawTabStock() {
         if (ImGui::SmallButton(s)) {
             std::strncpy(m_stockSymbol, s, sizeof(m_stockSymbol) - 1);
             RefreshStock(m_stockSymbol);
+            if (OnSymbolChanged) OnSymbolChanged(m_stockSymbol);
         }
         if (active) ImGui::PopStyleColor();
     }

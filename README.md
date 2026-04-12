@@ -12,9 +12,11 @@ A professional-grade C++20 trading terminal for Interactive Brokers, built with 
 - **Portfolio Dashboard** — Account summary, positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
 - **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L
 - **Paper & Live accounts** — Toggle between paper and live trading from the login screen
-- **Multi-Instance Windows** — Open up to 4 simultaneous Chart, Order Book, and Scanner windows to monitor multiple assets at once
+- **Multi-Instance Windows** — Open up to 10 simultaneous Chart, Order Book, Scanner, and News windows to monitor multiple assets at once
 - **Window Groups** — Link any windows into a color-coded group (G1–G4); changing the asset in one window instantly syncs all others in the same group
 - **Layout Presets** — One-click workspace layouts: Trading Focus, Research, Full Desk
+- **Responsive UI** — All toolbars and info bars wrap gracefully when windows are resized small; font size adjustable (Small / Medium / Large) via the Settings menu
+- **Resizable Panels** — Drag the splitter bars inside the Order Book window to resize the DOM ladder, order entry form, and bottom tabs independently
 
 ---
 
@@ -78,7 +80,7 @@ cmake -B build -S .
 cmake --build build -j$(nproc)
 
 # Run
-./build/bin/ibkr-trading-app
+./build/ibkr-trading-app
 
 # --- Variants ---
 
@@ -95,7 +97,7 @@ rm -rf build && cmake -B build -S . && cmake --build build
 If running on a machine without a physical display (e.g., a server or WSL), set a virtual display before launching:
 
 ```bash
-DISPLAY=:1 ./build/bin/ibkr-trading-app
+DISPLAY=:1 ./build/ibkr-trading-app
 ```
 
 ### Platform notes
@@ -201,7 +203,7 @@ The UI uses ImGui's docking system. All windows are dockable and can be rearrang
 
 ### Multi-Instance Windows
 
-Chart, Order Book, and Scanner windows support up to **4 simultaneous instances**. Open additional instances from **Windows → + New Chart / + New Order Book / + New Scanner**. Each instance has an independent symbol subscription and its own IB reqId range, so they never interfere with each other.
+Chart, Order Book, Scanner, and News windows support up to **10 simultaneous instances** each. Open additional instances from **Windows → IBKR → + New Chart / + New Order Book / + New Scanner / + New News**. Each instance has an independent symbol subscription and its own IB reqId range, so they never interfere with each other.
 
 ### Window Groups & Symbol Sync
 
@@ -210,7 +212,7 @@ Every window has a **group button** (`G1` / `G2` / `G3` / `G4` / `G-`) at the le
 - Click the button to assign the window to a group (or clear it with `G-`).
 - When you change the asset in any grouped window — by typing a symbol in the chart search box, changing the symbol in the Order Book, or double-clicking a row in the Scanner — **all other windows in the same group immediately switch to that asset** and re-subscribe to live market data.
 - Groups are color-coded: G1 = blue, G2 = green, G3 = orange, G4 = purple.
-- By default, instance N starts in group N (e.g. Chart 1, Order Book 1, Scanner 1 all start in G1).
+- By default, instance N starts in group N (e.g. Chart 1, Order Book 1, Scanner 1, News 1 all start in G1).
 
 ### Layout Presets
 
@@ -255,6 +257,11 @@ Real-time candlestick charting with technical analysis overlays.
 
 Professional Depth of Market ladder for market microstructure analysis and fast order entry.
 
+**Layout** — Three resizable panels separated by draggable splitter bars:
+- **Left**: DOM ladder (drag the vertical splitter to resize)
+- **Right**: Order entry form
+- **Bottom**: Tabbed panel (drag the horizontal splitter to resize)
+
 **Order Book:**
 - Up to 50 bid/ask price levels (Level II)
 - Cumulative size and number of orders per level
@@ -273,9 +280,23 @@ Professional Depth of Market ladder for market microstructure analysis and fast 
 
 ---
 
+### Settings
+
+Open via **Settings** in the menu bar. A floating panel lets you change the font size:
+
+| Option | Scale |
+|---|---|
+| Small | 0.85× |
+| Medium | 1.0× (default) |
+| Large | 1.5× |
+
+All UI elements — text, widgets, padding, and spacing — scale uniformly. The setting takes effect immediately without restarting.
+
+---
+
 ### News Window
 
-Multi-source financial news with three tabs.
+Multi-source financial news with three tabs. Supports up to **10 simultaneous instances**, each independently grouped.
 
 **Market Tab** — Real-time news ticks for major market symbols. Auto-updates as headlines arrive. Highlights breaking news.
 
@@ -396,9 +417,9 @@ If IB Gateway or TWS closes unexpectedly while the app is running:
             │  Callbacks routed by reqId to entry vectors
    ┌────────┼──────────────────────────────────────────────┐
    │        │                  │              │             │
-   ▼        ▼                  ▼              ▼             ▼
-Chart×4  Trading×4   News   Scanner×4   Portfolio   Orders
- (G1-G4)  (G1-G4)  (G1)    (G1-G4)    (singleton) (singleton)
+   ▼        ▼         ▼        ▼           ▼             ▼
+Chart×10 Trading×10 News×10 Scanner×10 Portfolio     Orders
+ (G1-G4)  (G1-G4)  (G1-G4)  (G1-G4)  (singleton) (singleton)
 ```
 
 **Threading model:**

@@ -51,6 +51,10 @@ public:
     void SetPortfolioSymbols(std::vector<std::string> symbols);
 
     // ── Callbacks wired by main.cpp after connection ──────────────────────
+    // Fired whenever the user changes the stock symbol from within the window
+    // (Enter, Load button, or quick-symbol click). NOT fired when SetSymbol()
+    // is called from outside (group sync) to avoid re-entrant loops.
+    std::function<void(const std::string& symbol)>              OnSymbolChanged;
     std::function<void(const std::string& symbol)>              OnStockNewsRequested;
     std::function<void(const std::vector<std::string>& symbols)> OnPortfolioNewsRequested;
     std::function<void(int itemId, const std::string& providerCode,

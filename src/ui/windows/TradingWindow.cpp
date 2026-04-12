@@ -85,6 +85,33 @@ void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
 void TradingWindow::OnFill(const core::Fill& fill) {
     m_fills.insert(m_fills.begin(), fill);
     if (m_fills.size() > 200) m_fills.resize(200);
+
+    // Update running position and average entry price
+    double delta   = (fill.side == core::OrderSide::Buy) ? fill.quantity : -fill.quantity;
+    double prevQty = m_positionQty;
+    double newQty  = prevQty + delta;
+
+    if (std::abs(newQty) < 1e-9) {
+        // Closed flat
+        m_positionQty   = 0.0;
+        m_avgEntryPrice = 0.0;
+    } else if (std::abs(prevQty) < 1e-9) {
+        // Was flat — opening fresh position
+        m_positionQty   = newQty;
+        m_avgEntryPrice = fill.price;
+    } else if ((prevQty > 0) == (delta > 0)) {
+        // Adding to same-side position — weighted average entry
+        double absP = std::abs(prevQty);
+        double absD = std::abs(delta);
+        m_avgEntryPrice = (absP * m_avgEntryPrice + absD * fill.price) / (absP + absD);
+        m_positionQty   = newQty;
+    } else {
+        // Reducing or flipping
+        m_positionQty = newQty;
+        if (std::abs(newQty) > 1e-9 && (newQty > 0) != (prevQty > 0))
+            m_avgEntryPrice = fill.price;   // flipped side — reset entry to fill price
+        // If just reducing (same sign, smaller abs), keep existing avg entry
+    }
 }
 
 void TradingWindow::OnNBBO(double bid, double bidSz, double ask, double askSz) {
@@ -149,6 +176,8 @@ void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
     m_volAtPrice.clear();
     m_maxVolAtPrice   = 1.0;
     m_domOrders.clear();
+    m_positionQty     = 0.0;
+    m_avgEntryPrice   = 0.0;
 }
 
 void TradingWindow::UpdateMidPrice(double price) {
@@ -356,7 +385,25 @@ void TradingWindow::DrawOrderBook() {
         ImGui::Text("%s", priceLabel);
         ImGui::PopStyleColor();
     }
-    hdr.item(FlexRow::checkboxW("Click-to-Trade"), 20);
+    if (m_positionQty != 0.0) {
+        char posLabel[48];
+        std::snprintf(posLabel, sizeof(posLabel), "%s%.0f@%.2f",
+                      m_positionQty > 0 ? "L " : "S ",
+                      std::abs(m_positionQty), m_avgEntryPrice);
+        hdr.item(FlexRow::textW(posLabel), 14);
+        ImGui::PushStyleColor(ImGuiCol_Text, m_positionQty > 0 ? kBuyGreen : kSellRed);
+        ImGui::TextUnformatted(posLabel);
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Open position: %.0f shares @ avg $%.2f\n"
+                              "P&L column shows dollar P&L at each price level.",
+                              std::abs(m_positionQty), m_avgEntryPrice);
+    }
+    hdr.item(FlexRow::checkboxW("Expand Spread"), 20);
+    ImGui::Checkbox("Expand Spread", &m_expandSpread);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show every tick between bid and ask as a separate clickable row.");
+    hdr.item(FlexRow::checkboxW("Click-to-Trade"), 12);
     ImGui::Checkbox("Click-to-Trade", &m_clickToTrade);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
@@ -459,26 +506,47 @@ void TradingWindow::DrawOrderBook() {
             1.0f);
     };
 
-    // ── Two-layer histogram bar ───────────────────────────────────────────────
-    // Layer 1 (dim): accumulated volume at this price level (trade history).
-    // Layer 2 (bright): current depth size (live order book).
-    auto DrawBar = [&](double depthSz, double price, ImU32 brightCol) {
+    // ── P&L per price level: position P&L when holding, else price distance ──
+    // Shows dollar P&L if closed at each row's price; falls back to ±offset
+    // from mid when flat so the column is always informative.
+    auto CalcPnl = [&](double price) -> double {
+        if (m_positionQty != 0.0 && m_avgEntryPrice > 0.0)
+            return m_positionQty * (price - m_avgEntryPrice);
+        return (m_midPrice > 0.0) ? price - m_midPrice : 0.0;
+    };
+
+    // ── Volume-profile bar ────────────────────────────────────────────────────
+    // Primary layer  : consolidated traded volume at this price (bright blue bar,
+    //                  full row height, width proportional to max volume seen).
+    // Secondary layer: live depth size (thin strip along the bottom of the row,
+    //                  bid/ask colour).  Depth is an order-book snapshot; volume
+    //                  is what has actually traded — keeping them visually distinct
+    //                  prevents confusion between the two.
+    auto DrawBar = [&](double depthSz, double price, ImU32 depthCol) {
         ImDrawList* ldl = ImGui::GetWindowDrawList();
         ImVec2 p  = ImGui::GetCursorScreenPos();
         float  cw = ImGui::GetContentRegionAvail().x - 2.f;
         float  bh = ImGui::GetTextLineHeight();
-        // Volume profile background
+
+        // Track: dim full-width background so the column is never blank
+        ldl->AddRectFilled(p, ImVec2(p.x + cw, p.y + bh), IM_COL32(28, 28, 33, 80));
+
+        // Volume profile: primary visual — how much has been traded at this price
         int key = static_cast<int>(std::round(price / 0.01));
         auto it = m_volAtPrice.find(key);
         if (it != m_volAtPrice.end() && m_maxVolAtPrice > 0.0) {
-            float vw = (float)(it->second / m_maxVolAtPrice) * cw;
-            ldl->AddRectFilled(p, ImVec2(p.x + vw, p.y + bh), IM_COL32(80, 80, 110, 90));
+            float vw = std::max(2.f, (float)(it->second / m_maxVolAtPrice) * cw);
+            ldl->AddRectFilled(p, ImVec2(p.x + vw, p.y + bh), IM_COL32(55, 130, 210, 190));
         }
-        // Depth size foreground
+
+        // Depth strip: thin bar along the bottom row edge (25% height)
         if (depthSz > 0.0 && m_maxDepthSize > 0.0) {
-            float bw = (float)(depthSz / m_maxDepthSize) * cw;
-            ldl->AddRectFilled(p, ImVec2(p.x + bw, p.y + bh), brightCol);
+            float bw      = std::max(2.f, (float)(depthSz / m_maxDepthSize) * cw);
+            float stripH  = std::max(2.f, bh * 0.25f);
+            ldl->AddRectFilled(ImVec2(p.x, p.y + bh - stripH),
+                               ImVec2(p.x + bw, p.y + bh), depthCol);
         }
+
         ImGui::Dummy(ImVec2(cw, bh));
     };
 
@@ -495,9 +563,12 @@ void TradingWindow::DrawOrderBook() {
         // the Click-to-Trade checkbox).  The raw-coordinate check that was here
         // before had no knowledge of the scroll clip rect and caused an accidental
         // PlaceDomOrder when the checkbox was pressed while the table was scrolled.
+        // clip=false: ignore the current column clip rect so the rect test spans
+        // the full row width, not just column 0 (where RowOverlay is called from).
         bool hovered = panelHovered &&
                        ImGui::IsMouseHoveringRect(ImVec2(wMin.x, ry),
-                                                  ImVec2(wMin.x + wW, ry + rowH));
+                                                  ImVec2(wMin.x + wW, ry + rowH),
+                                                  false);
 
         if (m_clickToTrade && rowPrice > 0.0) {
             if (hovered) {
@@ -510,7 +581,7 @@ void TradingWindow::DrawOrderBook() {
                 // Without this guard, unchecking the checkbox while the table is
                 // scrolled fires PlaceDomOrder on the same frame as the press.
                 if (ImGui::GetIO().MouseClicked[0] && !ImGui::IsAnyItemActive())
-                    PlaceDomOrder(!isAskRow, rowPrice);
+                    PlaceDomOrder(isAskRow, rowPrice);  // ask row → BUY, bid row → SELL
             }
         }
 
@@ -530,6 +601,20 @@ void TradingWindow::DrawOrderBook() {
             if (tint)
                 ldl->AddRectFilled(ImVec2(wMin.x, ry),
                                    ImVec2(wMin.x + wW, ry + rowH), tint);
+        }
+
+        // Volume tooltip: hover anywhere on the row to see consolidated traded size
+        if (hovered && rowPrice > 0.0) {
+            int key = static_cast<int>(std::round(rowPrice / 0.01));
+            auto vit = m_volAtPrice.find(key);
+            if (vit != m_volAtPrice.end() && vit->second > 0.0) {
+                ImGui::BeginTooltip();
+                ImGui::Text("$%.2f", rowPrice);
+                ImGui::Separator();
+                ImGui::Text("Traded: %.0f shares", vit->second);
+                ImGui::Text("%.1f%% of session max", 100.0 * vit->second / m_maxVolAtPrice);
+                ImGui::EndTooltip();
+            }
         }
     };
 
@@ -559,7 +644,7 @@ void TradingWindow::DrawOrderBook() {
         const auto& lvl  = m_asks[i];
         const bool  best = (i == 0);
         const ImVec4 col = FlashCol(kSellRed, lvl.flashAge);
-        const double pnl = (m_midPrice > 0.0) ? lvl.price - m_midPrice : 0.0;
+        const double pnl = CalcPnl(lvl.price);
 
         ImGui::TableNextRow();
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
@@ -584,7 +669,7 @@ void TradingWindow::DrawOrderBook() {
         ImGui::PopStyleColor();
 
         ImGui::TableSetColumnIndex(5);
-        if (m_midPrice > 0.0) {
+        if (m_positionQty != 0.0 || m_midPrice > 0.0) {
             ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
             ImGui::Text("%+.2f", pnl);
             ImGui::PopStyleColor();
@@ -596,15 +681,53 @@ void TradingWindow::DrawOrderBook() {
 
     // ── Mid section: spread or NBBO fallback or empty notice ─────────────────
     if (!noL2) {
-        // L2 data present: show spread row
+        // Spread: expand into per-tick rows or collapse to a single summary row
         if (nAsks > 0 && nBids > 0) {
-            double spread = m_asks[0].price - m_bids[0].price;
-            ImGui::TableNextRow();
-            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 50, 58, 140));
-            ImGui::TableSetColumnIndex(2);
-            ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
-            ImGui::Text("─ $%.2f ─", spread);
-            ImGui::PopStyleColor();
+            double spreadVal = m_asks[0].price - m_bids[0].price;
+            int    nSpread   = std::max(0, (int)std::lround(spreadVal / 0.01) - 1);
+            if (m_expandSpread) {
+                static constexpr int kMaxSpreadRows = 100;
+                for (int s = 1; s <= std::min(nSpread, kMaxSpreadRows); ++s) {
+                    double price = RoundTick(m_asks[0].price - s * 0.01);
+                    double pnl   = CalcPnl(price);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
+                    ImGui::TableSetColumnIndex(0);
+                    RowOverlay(price, m_sideIdx == 0);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                    ImGui::Text("%.2f", price);
+                    ImGui::PopStyleColor();
+                    ImGui::TableSetColumnIndex(5);
+                    if (m_positionQty != 0.0 || m_midPrice > 0.0) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                        ImGui::Text("%+.2f", pnl);
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::TableSetColumnIndex(6);
+                    DrawBar(0.0, price, IM_COL32(160, 160, 170, 60));
+                }
+                if (nSpread > kMaxSpreadRows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+                    ImGui::Text("... %d more ...", nSpread - kMaxSpreadRows);
+                    ImGui::PopStyleColor();
+                }
+            } else {
+                // Collapsed: single summary row
+                double midP = RoundTick((m_asks[0].price + m_bids[0].price) / 2.0);
+                ImGui::TableNextRow();
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
+                ImGui::TableSetColumnIndex(0);
+                RowOverlay(midP, m_sideIdx == 0);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                ImGui::Text("spread $%.2f (%d ticks)", spreadVal, nSpread + 1);
+                ImGui::PopStyleColor();
+                ImGui::TableSetColumnIndex(6);
+                DrawBar(0.0, midP, IM_COL32(160, 160, 170, 60));
+            }
         }
     } else if (hasNBBO) {
         // No L2 — render a virtual price ladder: 25 rows above ask, NBBO rows,
@@ -618,7 +741,7 @@ void TradingWindow::DrawOrderBook() {
         // ── 25 virtual ask rows above the best ask (highest first) ───────────
         for (int i = kLadderRows; i >= 1; --i) {
             double price = RoundTick(askAnchor + i * kTick);
-            double pnl   = (m_midPrice > 0.0) ? price - m_midPrice : 0.0;
+            double pnl   = CalcPnl(price);
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 15, 15, 50));
             ImGui::TableSetColumnIndex(0);
@@ -639,7 +762,7 @@ void TradingWindow::DrawOrderBook() {
 
         // ── Best ask row (NBBO) ───────────────────────────────────────────────
         if (m_nbboAsk > 0.0) {
-            double pnl = (m_midPrice > 0.0) ? m_nbboAsk - m_midPrice : 0.0;
+            double pnl = CalcPnl(m_nbboAsk);
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(100, 22, 22, 110));
             ImGui::TableSetColumnIndex(0);
@@ -662,19 +785,57 @@ void TradingWindow::DrawOrderBook() {
             DrawBar(m_nbboAskSz, m_nbboAsk, IM_COL32(190, 45, 45, 180));
         }
 
-        // ── Spread separator ─────────────────────────────────────────────────
+        // ── Spread: expand into per-tick rows or collapse to a single summary ─
         if (m_nbboAsk > 0.0 && m_nbboBid > 0.0) {
-            ImGui::TableNextRow();
-            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 50, 58, 140));
-            ImGui::TableSetColumnIndex(2);
-            ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
-            ImGui::Text("─ %.2f ─", m_nbboAsk - m_nbboBid);
-            ImGui::PopStyleColor();
+            double spreadVal = m_nbboAsk - m_nbboBid;
+            int    nSpread   = std::max(0, (int)std::lround(spreadVal / 0.01) - 1);
+            if (m_expandSpread) {
+                static constexpr int kMaxSpreadRows = 100;
+                for (int s = 1; s <= std::min(nSpread, kMaxSpreadRows); ++s) {
+                    double price = RoundTick(m_nbboAsk - s * 0.01);
+                    double pnl   = CalcPnl(price);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
+                    ImGui::TableSetColumnIndex(0);
+                    RowOverlay(price, m_sideIdx == 0);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                    ImGui::Text("%.2f", price);
+                    ImGui::PopStyleColor();
+                    ImGui::TableSetColumnIndex(5);
+                    if (m_positionQty != 0.0 || m_midPrice > 0.0) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
+                        ImGui::Text("%+.2f", pnl);
+                        ImGui::PopStyleColor();
+                    }
+                    ImGui::TableSetColumnIndex(6);
+                    DrawBar(0.0, price, IM_COL32(160, 160, 170, 60));
+                }
+                if (nSpread > kMaxSpreadRows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+                    ImGui::Text("... %d more ...", nSpread - kMaxSpreadRows);
+                    ImGui::PopStyleColor();
+                }
+            } else {
+                double midP = RoundTick((m_nbboAsk + m_nbboBid) / 2.0);
+                ImGui::TableNextRow();
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
+                ImGui::TableSetColumnIndex(0);
+                RowOverlay(midP, m_sideIdx == 0);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                ImGui::Text("spread $%.2f (%d ticks)", spreadVal, nSpread + 1);
+                ImGui::PopStyleColor();
+                ImGui::TableSetColumnIndex(6);
+                DrawBar(0.0, midP, IM_COL32(160, 160, 170, 60));
+            }
         }
 
         // ── Best bid row (NBBO) ───────────────────────────────────────────────
         if (m_nbboBid > 0.0) {
-            double pnl = (m_midPrice > 0.0) ? m_nbboBid - m_midPrice : 0.0;
+            double pnl = CalcPnl(m_nbboBid);
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(18, 90, 32, 110));
             ImGui::TableSetColumnIndex(0);
@@ -699,7 +860,7 @@ void TradingWindow::DrawOrderBook() {
         // ── 25 virtual bid rows below the best bid ────────────────────────────
         for (int i = 1; i <= kLadderRows; ++i) {
             double price = RoundTick(bidAnchor - i * kTick);
-            double pnl   = (m_midPrice > 0.0) ? price - m_midPrice : 0.0;
+            double pnl   = CalcPnl(price);
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(15, 50, 18, 50));
             ImGui::TableSetColumnIndex(0);
@@ -739,7 +900,7 @@ void TradingWindow::DrawOrderBook() {
         const auto& lvl  = m_bids[i];
         const bool  best = (i == 0);
         const ImVec4 col = FlashCol(kBuyGreen, lvl.flashAge);
-        const double pnl = (m_midPrice > 0.0) ? lvl.price - m_midPrice : 0.0;
+        const double pnl = CalcPnl(lvl.price);
 
         ImGui::TableNextRow();
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
@@ -762,7 +923,7 @@ void TradingWindow::DrawOrderBook() {
         ImGui::PopStyleColor();
 
         ImGui::TableSetColumnIndex(5);
-        if (m_midPrice > 0.0) {
+        if (m_positionQty != 0.0 || m_midPrice > 0.0) {
             ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
             ImGui::Text("%+.2f", pnl);
             ImGui::PopStyleColor();
@@ -1130,6 +1291,11 @@ void TradingWindow::CancelOrder(int orderId) {
 
 void TradingWindow::SetNextOrderId(int id) {
     m_nextOrderId = id;
+}
+
+void TradingWindow::SetPosition(double qty, double avgCost) {
+    m_positionQty   = qty;
+    m_avgEntryPrice = (std::abs(qty) > 1e-9) ? avgCost : 0.0;
 }
 
 // ============================================================================
