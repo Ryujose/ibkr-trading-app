@@ -1,12 +1,18 @@
 # IBKR Trading App
 
-A professional-grade C++20 trading terminal for Interactive Brokers, built with Dear ImGui (Vulkan backend) and the IB TWS C++ API. Designed for active traders who want a fast, low-latency desktop client with real market data, order execution, charting, and portfolio analytics — all in a single dockable window system.
+A C++20 desktop trading terminal for Interactive Brokers, built with Dear ImGui (Vulkan backend) and the official IBKR TWS API.
 
-## Features
+Designed as a high-performance alternative front-end for IB Gateway / TWS, focusing on execution speed, multi-window workflows, and real-time market visualization.
+
+Distributed for research and personal trading use via IBKR accounts. No guarantees of correctness, uptime, or suitability for financial decision-making.
+
+The “Interactive Brokers API Usage Notice” section must be reviewed prior to use. By using this software, users acknowledge and agree to its terms.
+
+## Demonstrated Capabilities
 
 - **Candlestick Charts** — Multi-timeframe OHLCV with SMA, EMA, Bollinger Bands, VWAP, RSI, and volume
 - **DOM / Level II** — Live order book ladder with click-to-trade
-- **Order Management** — Place, track, and cancel Market, Limit, Stop, Stop-Limit, and Trailing orders
+- **Order Management** — Place, track, and cancel Market, Limit, Stop, Stop-Limit, Trailing, MOC/LOC, MTL, MIT/LIT, Midprice, and Relative orders
 - **Market Scanner** — Scan for Top Gainers/Losers, Volume Leaders, 52W Highs/Lows, RSI extremes, and more
 - **News Feed** — Real-time and historical news across Market, Portfolio, and per-Stock tabs with sentiment indicators
 - **Portfolio Dashboard** — Account summary, positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
@@ -203,7 +209,7 @@ The UI uses ImGui's docking system. All windows are dockable and can be rearrang
 
 ### Multi-Instance Windows
 
-Chart, Order Book, Scanner, and News windows support up to **10 simultaneous instances** each. Open additional instances from **Windows → IBKR → + New Chart / + New Order Book / + New Scanner / + New News**. Each instance has an independent symbol subscription and its own IB reqId range, so they never interfere with each other.
+Chart, Order Book, Scanner, and News windows support up to **10 simultaneous windows instances** each. Open additional instances from **Windows → IBKR → + New Chart / + New Order Book / + New Scanner / + New News**. Each instance has an independent symbol subscription and its own IB reqId range, so they never interfere with each other.
 
 ### Window Groups & Symbol Sync
 
@@ -241,7 +247,7 @@ Real-time candlestick charting with technical analysis overlays.
 **Drawing Tools:** Horizontal lines, trendlines, Fibonacci retracements, eraser
 
 **Trading:**
-- Place orders directly from the chart (Market, Limit, Stop, Stop-Limit, Trailing)
+- Place orders directly from the chart (MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MIDPRICE, REL)
 - Working orders displayed as horizontal lines on the price axis
 - Current position shown with entry price, current price, and unrealized P&L strip
 - **Current price line** — dashed horizontal line tracking the latest price, with a right-aligned price tag inside the chart
@@ -267,9 +273,9 @@ Professional Depth of Market ladder for market microstructure analysis and fast 
 - Cumulative size and number of orders per level
 - Volume-at-price overlay from executed trades
 
-**Click-to-Trade:**
+**Interactive order placement (via IBKR API):**
 - Click any price level to pre-fill an order at that price
-- Select order type: MKT, LMT, STP, STP LMT
+- Select order type: MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MIDPRICE, REL
 - Select time-in-force: DAY, GTC, IOC, FOK
 - BUY / SELL buttons confirm submission
 
@@ -296,7 +302,7 @@ All UI elements — text, widgets, padding, and spacing — scale uniformly. The
 
 ### News Window
 
-Multi-source financial news with three tabs. Supports up to **10 simultaneous instances**, each independently grouped.
+Multi-source financial news with three tabs. Supports up to **10 simultaneous windows instances**, each independently grouped.
 
 **Market Tab** — Real-time news ticks for major market symbols. Auto-updates as headlines arrive. Highlights breaking news.
 
@@ -434,6 +440,20 @@ Chart×10 Trading×10 News×10 Scanner×10 Portfolio     Orders
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-IMPORTANT!!!
-Beware this project have been developed under another licenses such as IBKR non-license agreement taken by default as personal individual usages.
-If you need to COMMERCIALIZE this, do a fork and contact IBKR team for commercial license support.
+### Interactive Brokers API Usage Notice
+
+- This application uses the Interactive Brokers (IBKR) Trader Workstation (TWS) API under IBKR’s Non-Commercial License Agreement.
+
+- The software is provided for personal, educational, and research purposes, and for use with the user’s own IBKR account.
+
+- It is not a brokerage service, investment advisory tool, or financial institution, and does not provide investment advice or recommendations.
+
+- Users are solely responsible for any trading activity executed through their IBKR account.
+
+- The application requires a locally running IBKR Trader Workstation (TWS) or IB Gateway instance.
+
+- This project does not redistribute or modify any proprietary IBKR API components.
+
+- This software is not certified for production or mission-critical trading environments. Users should evaluate suitability before live use.
+
+- Use of the IBKR API is subject to IBKR’s own license terms and policies.

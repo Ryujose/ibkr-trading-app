@@ -120,6 +120,15 @@ void TradingWindow::OnNBBO(double bid, double bidSz, double ask, double askSz) {
     if (bidSz > 0) m_nbboBidSz = bidSz;
     if (ask   > 0) m_nbboAsk   = ask;
     if (askSz > 0) m_nbboAskSz = askSz;
+
+    // Update mid-price if we have both sides, otherwise use what we have
+    if (m_nbboBid > 0 && m_nbboAsk > 0) {
+        UpdateMidPrice((m_nbboBid + m_nbboAsk) * 0.5);
+    } else if (m_nbboBid > 0 && m_midPrice <= 0) {
+        UpdateMidPrice(m_nbboBid);
+    } else if (m_nbboAsk > 0 && m_midPrice <= 0) {
+        UpdateMidPrice(m_nbboAsk);
+    }
 }
 
 void TradingWindow::OnMktDataError(int code) {
@@ -183,6 +192,10 @@ void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
 void TradingWindow::UpdateMidPrice(double price) {
     m_prevMidPrice = m_midPrice;
     m_midPrice     = price;
+    // A LAST tick means the data subscription is working even if no bid/ask
+    // has arrived yet (paper accounts outside RTH, or delayed-frozen data).
+    if (m_mktDataStatus == SubStatus::Unknown)
+        m_mktDataStatus = SubStatus::Ok;
 }
 
 // ============================================================================
@@ -319,7 +332,6 @@ void TradingWindow::PlaceDomOrder(bool isBuy, double price) {
     double qty = std::atof(m_qtyBuf);
     if (qty <= 0.0 || price <= 0.0) return;
 
-    const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
     int orderId = m_nextOrderId++;
 
     DOMOrder dom;
@@ -338,16 +350,14 @@ void TradingWindow::PlaceDomOrder(bool isBuy, double price) {
     o.tif         = static_cast<core::TimeInForce>(m_tifIdx);
     o.quantity    = qty;
     o.limitPrice  = price;
+    o.outsideRth  = m_outsideRth;
     o.status      = core::OrderStatus::Working;
     o.submittedAt = std::time(nullptr);
     o.updatedAt   = o.submittedAt;
     m_openOrders.push_back(o);
 
     if (OnOrderSubmit)
-        OnOrderSubmit(orderId, std::string(m_symbol),
-                      isBuy ? "BUY" : "SELL",
-                      "LMT", qty, price, 0.0,
-                      tifs[m_tifIdx], m_outsideRth);
+        OnOrderSubmit(o);
 }
 
 TradingWindow::DOMOrder* TradingWindow::FindDomOrder(double price) {
@@ -456,23 +466,38 @@ void TradingWindow::DrawOrderBook() {
     ImGui::Separator();
     if (m_mktDataStatus == SubStatus::Ok) {
         FlexRow nbbo;
-        char bidBuf[32], askBuf[32];
-        std::snprintf(bidBuf, sizeof(bidBuf), "BID $%.2f x %.0f", m_nbboBid, m_nbboBidSz);
-        std::snprintf(askBuf, sizeof(askBuf), "ASK $%.2f x %.0f", m_nbboAsk, m_nbboAskSz);
-        nbbo.item(FlexRow::textW(bidBuf), 0);
-        ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
-        ImGui::TextUnformatted(bidBuf);
-        ImGui::PopStyleColor();
-        nbbo.item(FlexRow::textW(askBuf), 20);
-        ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
-        ImGui::TextUnformatted(askBuf);
-        ImGui::PopStyleColor();
-        if (m_nbboAsk > 0 && m_nbboBid > 0) {
-            char sprdBuf[24];
-            std::snprintf(sprdBuf, sizeof(sprdBuf), "sprd $%.2f", m_nbboAsk - m_nbboBid);
-            nbbo.item(FlexRow::textW(sprdBuf), 20);
+        if (m_nbboBid > 0.0 || m_nbboAsk > 0.0) {
+            // Full NBBO available
+            char bidBuf[32], askBuf[32];
+            std::snprintf(bidBuf, sizeof(bidBuf), "BID $%.2f x %.0f", m_nbboBid, m_nbboBidSz);
+            std::snprintf(askBuf, sizeof(askBuf), "ASK $%.2f x %.0f", m_nbboAsk, m_nbboAskSz);
+            nbbo.item(FlexRow::textW(bidBuf), 0);
+            ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
+            ImGui::TextUnformatted(bidBuf);
+            ImGui::PopStyleColor();
+            nbbo.item(FlexRow::textW(askBuf), 20);
+            ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
+            ImGui::TextUnformatted(askBuf);
+            ImGui::PopStyleColor();
+            if (m_nbboAsk > 0 && m_nbboBid > 0) {
+                char sprdBuf[24];
+                std::snprintf(sprdBuf, sizeof(sprdBuf), "sprd $%.2f", m_nbboAsk - m_nbboBid);
+                nbbo.item(FlexRow::textW(sprdBuf), 20);
+                ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+                ImGui::TextUnformatted(sprdBuf);
+                ImGui::PopStyleColor();
+            }
+        } else if (m_midPrice > 0.0) {
+            // Only LAST price available (paper/delayed-frozen outside RTH)
+            char lastBuf[32];
+            std::snprintf(lastBuf, sizeof(lastBuf), "LAST $%.2f", m_midPrice);
+            nbbo.item(FlexRow::textW(lastBuf), 0);
+            ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+            ImGui::TextUnformatted(lastBuf);
+            ImGui::PopStyleColor();
+            nbbo.item(FlexRow::textW("(no bid/ask)"), 16);
             ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-            ImGui::TextUnformatted(sprdBuf);
+            ImGui::TextUnformatted("(no bid/ask)");
             ImGui::PopStyleColor();
         }
     } else {
@@ -729,9 +754,9 @@ void TradingWindow::DrawOrderBook() {
                 DrawBar(0.0, midP, IM_COL32(160, 160, 170, 60));
             }
         }
-    } else if (hasNBBO) {
-        // No L2 — render a virtual price ladder: 25 rows above ask, NBBO rows,
-        // 25 rows below bid.  Sizes shown only on the actual NBBO best bid/ask.
+    } else if (hasNBBO || m_midPrice > 0.0) {
+        // No L2 — render a virtual price ladder anchored on NBBO when available,
+        // or on LAST price when only delayed/frozen data is present.
         const int    kLadderRows = m_ladderRows;
         static constexpr double kTick = 0.01;
 
@@ -1008,11 +1033,17 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::Spacing();
 
     // ---- Order Type ---------------------------------------------------------
-    const char* types[] = {"Market", "Limit", "Stop", "Stop Limit"};
+    static constexpr const char* kTypes[] = {
+        "Market", "Limit", "Stop", "Stop Limit",          // 0-3
+        "Trail Stop", "Trail Limit",                       // 4-5
+        "Market On Close", "Limit On Close", "Mkt To Limit", // 6-8
+        "Mkt If Touched", "Lmt If Touched",               // 9-10
+        "Midprice", "Relative"                             // 11-12
+    };
     ImGui::Text("Type");
     ImGui::SameLine(labelCol);
-    ImGui::SetNextItemWidth(em(130));
-    ImGui::Combo("##type", &m_typeIdx, types, IM_ARRAYSIZE(types));
+    ImGui::SetNextItemWidth(em(160));
+    ImGui::Combo("##type", &m_typeIdx, kTypes, IM_ARRAYSIZE(kTypes));
 
     // ---- Quantity -----------------------------------------------------------
     ImGui::Text("Quantity");
@@ -1021,26 +1052,46 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::InputText("##qty", m_qtyBuf, sizeof(m_qtyBuf),
                      ImGuiInputTextFlags_CharsDecimal);
 
-    // ---- Limit price (shown for Limit / StopLimit) --------------------------
-    bool needsLimit = (m_typeIdx == 1 || m_typeIdx == 3);
-    if (needsLimit) {
+    // ---- Conditional price fields per type ----------------------------------
+    // idx 1  LMT          → Limit Price
+    // idx 2  STP          → Stop Price
+    // idx 3  STP LMT      → Stop Price + Limit Price
+    // idx 4  TRAIL        → Trail Amt ($/%) toggle + optional Stop Cap
+    // idx 5  TRAIL LIMIT  → Trail Amt + Stop Cap (opt.) + Lmt Offset
+    // idx 7  LOC          → Limit Price
+    // idx 9  MIT          → Trigger Price  (reuses m_stpBuf)
+    // idx 10 LIT          → Trigger Price + Limit Price
+    // idx 11 MIDPRICE     → Price Cap (optional, reuses m_lmtBuf)
+    // idx 12 REL          → Offset Amt + Price Cap (optional)
+    // idx 0,6,8 — no price fields
+
+    bool showLmt     = (m_typeIdx == 1 || m_typeIdx == 3 || m_typeIdx == 7 || m_typeIdx == 10);
+    bool showStp     = (m_typeIdx == 2 || m_typeIdx == 3);
+    bool showTrigger = (m_typeIdx == 9 || m_typeIdx == 10);
+    bool showTrail   = (m_typeIdx == 4 || m_typeIdx == 5);
+    bool showLmtOff  = (m_typeIdx == 5);
+    bool showCapOpt  = (m_typeIdx == 11 || m_typeIdx == 12);
+    bool showOffset  = (m_typeIdx == 12);
+
+    if (showLmt) {
         ImGui::Text("Lmt Price");
         ImGui::SameLine(labelCol);
         ImGui::SetNextItemWidth(em(100));
         ImGui::InputText("##lmt", m_lmtBuf, sizeof(m_lmtBuf),
                          ImGuiInputTextFlags_CharsDecimal);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(isBuy ? "Ask" : "Bid")) {
-            double fillPrice = isBuy ? (m_asks.empty() ? m_midPrice : m_asks[0].price)
-                                     : (m_bids.empty() ? m_midPrice : m_bids[0].price);
-            std::snprintf(m_lmtBuf, sizeof(m_lmtBuf), "%.2f", fillPrice);
+        if (m_typeIdx == 1 || m_typeIdx == 7 || m_typeIdx == 10) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(isBuy ? "Ask" : "Bid")) {
+                double fillPrice = isBuy ? (m_asks.empty() ? m_midPrice : m_asks[0].price)
+                                         : (m_bids.empty() ? m_midPrice : m_bids[0].price);
+                std::snprintf(m_lmtBuf, sizeof(m_lmtBuf), "%.2f", fillPrice);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fill from best %s", isBuy ? "ask" : "bid");
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Fill from best %s", isBuy ? "ask" : "bid");
     }
 
-    // ---- Stop price (shown for Stop / StopLimit) ----------------------------
-    bool needsStop  = (m_typeIdx == 2 || m_typeIdx == 3);
-    if (needsStop) {
+    if (showStp) {
         ImGui::Text("Stp Price");
         ImGui::SameLine(labelCol);
         ImGui::SetNextItemWidth(em(100));
@@ -1048,38 +1099,179 @@ void TradingWindow::DrawOrderEntry() {
                          ImGuiInputTextFlags_CharsDecimal);
     }
 
+    if (showTrigger) {
+        ImGui::Text("Trigger");
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
+        ImGui::InputText("##stp", m_stpBuf, sizeof(m_stpBuf),
+                         ImGuiInputTextFlags_CharsDecimal);
+    }
+
+    if (showTrail) {
+        // $/% toggle button
+        ImGui::Text(m_trailByPct ? "Trail %%" : "Trail $");
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(80));
+        if (m_trailByPct)
+            ImGui::InputText("##trailpct", m_trailPctBuf, sizeof(m_trailPctBuf),
+                             ImGuiInputTextFlags_CharsDecimal);
+        else
+            ImGui::InputText("##trailamt", m_trailAmtBuf, sizeof(m_trailAmtBuf),
+                             ImGuiInputTextFlags_CharsDecimal);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(m_trailByPct ? "$" : "%"))
+            m_trailByPct = !m_trailByPct;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Switch between trailing by %s",
+                              m_trailByPct ? "percent and dollar amount" : "dollar amount and percent");
+
+        // Optional initial stop cap
+        ImGui::Text("Stop Cap");
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
+        ImGui::InputText("##stpcap", m_stpBuf, sizeof(m_stpBuf),
+                         ImGuiInputTextFlags_CharsDecimal);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Optional: sets the initial stop price.\nLeave blank to let IB compute from current price.");
+    }
+
+    if (showLmtOff) {
+        ImGui::Text("Lmt Offset");
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
+        ImGui::InputText("##lmtoff", m_lmtBuf, sizeof(m_lmtBuf),
+                         ImGuiInputTextFlags_CharsDecimal);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Limit price offset from the trail stop price.\nPositive = limit above stop (buy), negative = below (sell).");
+    }
+
+    if (showCapOpt) {
+        const char* capLabel = (m_typeIdx == 11) ? "Price Cap" : "Cap (opt.)";
+        ImGui::Text("%s", capLabel);
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
+        ImGui::InputText("##cap", m_lmtBuf, sizeof(m_lmtBuf),
+                         ImGuiInputTextFlags_CharsDecimal);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Optional maximum (buy) or minimum (sell) price.\nLeave blank for no cap.");
+    }
+
+    if (showOffset) {
+        ImGui::Text("Peg Offset");
+        ImGui::SameLine(labelCol);
+        ImGui::SetNextItemWidth(em(100));
+        ImGui::InputText("##offset", m_offsetBuf, sizeof(m_offsetBuf),
+                         ImGuiInputTextFlags_CharsDecimal);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Dollar offset from the primary quote.\nNegative = below (buy), positive = above (sell).");
+    }
+
     // ---- Time In Force ------------------------------------------------------
+    // MOC/LOC must be DAY-only; auto-clamp and grey out the combo.
+    bool tifLocked = (m_typeIdx == 6 || m_typeIdx == 7); // MOC, LOC
+    if (tifLocked) m_tifIdx = 0;
+
     const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
     ImGui::Text("TIF");
     ImGui::SameLine(labelCol);
     ImGui::SetNextItemWidth(em(80));
+    if (tifLocked) ImGui::BeginDisabled();
     ImGui::Combo("##tif", &m_tifIdx, tifs, IM_ARRAYSIZE(tifs));
+    if (tifLocked) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("On-Close orders must use DAY TIF.");
+    }
 
     // ---- Outside RTH --------------------------------------------------------
+    // Close orders (MOC/LOC) can't be outside RTH — disable the checkbox.
+    bool rthLocked = (m_typeIdx == 6 || m_typeIdx == 7);
+    if (rthLocked) m_outsideRth = false;
+
     ImGui::Spacing();
+    if (rthLocked) ImGui::BeginDisabled();
     ImGui::Checkbox("Outside RTH", &m_outsideRth);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            "Allow order to be active and fill during pre-market\n"
-            "and after-hours sessions.\n"
-            "Requires a limit price — market orders are rejected\n"
-            "outside regular trading hours by IB.");
+    if (rthLocked) {
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("On-Close orders always execute at the regular session close.");
+    } else {
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Allow order to be active and fill during pre-market\n"
+                "and after-hours sessions.\n"
+                "Requires a limit price — market orders are rejected\n"
+                "outside regular trading hours by IB.");
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
+    // ---- Price summary for the submit label and order preview ---------------
+    // Returns a short string describing the key price(s) for the current type.
+    char priceSummary[96] = "";
+    switch (m_typeIdx) {
+        case 0: case 6: case 8:  // MKT, MOC, MTL
+            std::snprintf(priceSummary, sizeof(priceSummary), "MKT");
+            break;
+        case 1: case 7:  // LMT, LOC
+            std::snprintf(priceSummary, sizeof(priceSummary), "$%s", m_lmtBuf);
+            break;
+        case 2:  // STP
+            std::snprintf(priceSummary, sizeof(priceSummary), "stp $%s", m_stpBuf);
+            break;
+        case 3:  // STP LMT
+            std::snprintf(priceSummary, sizeof(priceSummary), "stp $%s / lmt $%s",
+                          m_stpBuf, m_lmtBuf);
+            break;
+        case 4:  // TRAIL
+            if (m_trailByPct)
+                std::snprintf(priceSummary, sizeof(priceSummary), "%s%% trail",
+                              m_trailPctBuf);
+            else
+                std::snprintf(priceSummary, sizeof(priceSummary), "$%s trail",
+                              m_trailAmtBuf);
+            break;
+        case 5:  // TRAIL LIMIT
+            if (m_trailByPct)
+                std::snprintf(priceSummary, sizeof(priceSummary), "%s%% / off $%s",
+                              m_trailPctBuf, m_lmtBuf);
+            else
+                std::snprintf(priceSummary, sizeof(priceSummary), "$%s / off $%s",
+                              m_trailAmtBuf, m_lmtBuf);
+            break;
+        case 9:  // MIT
+            std::snprintf(priceSummary, sizeof(priceSummary), "trig $%s", m_stpBuf);
+            break;
+        case 10: // LIT
+            std::snprintf(priceSummary, sizeof(priceSummary), "trig $%s / lmt $%s",
+                          m_stpBuf, m_lmtBuf);
+            break;
+        case 11: // MIDPRICE
+            if (m_lmtBuf[0] != '\0')
+                std::snprintf(priceSummary, sizeof(priceSummary), "mid / cap $%s",
+                              m_lmtBuf);
+            else
+                std::snprintf(priceSummary, sizeof(priceSummary), "mid");
+            break;
+        case 12: // REL
+            std::snprintf(priceSummary, sizeof(priceSummary), "off $%s", m_offsetBuf);
+            break;
+        default: break;
+    }
+
     // ---- Order preview ------------------------------------------------------
-    double qty   = std::atof(m_qtyBuf);
-    double lmt   = std::atof(m_lmtBuf);
-    double refP  = needsLimit ? lmt : m_midPrice;
+    double qty    = std::atof(m_qtyBuf);
+    double lmt    = std::atof(m_lmtBuf);
+    double refP   = (showLmt && lmt > 0) ? lmt : m_midPrice;
     double estVal = qty * refP;
 
     ImGui::PushStyleColor(ImGuiCol_Text, kDim);
     ImGui::Text("Est. value: $%.2f  |  %s  %s  %s",
                 estVal,
                 m_sideIdx == 0 ? "BUY" : "SELL",
-                types[m_typeIdx],
+                kTypes[m_typeIdx],
                 tifs[m_tifIdx]);
     ImGui::PopStyleColor();
 
@@ -1098,12 +1290,12 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  btnAct);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
 
-    char submitLabel[64];
+    char submitLabel[96];
     std::snprintf(submitLabel, sizeof(submitLabel),
                   "%s  %s  %.0f @ %s",
                   isBuy ? "BUY" : "SELL",
-                  types[m_typeIdx], qty,
-                  m_typeIdx == 0 ? "MKT" : m_lmtBuf);
+                  kTypes[m_typeIdx], qty,
+                  priceSummary);
 
     float submitW = ImGui::GetContentRegionAvail().x;
     if (ImGui::Button(submitLabel, ImVec2(submitW, em(25)))) {
@@ -1149,7 +1341,13 @@ void TradingWindow::DrawConfirmationPopup() {
 
     if (ImGui::BeginPopupModal("Confirm Order", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        const char* types[] = {"Market", "Limit", "Stop", "Stop Limit"};
+        static constexpr const char* kTypes[] = {
+            "Market", "Limit", "Stop", "Stop Limit",
+            "Trail Stop", "Trail Limit",
+            "Market On Close", "Limit On Close", "Mkt To Limit",
+            "Mkt If Touched", "Lmt If Touched",
+            "Midprice", "Relative"
+        };
         const char* tifs[]  = {"DAY", "GTC", "IOC", "FOK"};
         double qty  = std::atof(m_qtyBuf);
         double lmt  = std::atof(m_lmtBuf);
@@ -1162,11 +1360,34 @@ void TradingWindow::DrawConfirmationPopup() {
         ImGui::PopStyleColor();
         ImGui::Separator();
 
-        ImGui::Text("Symbol:    %s",           m_symbol);
-        ImGui::Text("Type:      %s",           types[m_typeIdx]);
-        ImGui::Text("Quantity:  %.0f shares",  qty);
-        if (m_typeIdx >= 1) ImGui::Text("Limit:     $%.2f", lmt);
-        if (m_typeIdx >= 2) ImGui::Text("Stop:      $%.2f", stp);
+        ImGui::Text("Symbol:    %s",          m_symbol);
+        ImGui::Text("Type:      %s",          kTypes[m_typeIdx]);
+        ImGui::Text("Quantity:  %.0f shares", qty);
+        // Show relevant price fields per type
+        if (m_typeIdx == 1 || m_typeIdx == 7 || m_typeIdx == 10) // LMT, LOC, LIT
+            ImGui::Text("Limit:     $%.2f", lmt);
+        if (m_typeIdx == 2 || m_typeIdx == 3)  // STP, STP LMT
+            ImGui::Text("Stop:      $%.2f", stp);
+        if (m_typeIdx == 3)                    // STP LMT also shows limit
+            ImGui::Text("Limit:     $%.2f", lmt);
+        if (m_typeIdx == 4 || m_typeIdx == 5) { // TRAIL, TRAIL LIMIT
+            if (m_trailByPct) ImGui::Text("Trail %%:   %.2f%%", std::atof(m_trailPctBuf));
+            else              ImGui::Text("Trail $:   $%.2f",   std::atof(m_trailAmtBuf));
+            if (stp > 0)      ImGui::Text("Stop Cap:  $%.2f",   stp);
+        }
+        if (m_typeIdx == 5)                    // TRAIL LIMIT also shows lmt offset
+            ImGui::Text("Lmt Offset:$%.2f", lmt);
+        if (m_typeIdx == 9)                    // MIT trigger
+            ImGui::Text("Trigger:   $%.2f", stp);
+        if (m_typeIdx == 10) {                 // LIT trigger + limit (limit shown above)
+            ImGui::Text("Trigger:   $%.2f", stp);
+        }
+        if (m_typeIdx == 11 && lmt > 0)        // MIDPRICE cap
+            ImGui::Text("Price Cap: $%.2f", lmt);
+        if (m_typeIdx == 12) {                 // REL
+            ImGui::Text("Offset:    $%.4f", std::atof(m_offsetBuf));
+            if (lmt > 0) ImGui::Text("Cap:       $%.2f", lmt);
+        }
         ImGui::Text("TIF:       %s",           tifs[m_tifIdx]);
         if (m_outsideRth) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
@@ -1207,59 +1428,169 @@ bool TradingWindow::ValidateOrder(std::string& err) const {
     double qty = std::atof(m_qtyBuf);
     if (qty <= 0) { err = "Quantity must be > 0"; return false; }
 
-    bool needsLimit = (m_typeIdx == 1 || m_typeIdx == 3);
-    bool needsStop  = (m_typeIdx == 2 || m_typeIdx == 3);
+    switch (m_typeIdx) {
+        case 1:  // LMT
+        case 7:  // LOC
+        {
+            double lmt = std::atof(m_lmtBuf);
+            if (lmt <= 0) { err = "Limit price must be > 0"; return false; }
+            break;
+        }
+        case 2:  // STP
+        {
+            double stp = std::atof(m_stpBuf);
+            if (stp <= 0) { err = "Stop price must be > 0"; return false; }
+            break;
+        }
+        case 3:  // STP LMT
+        {
+            double stp = std::atof(m_stpBuf);
+            double lmt = std::atof(m_lmtBuf);
+            if (stp <= 0) { err = "Stop price must be > 0"; return false; }
+            if (lmt <= 0) { err = "Limit price must be > 0"; return false; }
+            break;
+        }
+        case 4:  // TRAIL
+        {
+            double amt = m_trailByPct ? std::atof(m_trailPctBuf) : std::atof(m_trailAmtBuf);
+            if (amt <= 0) { err = "Trailing amount must be > 0"; return false; }
+            break;
+        }
+        case 5:  // TRAIL LIMIT
+        {
+            double amt = m_trailByPct ? std::atof(m_trailPctBuf) : std::atof(m_trailAmtBuf);
+            if (amt <= 0) { err = "Trailing amount must be > 0"; return false; }
+            double off = std::atof(m_lmtBuf);
+            if (off == 0.0) { err = "Limit offset must be non-zero"; return false; }
 
-    if (needsLimit) {
-        double lmt = std::atof(m_lmtBuf);
-        if (lmt <= 0) { err = "Limit price must be > 0"; return false; }
-    }
-    if (needsStop) {
-        double stp = std::atof(m_stpBuf);
-        if (stp <= 0) { err = "Stop price must be > 0"; return false; }
+            double stp = std::atof(m_stpBuf);
+            if (stp <= 0.0 && m_midPrice <= 0.0) {
+                err = "Need Stop Cap if market price is unavailable";
+                return false;
+            }
+            break;
+        }
+        case 9:  // MIT
+        {
+            double trig = std::atof(m_stpBuf);
+            if (trig <= 0) { err = "Trigger price must be > 0"; return false; }
+            break;
+        }
+        case 10: // LIT
+        {
+            double trig = std::atof(m_stpBuf);
+            double lmt  = std::atof(m_lmtBuf);
+            if (trig <= 0) { err = "Trigger price must be > 0"; return false; }
+            if (lmt  <= 0) { err = "Limit price must be > 0";   return false; }
+            break;
+        }
+        case 12: // REL
+        {
+            double off = std::atof(m_offsetBuf);
+            if (off == 0.0) { err = "Peg offset must be non-zero"; return false; }
+            break;
+        }
+        default: break;  // MKT(0), MOC(6), MTL(8), MIDPRICE(11) — no price required
     }
     return true;
 }
 
 void TradingWindow::SubmitOrder() {
+    // Explicit typeIdx → OrderType mapping (no fragile enum cast)
+    static constexpr core::OrderType kTypeMap[] = {
+        core::OrderType::Market,   // 0
+        core::OrderType::Limit,    // 1
+        core::OrderType::Stop,     // 2
+        core::OrderType::StopLimit,// 3
+        core::OrderType::Trail,    // 4
+        core::OrderType::TrailLimit,// 5
+        core::OrderType::MOC,      // 6
+        core::OrderType::LOC,      // 7
+        core::OrderType::MTL,      // 8
+        core::OrderType::MIT,      // 9
+        core::OrderType::LIT,      // 10
+        core::OrderType::Midprice, // 11
+        core::OrderType::Relative, // 12
+    };
+
     core::Order o;
-    o.orderId    = m_nextOrderId++;
-    o.symbol     = m_symbol;
-    o.side       = m_sideIdx == 0 ? core::OrderSide::Buy : core::OrderSide::Sell;
-    o.type       = static_cast<core::OrderType>(m_typeIdx);
-    o.tif        = static_cast<core::TimeInForce>(m_tifIdx);
-    o.quantity   = std::atof(m_qtyBuf);
-    o.limitPrice = (m_typeIdx == 1 || m_typeIdx == 3) ? std::atof(m_lmtBuf) : 0.0;
-    o.stopPrice  = (m_typeIdx == 2 || m_typeIdx == 3) ? std::atof(m_stpBuf) : 0.0;
-    o.status     = core::OrderStatus::Working;
+    o.orderId     = m_nextOrderId++;
+    o.symbol      = m_symbol;
+    o.side        = (m_sideIdx == 0) ? core::OrderSide::Buy : core::OrderSide::Sell;
+    o.type        = kTypeMap[m_typeIdx];
+    o.tif         = static_cast<core::TimeInForce>(m_tifIdx);
+    o.quantity    = std::atof(m_qtyBuf);
+    o.outsideRth  = m_outsideRth;
+    o.status      = core::OrderStatus::Working;
     o.submittedAt = std::time(nullptr);
     o.updatedAt   = o.submittedAt;
 
-    if (OnOrderSubmit) {
-        const char* action = (o.side == core::OrderSide::Buy) ? "BUY" : "SELL";
-        const char* orderType = "MKT";
-        double price    = 0.0;  // lmt price for LMT; stop trigger for STP / STP LMT
-        double auxPrice = 0.0;  // limit price for STP LMT
-        switch (o.type) {
-            case core::OrderType::Limit:
-                orderType = "LMT";
-                price     = o.limitPrice;
-                break;
-            case core::OrderType::Stop:
-                orderType = "STP";
-                price     = o.stopPrice;
-                break;
-            case core::OrderType::StopLimit:
-                orderType = "STP LMT";
-                price     = o.stopPrice;   // stop trigger
-                auxPrice  = o.limitPrice;  // limit price
-                break;
-            default: break;
+    // Populate price fields per type
+    switch (m_typeIdx) {
+        case 1:  // LMT
+        case 7:  // LOC
+            o.limitPrice = std::atof(m_lmtBuf);
+            break;
+        case 2:  // STP
+            o.stopPrice = std::atof(m_stpBuf);
+            break;
+        case 3:  // STP LMT
+            o.stopPrice  = std::atof(m_stpBuf);
+            o.limitPrice = std::atof(m_lmtBuf);
+            break;
+        case 4:  // TRAIL
+        case 5:  // TRAIL LIMIT
+        {
+            double trailAmtVal = 0.0;
+            if (m_trailByPct) {
+                o.trailingPercent = std::atof(m_trailPctBuf);
+                trailAmtVal = m_midPrice * (o.trailingPercent / 100.0);
+            } else {
+                o.auxPrice = std::atof(m_trailAmtBuf);
+                trailAmtVal = o.auxPrice;
+            }
+
+            o.trailStopPrice = std::atof(m_stpBuf);
+            if (o.trailStopPrice <= 0.0) {
+                if (m_midPrice > 0.0) {
+                    // Default initial stop if left blank
+                    if (o.side == core::OrderSide::Buy)
+                        o.trailStopPrice = m_midPrice + trailAmtVal;
+                    else
+                        o.trailStopPrice = m_midPrice - trailAmtVal;
+                } else {
+                    // We need a stop price for TRAIL LIMIT but have no market price.
+                    // Fallback: if it's a TRAIL LIMIT and we are BUYING, 0.0 is definitely wrong.
+                    // But we can't guess. For now, let's at least try to avoid sending 0.
+                    // IBKRClient will check this too.
+                }
+            }
+
+            if (m_typeIdx == 5)
+                o.lmtPriceOffset = std::atof(m_lmtBuf);
+            break;
         }
-        const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
-        OnOrderSubmit(o.orderId, o.symbol, action, orderType, o.quantity, price, auxPrice,
-                      tifs[m_tifIdx], m_outsideRth);
+        case 9:  // MIT
+            o.auxPrice = std::atof(m_stpBuf);
+            break;
+        case 10: // LIT
+            o.auxPrice   = std::atof(m_stpBuf);  // trigger
+            o.limitPrice = std::atof(m_lmtBuf);
+            break;
+        case 11: // MIDPRICE — optional cap
+            if (m_lmtBuf[0] != '\0')
+                o.limitPrice = std::atof(m_lmtBuf);
+            break;
+        case 12: // REL
+            o.auxPrice = std::atof(m_offsetBuf);
+            if (m_lmtBuf[0] != '\0')
+                o.limitPrice = std::atof(m_lmtBuf);
+            break;
+        default: break; // MKT(0), MOC(6), MTL(8)
     }
+
+    if (OnOrderSubmit)
+        OnOrderSubmit(o);
 
     m_openOrders.push_back(o);
 
@@ -1340,20 +1671,26 @@ void TradingWindow::DrawOpenOrders() {
 
     ImGuiTableFlags tblFlags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit;
 
-    if (!ImGui::BeginTable("##orders", 9, tblFlags)) return;
+    if (!ImGui::BeginTable("##orders", 14, tblFlags)) return;
 
     ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("ID",     ImGuiTableColumnFlags_WidthFixed, 50);
-    ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 60);
-    ImGui::TableSetupColumn("Side",   ImGuiTableColumnFlags_WidthFixed, 42);
-    ImGui::TableSetupColumn("Type",   ImGuiTableColumnFlags_WidthFixed, 60);
-    ImGui::TableSetupColumn("Qty",    ImGuiTableColumnFlags_WidthFixed, 55);
-    ImGui::TableSetupColumn("Price",  ImGuiTableColumnFlags_WidthFixed, 65);
-    ImGui::TableSetupColumn("Filled", ImGuiTableColumnFlags_WidthFixed, 55);
-    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed, 52);
+    ImGui::TableSetupColumn("ID",     ImGuiTableColumnFlags_WidthFixed,  50);
+    ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed,  60);
+    ImGui::TableSetupColumn("Side",   ImGuiTableColumnFlags_WidthFixed,  42);
+    ImGui::TableSetupColumn("Type",   ImGuiTableColumnFlags_WidthFixed,  68);
+    ImGui::TableSetupColumn("Qty",    ImGuiTableColumnFlags_WidthFixed,  50);
+    ImGui::TableSetupColumn("Price",  ImGuiTableColumnFlags_WidthFixed,  80);
+    ImGui::TableSetupColumn("Aux",    ImGuiTableColumnFlags_WidthFixed,  72);
+    ImGui::TableSetupColumn("TIF",    ImGuiTableColumnFlags_WidthFixed,  38);
+    ImGui::TableSetupColumn("Filled", ImGuiTableColumnFlags_WidthFixed,  50);
+    ImGui::TableSetupColumn("Avg $",  ImGuiTableColumnFlags_WidthFixed,  68);
+    ImGui::TableSetupColumn("Comm",   ImGuiTableColumnFlags_WidthFixed,  58);
+    ImGui::TableSetupColumn("Time",   ImGuiTableColumnFlags_WidthFixed,  60);
+    ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 100);
+    ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed,  52);
     ImGui::TableHeadersRow();
 
     // Show newest first
@@ -1372,29 +1709,133 @@ void TradingWindow::DrawOpenOrders() {
         ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
             ImGui::ColorConvertFloat4ToU32(rowTint));
 
+        // ID
         ImGui::TableNextColumn(); ImGui::Text("%d", o.orderId);
-        ImGui::TableNextColumn(); ImGui::Text("%s", o.symbol.c_str());
-
+        // Symbol
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(o.symbol.c_str());
+        // Side
         ImGui::TableNextColumn();
         ImGui::PushStyleColor(ImGuiCol_Text,
             o.side == core::OrderSide::Buy ? kBuyGreen : kSellRed);
-        ImGui::Text("%s", core::OrderSideStr(o.side));
+        ImGui::TextUnformatted(core::OrderSideStr(o.side));
         ImGui::PopStyleColor();
-
-        ImGui::TableNextColumn(); ImGui::Text("%s", core::OrderTypeStr(o.type));
+        // Type
+        ImGui::TableNextColumn(); ImGui::TextUnformatted(core::OrderTypeStr(o.type));
+        // Qty
         ImGui::TableNextColumn(); ImGui::Text("%.0f", o.quantity);
 
+        // Price — main price per order type
         ImGui::TableNextColumn();
-        if (o.type == core::OrderType::Market)
-            ImGui::TextDisabled("MKT");
-        else
-            ImGui::Text("$%.2f", o.limitPrice > 0 ? o.limitPrice : o.stopPrice);
+        switch (o.type) {
+            case core::OrderType::Market:
+            case core::OrderType::MOC:
+            case core::OrderType::MTL:
+                ImGui::TextDisabled("MKT");
+                break;
+            case core::OrderType::Stop:
+            case core::OrderType::StopLimit:
+                ImGui::Text("stp $%.2f", o.stopPrice);
+                break;
+            case core::OrderType::Trail:
+            case core::OrderType::TrailLimit:
+                if (o.trailingPercent > 0.0)
+                    ImGui::Text("tr %.2f%%", o.trailingPercent);
+                else
+                    ImGui::Text("tr $%.2f", o.auxPrice);
+                break;
+            case core::OrderType::MIT:
+                ImGui::Text("trig $%.2f", o.auxPrice);
+                break;
+            case core::OrderType::LIT:
+                ImGui::Text("trig $%.2f", o.auxPrice);
+                break;
+            case core::OrderType::Midprice:
+                ImGui::TextDisabled("mid");
+                break;
+            case core::OrderType::Relative:
+                ImGui::Text("off $%.3f", o.auxPrice);
+                break;
+            default:  // LMT, LOC
+                if (o.limitPrice > 0.0) ImGui::Text("$%.2f", o.limitPrice);
+                else                    ImGui::TextDisabled("—");
+                break;
+        }
+        if (ImGui::IsItemHovered()) {
+            // Full price detail on hover
+            ImGui::BeginTooltip();
+            if (o.limitPrice  > 0.0) ImGui::Text("Limit:    $%.4f", o.limitPrice);
+            if (o.stopPrice   > 0.0) ImGui::Text("Stop:     $%.4f", o.stopPrice);
+            if (o.auxPrice    > 0.0) ImGui::Text("Aux:      $%.4f", o.auxPrice);
+            if (o.trailingPercent > 0.0) ImGui::Text("Trail %%: %.4f", o.trailingPercent);
+            if (o.trailStopPrice > 0.0)  ImGui::Text("Stop cap: $%.4f", o.trailStopPrice);
+            if (o.lmtPriceOffset != 0.0) ImGui::Text("Lmt off:  $%.4f", o.lmtPriceOffset);
+            ImGui::EndTooltip();
+        }
 
+        // Aux — secondary price for dual-leg / trail orders
         ImGui::TableNextColumn();
-        if (o.filledQty > 0)
-            ImGui::Text("%.0f@$%.2f", o.filledQty, o.avgFillPrice);
+        switch (o.type) {
+            case core::OrderType::StopLimit:
+                if (o.limitPrice > 0.0) ImGui::Text("lmt $%.2f", o.limitPrice);
+                else                    ImGui::TextDisabled("—");
+                break;
+            case core::OrderType::LIT:
+                if (o.limitPrice > 0.0) ImGui::Text("lmt $%.2f", o.limitPrice);
+                else                    ImGui::TextDisabled("—");
+                break;
+            case core::OrderType::TrailLimit:
+                ImGui::Text("off $%.3f", o.lmtPriceOffset);
+                if (o.trailStopPrice > 0.0 && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stop cap: $%.2f", o.trailStopPrice);
+                break;
+            case core::OrderType::Trail:
+                if (o.trailStopPrice > 0.0) ImGui::Text("cap $%.2f", o.trailStopPrice);
+                else                        ImGui::TextDisabled("—");
+                break;
+            case core::OrderType::Midprice:
+                if (o.limitPrice > 0.0) ImGui::Text("cap $%.2f", o.limitPrice);
+                else                    ImGui::TextDisabled("—");
+                break;
+            default:
+                ImGui::TextDisabled("—");
+                break;
+        }
+
+        // TIF
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(core::TIFStr(o.tif));
+
+        // Filled qty
+        ImGui::TableNextColumn();
+        if (o.filledQty > 0.0)
+            ImGui::Text("%.0f", o.filledQty);
         else
             ImGui::TextDisabled("—");
+
+        // Avg fill price
+        ImGui::TableNextColumn();
+        if (o.avgFillPrice > 0.0)
+            ImGui::Text("$%.2f", o.avgFillPrice);
+        else
+            ImGui::TextDisabled("—");
+
+        // Commission
+        ImGui::TableNextColumn();
+        if (o.commission > 0.0)
+            ImGui::Text("-$%.2f", o.commission);
+        else
+            ImGui::TextDisabled("—");
+
+        // Submitted time
+        ImGui::TableNextColumn();
+        if (o.submittedAt != 0) {
+            char tbuf[16];
+            std::tm* lt = std::localtime(&o.submittedAt);
+            std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", lt);
+            ImGui::TextDisabled("%s", tbuf);
+        } else {
+            ImGui::TextDisabled("—");
+        }
 
         // Status with colour
         ImGui::TableNextColumn();
@@ -1408,8 +1849,10 @@ void TradingWindow::DrawOpenOrders() {
             default: break;
         }
         ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
-        ImGui::Text("%s", core::OrderStatusStr(o.status));
+        ImGui::TextUnformatted(core::OrderStatusStr(o.status));
         ImGui::PopStyleColor();
+        if (!o.rejectReason.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", o.rejectReason.c_str());
 
         // Cancel button
         ImGui::TableNextColumn();

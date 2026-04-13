@@ -155,14 +155,7 @@ public:
                         const std::string& locationCode = "STK.US.MAJOR");
     void CancelScannerData(int reqId);
 
-    void PlaceOrder(int orderId, const std::string& symbol,
-                    const std::string& action,       // "BUY" | "SELL"
-                    const std::string& orderType,    // "MKT","LMT","STP","STP LMT","TRAIL",…
-                    double qty,
-                    double price      = 0.0,         // lmt price or stop price for STP
-                    const std::string& tif = "DAY",  // "DAY","GTC","GTD"
-                    bool outsideRth   = false,
-                    double auxPrice   = 0.0);        // stop for STP LMT, trail amt for TRAIL*
+    void PlaceOrder(const ::core::Order& order);
     void CancelOrder(int orderId);
     void ReqOpenOrders();
 

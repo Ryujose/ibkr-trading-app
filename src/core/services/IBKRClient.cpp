@@ -241,56 +241,85 @@ void IBKRClient::CancelScannerData(int reqId) {
     m_client->cancelScannerSubscription(reqId);
 }
 
-void IBKRClient::PlaceOrder(int orderId, const std::string& symbol,
-                             const std::string& action,
-                             const std::string& orderType,
-                             double qty,
-                             double price,
-                             const std::string& tif,
-                             bool outsideRth,
-                             double auxPrice) {
-    // Capture all parameters by value and execute on the send thread so the
-    // blocking socket write never stalls the UI/render loop.
-    PostSend([=, this]() {
-        Contract c = MakeStockContract(symbol);
-        ::Order order;
-        order.action        = action;
-        order.totalQuantity = DecimalFunctions::doubleToDecimal(qty);
-        order.orderType     = orderType;
-        order.tif           = tif;
-        order.outsideRth    = outsideRth;
+void IBKRClient::PlaceOrder(const ::core::Order& o) {
+    // Capture order by value so the UI thread can mutate o after this call returns.
+    PostSend([o, this]() {
+        Contract c = MakeStockContract(o.symbol);
+        ::Order ibOrder;
+        ibOrder.action        = ::core::OrderSideStr(o.side);
+        ibOrder.totalQuantity = DecimalFunctions::doubleToDecimal(o.quantity);
+        ibOrder.orderType     = ::core::OrderTypeStr(o.type);
+        ibOrder.outsideRth    = o.outsideRth;
 
-        if (orderType == "LMT") {
-            order.lmtPrice = price;
-        } else if (orderType == "STP") {
-            order.auxPrice = price;
-        } else if (orderType == "STP LMT") {
-            order.auxPrice = price;      // stop trigger
-            order.lmtPrice = auxPrice;   // limit price
-        } else if (orderType == "MTL") {
-            // Market-to-Limit: no price fields
-        } else if (orderType == "TRAIL") {
-            order.auxPrice = auxPrice;   // trailing amount in dollars
-        } else if (orderType == "TRAIL LIMIT") {
-            order.auxPrice = auxPrice;   // trailing amount
-            order.lmtPrice = price;      // limit offset (price below/above trail stop)
-        } else if (orderType == "LIT") {
-            order.auxPrice = auxPrice;
-            order.lmtPrice = price;
-        } else if (orderType == "MIT") {
-            order.auxPrice = auxPrice;
+        // TIF
+        static constexpr const char* kTIFs[] = {"DAY", "GTC", "IOC", "FOK"};
+        ibOrder.tif = kTIFs[static_cast<int>(o.tif)];
+
+        // Price fields per order type
+        switch (o.type) {
+            case ::core::OrderType::Market:
+            case ::core::OrderType::MOC:
+            case ::core::OrderType::MTL:
+                break;  // no price fields
+
+            case ::core::OrderType::Limit:
+            case ::core::OrderType::LOC:
+                ibOrder.lmtPrice = o.limitPrice;
+                break;
+
+            case ::core::OrderType::Stop:
+                ibOrder.auxPrice = o.stopPrice;
+                break;
+
+            case ::core::OrderType::StopLimit:
+                ibOrder.auxPrice = o.stopPrice;
+                ibOrder.lmtPrice = o.limitPrice;
+                break;
+
+            case ::core::OrderType::Trail:
+                if (o.trailingPercent > 0.0)
+                    ibOrder.trailingPercent = o.trailingPercent;
+                else
+                    ibOrder.auxPrice = o.auxPrice;       // trailing amount $
+                if (o.trailStopPrice > 0.0)
+                    ibOrder.trailStopPrice = o.trailStopPrice;
+                break;
+
+            case ::core::OrderType::TrailLimit:
+                if (o.trailingPercent > 0.0)
+                    ibOrder.trailingPercent = o.trailingPercent;
+                else
+                    ibOrder.auxPrice = o.auxPrice;       // trailing amount $
+                ibOrder.lmtPriceOffset = o.lmtPriceOffset;
+                if (o.trailStopPrice > 0.0)
+                    ibOrder.trailStopPrice = o.trailStopPrice;
+                else
+                    printf("[IBKR] Warning: TRAIL LIMIT submitted without trailStopPrice. Symbols: %s\n", o.symbol.c_str());
+                break;
+
+            case ::core::OrderType::MIT:
+                ibOrder.auxPrice = o.auxPrice;           // trigger price
+                break;
+
+            case ::core::OrderType::LIT:
+                ibOrder.auxPrice = o.auxPrice;           // trigger price
+                ibOrder.lmtPrice = o.limitPrice;
+                break;
+
+            case ::core::OrderType::Midprice:
+                if (o.limitPrice > 0.0)
+                    ibOrder.lmtPrice = o.limitPrice;     // optional price cap
+                break;
+
+            case ::core::OrderType::Relative:
+                if (o.limitPrice > 0.0)
+                    ibOrder.lmtPrice = o.limitPrice;     // absolute cap
+                if (o.auxPrice > 0.0)
+                    ibOrder.auxPrice = o.auxPrice;       // peg offset
+                break;
         }
 
-        if (tif == "GTD") {
-            std::time_t expiry = std::time(nullptr) + 90LL * 86400;
-            char buf[32];
-            std::tm* gm = std::gmtime(&expiry);
-            if (gm) std::strftime(buf, sizeof(buf), "%Y%m%d %H:%M:%S", gm);
-            else    std::strcpy(buf, "20991231 23:59:59");
-            order.goodTillDate = buf;
-        }
-
-        m_client->placeOrder(orderId, c, order);
+        m_client->placeOrder(o.orderId, c, ibOrder);
     });
 }
 
@@ -663,9 +692,18 @@ static ::core::OrderSide ParseSide(const std::string& action) {
 }
 
 static ::core::OrderType ParseOrderType(const std::string& t) {
-    if (t == "LMT")                    return ::core::OrderType::Limit;
-    if (t == "STP")                    return ::core::OrderType::Stop;
-    if (t == "STP LMT")               return ::core::OrderType::StopLimit;
+    if (t == "LMT")           return ::core::OrderType::Limit;
+    if (t == "STP")           return ::core::OrderType::Stop;
+    if (t == "STP LMT")       return ::core::OrderType::StopLimit;
+    if (t == "TRAIL")         return ::core::OrderType::Trail;
+    if (t == "TRAIL LIMIT")   return ::core::OrderType::TrailLimit;
+    if (t == "MOC")           return ::core::OrderType::MOC;
+    if (t == "LOC")           return ::core::OrderType::LOC;
+    if (t == "MTL")           return ::core::OrderType::MTL;
+    if (t == "MIT")           return ::core::OrderType::MIT;
+    if (t == "LIT")           return ::core::OrderType::LIT;
+    if (t == "MIDPRICE")      return ::core::OrderType::Midprice;
+    if (t == "REL")           return ::core::OrderType::Relative;
     return ::core::OrderType::Market;
 }
 
@@ -686,7 +724,18 @@ void IBKRClient::openOrder(OrderId orderId, const Contract& c,
     order.tif         = ParseTIF(o.tif);
     order.quantity    = DecimalFunctions::decimalToDouble(o.totalQuantity);
     order.limitPrice  = (o.lmtPrice  != UNSET_DOUBLE) ? o.lmtPrice  : 0.0;
-    order.stopPrice   = (o.auxPrice  != UNSET_DOUBLE) ? o.auxPrice   : 0.0;
+    
+    // In core::Order, we use stopPrice for STP/STPLMT trigger, 
+    // and auxPrice for others (MIT/LIT/TRAIL/REL).
+    double aux = (o.auxPrice != UNSET_DOUBLE) ? o.auxPrice : 0.0;
+    order.stopPrice   = aux;
+    order.auxPrice    = aux;
+
+    order.trailingPercent = (o.trailingPercent != UNSET_DOUBLE) ? o.trailingPercent : 0.0;
+    order.trailStopPrice  = (o.trailStopPrice  != UNSET_DOUBLE) ? o.trailStopPrice  : 0.0;
+    order.lmtPriceOffset  = (o.lmtPriceOffset  != UNSET_DOUBLE) ? o.lmtPriceOffset  : 0.0;
+    order.outsideRth      = o.outsideRth;
+
     order.commission  = (s.commissionAndFees != UNSET_DOUBLE) ? s.commissionAndFees : 0.0;
     order.status      = ParseStatus(s.status);
     order.submittedAt = std::time(nullptr);

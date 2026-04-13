@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/models/MarketData.h"
+#include "core/models/OrderData.h"
 #include <string>
 #include <vector>
 #include <deque>
@@ -90,12 +91,10 @@ public:
     std::function<void(const std::string& sym, core::Timeframe tf,
                        const std::string& endDateTime, bool useRTH)> OnExtendHistory;
 
-    // Fired when user places an order from the chart trade panel
-    // auxPrice: stop price for STP LMT, trail amount for TRAIL/TRAIL LIMIT/LIT/MIT, else 0
-    std::function<void(const std::string& sym, const std::string& side,
-                       const std::string& orderType, double qty, double price,
-                       const std::string& tif, bool outsideRth,
-                       double auxPrice)> OnOrderSubmit;
+    // Fired when user places an order from the chart trade panel.
+    // The Order struct is fully populated (all price/type fields set); orderId=0
+    // and the host (main.cpp) assigns a real ID before calling PlaceOrder.
+    std::function<void(const core::Order&)> OnOrderSubmit;
 
     // Fired when user clicks the ✕ button on a pending order line in the chart.
     std::function<void(int orderId)> OnCancelOrder;
@@ -194,12 +193,17 @@ private:
     int         m_sessionIdx   = 0;       // 0=Regular,1=Pre-Market,2=After Hours,3=Overnight
     int         m_tifIdx       = 0;       // 0=DAY,1=GTC,2=GTD
     int         m_orderQty     = 100;
-    double      m_trailAmount  = 0.50;    // for TRAIL* order types
-    double      m_limitOffset  = 0.10;    // stop-limit: gap between stop and limit
-    bool        m_limitArmed   = false;   // waiting for chart click to set price
-    std::string m_limitSide;              // "BUY" or "SELL"
-    bool        m_ctrlClickPopup = false; // ctrl+click confirmation popup open
-    double      m_pendingPrice   = 0.0;   // price from chart click, pending confirm
+    double      m_trailAmount    = 0.50;   // trail $ amount for TRAIL / TRAIL LIMIT
+    double      m_trailPercent   = 1.0;   // trail % amount for TRAIL / TRAIL LIMIT
+    bool        m_trailByPct     = false; // false=trail by $, true=trail by %
+    double      m_trailStopPrice = 0.0;   // optional initial stop cap (0 = let IB compute)
+    double      m_limitOffset    = 0.10;  // lmt price offset for TRAIL LIMIT
+    double      m_pegOffset      = 0.05;  // peg offset for Relative orders
+    bool        m_limitArmed       = false;   // waiting for chart click to set price
+    std::string m_limitSide;                // "BUY" or "SELL"
+    bool        m_transmitInstantly = true; // false = always show confirmation before sending
+    core::Order m_pendingConfirmOrder;      // order staged for the confirmation popup
+    bool        m_showConfirmPopup  = false; // set true to open the modal next frame
 
     // ---- Placed order line (drag-and-send mode) ------------------------------
     bool        m_limitPlaced    = false;  // line dropped on chart, awaiting send
@@ -239,6 +243,7 @@ private:
     void DrawToolbar();
     void DrawAnalysisToolbar();
     void DrawTradePanel();
+    void DrawConfirmPopup();
     void DrawInfoBar();
     void DrawPositionStrip();
     void DrawCandleChart();

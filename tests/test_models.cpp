@@ -15,10 +15,19 @@ TEST_CASE("OrderSideStr returns correct strings", "[order]") {
 }
 
 TEST_CASE("OrderTypeStr returns correct IB order type strings", "[order]") {
-    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Market))    == "MKT");
-    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Limit))     == "LMT");
-    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Stop))      == "STP");
-    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::StopLimit)) == "STP LMT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Market))     == "MKT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Limit))      == "LMT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Stop))       == "STP");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::StopLimit))  == "STP LMT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Trail))      == "TRAIL");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::TrailLimit)) == "TRAIL LIMIT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::MOC))        == "MOC");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::LOC))        == "LOC");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::MTL))        == "MTL");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::MIT))        == "MIT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::LIT))        == "LIT");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Midprice))   == "MIDPRICE");
+    REQUIRE(std::string(core::OrderTypeStr(core::OrderType::Relative))   == "REL");
 }
 
 TEST_CASE("TIFStr returns correct time-in-force strings", "[order]") {
@@ -43,9 +52,14 @@ TEST_CASE("Order struct has sane defaults", "[order][defaults]") {
     core::Order o;
     REQUIRE(o.orderId      == 0);
     REQUIRE(o.quantity     == 0.0);
-    REQUIRE(o.limitPrice   == 0.0);
-    REQUIRE(o.stopPrice    == 0.0);
-    REQUIRE(o.filledQty    == 0.0);
+    REQUIRE(o.limitPrice      == 0.0);
+    REQUIRE(o.stopPrice       == 0.0);
+    REQUIRE(o.auxPrice        == 0.0);
+    REQUIRE(o.trailingPercent == 0.0);
+    REQUIRE(o.trailStopPrice  == 0.0);
+    REQUIRE(o.lmtPriceOffset  == 0.0);
+    REQUIRE_FALSE(o.outsideRth);
+    REQUIRE(o.filledQty       == 0.0);
     REQUIRE(o.avgFillPrice == 0.0);
     REQUIRE(o.commission   == 0.0);
     REQUIRE(o.status       == core::OrderStatus::Pending);

@@ -133,6 +133,30 @@ public:
 };
 ```
 
+## Order Types & PlaceOrder
+
+`IBKRClient::PlaceOrder(const core::Order& order)` — takes a fully-populated `core::Order` struct.  
+The old 9-parameter string-based overload is **gone**. All call sites (TradingWindow, ChartWindow, modify-order) build a `core::Order` and call this.
+
+`core::OrderType` enum (13 values):
+```
+Market, Limit, Stop, StopLimit,   // basic
+Trail, TrailLimit,                 // trailing stop
+MOC, LOC, MTL,                     // market/limit close/to-limit
+MIT, LIT,                          // if-touched
+Midprice, Relative                 // smart / pegged-to-primary
+```
+
+`core::Order` key fields for advanced types:
+- `auxPrice` — trigger for MIT/LIT; peg offset for REL; trailing $ amount for TRAIL*
+- `trailingPercent` — trailing % (mutually exclusive with auxPrice trail path)
+- `trailStopPrice` — initial stop cap for TRAIL / TRAIL LIMIT (0 = let IB compute)
+- `lmtPriceOffset` — limit offset from trail stop price for TRAIL LIMIT
+- `outsideRth` — allow pre/after-hours fills (was a separate callback param, now on struct)
+
+`TradingWindow::OnOrderSubmit` callback: `std::function<void(const core::Order&)>`  
+`ChartWindow::OnOrderSubmit` callback: unchanged (string-based, basic types only — main.cpp lambda builds a `core::Order` and calls `PlaceOrder`).
+
 ## Connection State Machine
 
 `ConnectionState` enum in `main.cpp`:
@@ -177,3 +201,12 @@ Three panels with user-draggable splitters:
 - **Bottom**: Tabbed panel (Open Orders / Execution Log / Time & Sales) — height controlled by `m_topHeightRatio` (default 0.65)
 
 Splitters are 4px `InvisibleButton` widgets; dragging updates the ratio stored on the window instance. Resize cursors (`ResizeEW` / `ResizeNS`) shown on hover.
+
+**Order entry** supports all 13 `OrderType` values. Conditional fields render per type:
+- Trail Stop / Trail Limit: $/% toggle (`m_trailByPct`), trailing amount buffer, optional stop cap, lmt offset (Trail Limit only)
+- MIT / LIT: trigger price field (reuses `m_stpBuf`)
+- Relative: peg offset (`m_offsetBuf`), optional price cap
+- Midprice: optional price cap (reuses `m_lmtBuf`)
+- MOC / MTL: no price fields
+
+`SubmitOrder()` uses an explicit `kTypeMap[]` array (not an enum cast) to map `m_typeIdx` → `core::OrderType`.

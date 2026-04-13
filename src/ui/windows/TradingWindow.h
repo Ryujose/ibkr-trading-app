@@ -54,15 +54,7 @@ public:
     // Inject position from IB portfolio data (qty>0 long, <0 short, 0 flat)
     void SetPosition(double qty, double avgCost);
 
-    std::function<void(int orderId, const std::string& sym,
-                       const std::string& action,
-                       const std::string& orderType,
-                       double qty,
-                       double price,          // lmt price for LMT; stop trigger for STP/STP LMT
-                       double auxPrice,       // limit price for STP LMT; 0 otherwise
-                       const std::string& tif,  // "DAY","GTC","IOC","FOK"
-                       bool outsideRth           // true = allow pre/after-hours fills
-                       )> OnOrderSubmit;
+    std::function<void(const core::Order&)> OnOrderSubmit;
     std::function<void(int orderId)> OnOrderCancel;
     // Fired when the user types a new symbol and presses Enter in Order Entry.
     std::function<void(const std::string& symbol)> OnSymbolChanged;
@@ -123,14 +115,18 @@ private:
     DOMOrder* FindDomOrder(double price);
 
     // ── Order entry ──────────────────────────────────────────────────────────
-    int  m_sideIdx     = 0;
-    int  m_typeIdx     = 0;
-    int  m_tifIdx      = 0;
-    char m_qtyBuf[32]  = "100";
-    char m_lmtBuf[32]  = "";
-    char m_stpBuf[32]  = "";
-    bool m_outsideRth  = false;
-    bool m_showConfirm = false;
+    int  m_sideIdx          = 0;
+    int  m_typeIdx          = 0;
+    int  m_tifIdx           = 0;
+    char m_qtyBuf[32]       = "100";
+    char m_lmtBuf[32]       = "";    // limit price / lmt offset (TRAIL LIMIT) / price cap (MIDPRICE/REL)
+    char m_stpBuf[32]       = "";    // stop price / trigger price (MIT/LIT) / trail stop cap
+    char m_trailAmtBuf[32]  = "1.00"; // trailing amount in $ (TRAIL / TRAIL LIMIT)
+    char m_trailPctBuf[32]  = "1.0";  // trailing percent (TRAIL / TRAIL LIMIT)
+    bool m_trailByPct       = false;   // false = trail by $ amount, true = trail by %
+    char m_offsetBuf[32]    = "0.05"; // peg offset for Relative orders
+    bool m_outsideRth       = false;
+    bool m_showConfirm      = false;
 
     void DrawOrderEntry();
     bool ValidateOrder(std::string& err) const;
