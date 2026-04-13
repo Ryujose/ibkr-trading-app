@@ -121,21 +121,27 @@ void OrdersWindow::DrawOpenTab() {
 
     static ImGuiTableFlags flags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit;
 
-    if (!ImGui::BeginTable("##open", 10, flags, ImVec2(-1, -1))) return;
+    if (!ImGui::BeginTable("##open", 15, flags, ImVec2(-1, -1))) return;
 
     ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  55);
-    ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  70);
-    ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  45);
-    ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  65);
-    ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  60);
-    ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  60);
-    ImGui::TableSetupColumn("Limit $",  ImGuiTableColumnFlags_WidthFixed,  75);
-    ImGui::TableSetupColumn("Avg Fill", ImGuiTableColumnFlags_WidthFixed,  75);
-    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Action",   ImGuiTableColumnFlags_WidthFixed,  65);
+    ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  52);
+    ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  68);
+    ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  42);
+    ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  72);
+    ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  55);
+    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed,  80);
+    ImGui::TableSetupColumn("Aux",      ImGuiTableColumnFlags_WidthFixed,  78);
+    ImGui::TableSetupColumn("TIF",      ImGuiTableColumnFlags_WidthFixed,  38);
+    ImGui::TableSetupColumn("Ext",      ImGuiTableColumnFlags_WidthFixed,  30);
+    ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  52);
+    ImGui::TableSetupColumn("Avg $",    ImGuiTableColumnFlags_WidthFixed,  70);
+    ImGui::TableSetupColumn("Comm $",   ImGuiTableColumnFlags_WidthFixed,  62);
+    ImGui::TableSetupColumn("Time",     ImGuiTableColumnFlags_WidthFixed,  62);
+    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100);
+    ImGui::TableSetupColumn("Action",   ImGuiTableColumnFlags_WidthFixed,  58);
     ImGui::TableHeadersRow();
 
     for (auto& [id, o] : m_orders) {
@@ -158,21 +164,27 @@ void OrdersWindow::DrawHistoryTab() {
 
     static ImGuiTableFlags flags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit;
 
-    if (!ImGui::BeginTable("##history", 10, flags, ImVec2(-1, -1))) return;
+    if (!ImGui::BeginTable("##history", 15, flags, ImVec2(-1, -1))) return;
 
     ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  55);
-    ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  70);
-    ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  45);
-    ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  65);
-    ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  60);
-    ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  60);
-    ImGui::TableSetupColumn("Limit $",  ImGuiTableColumnFlags_WidthFixed,  75);
-    ImGui::TableSetupColumn("Avg Fill", ImGuiTableColumnFlags_WidthFixed,  75);
-    ImGui::TableSetupColumn("Comm $",   ImGuiTableColumnFlags_WidthFixed,  70);
-    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  52);
+    ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  68);
+    ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  42);
+    ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  72);
+    ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  55);
+    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed,  80);
+    ImGui::TableSetupColumn("Aux",      ImGuiTableColumnFlags_WidthFixed,  78);
+    ImGui::TableSetupColumn("TIF",      ImGuiTableColumnFlags_WidthFixed,  38);
+    ImGui::TableSetupColumn("Ext",      ImGuiTableColumnFlags_WidthFixed,  30);
+    ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  52);
+    ImGui::TableSetupColumn("Avg $",    ImGuiTableColumnFlags_WidthFixed,  70);
+    ImGui::TableSetupColumn("Comm $",   ImGuiTableColumnFlags_WidthFixed,  62);
+    ImGui::TableSetupColumn("Updated",  ImGuiTableColumnFlags_WidthFixed,  62);
+    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100);
+    ImGui::TableSetupColumn("Reject",   ImGuiTableColumnFlags_WidthFixed, 120);
     ImGui::TableHeadersRow();
 
     for (auto& [id, o] : m_orders) {
@@ -184,86 +196,208 @@ void OrdersWindow::DrawHistoryTab() {
 
 // ============================================================================
 // Single order row
+// Columns (0-14):
+//   0 ID | 1 Symbol | 2 Side | 3 Type | 4 Qty | 5 Price | 6 Aux | 7 TIF |
+//   8 Ext | 9 Filled | 10 Avg$ | 11 Comm$ | 12 Time | 13 Status |
+//   14 Action(open=Cancel) / Reject reason(history)
 // ============================================================================
 void OrdersWindow::DrawOrderRow(core::Order& o, bool showCancel) {
     ImGui::TableNextRow();
     ImGui::PushID(o.orderId);
 
-    ImVec4 statusCol = StatusColor(o.status);
+    // Row tint
+    ImVec4 rowTint = (o.side == core::OrderSide::Buy)
+        ? ImVec4(0.10f, 0.22f, 0.12f, 0.30f)
+        : ImVec4(0.26f, 0.10f, 0.10f, 0.30f);
+    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+        ImGui::ColorConvertFloat4ToU32(rowTint));
 
-    // ID
+    // 0 — ID
     ImGui::TableSetColumnIndex(0);
     ImGui::TextDisabled("%d", o.orderId);
 
-    // Symbol
+    // 1 — Symbol
     ImGui::TableSetColumnIndex(1);
     ImGui::TextUnformatted(o.symbol.c_str());
 
-    // Side
+    // 2 — Side
     ImGui::TableSetColumnIndex(2);
-    bool isBuy = (o.side == core::OrderSide::Buy);
     ImGui::PushStyleColor(ImGuiCol_Text,
-        isBuy ? ImVec4(0.2f, 0.9f, 0.4f, 1.f) : ImVec4(0.95f, 0.3f, 0.3f, 1.f));
+        o.side == core::OrderSide::Buy
+            ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+            : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
     ImGui::TextUnformatted(core::OrderSideStr(o.side));
     ImGui::PopStyleColor();
 
-    // Type
+    // 3 — Type
     ImGui::TableSetColumnIndex(3);
     ImGui::TextUnformatted(core::OrderTypeStr(o.type));
 
-    // Qty
+    // 4 — Qty
     ImGui::TableSetColumnIndex(4);
     ImGui::Text("%.0f", o.quantity);
 
-    // Filled
+    // 5 — Price (main price per order type)
     ImGui::TableSetColumnIndex(5);
+    switch (o.type) {
+        case core::OrderType::Market:
+        case core::OrderType::MOC:
+        case core::OrderType::MTL:
+            ImGui::TextDisabled("MKT");
+            break;
+        case core::OrderType::Limit:
+        case core::OrderType::LOC:
+            if (o.limitPrice > 0.0) ImGui::Text("$%.2f", o.limitPrice);
+            else                    ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::Stop:
+        case core::OrderType::StopLimit:
+            if (o.stopPrice > 0.0) ImGui::Text("stp $%.2f", o.stopPrice);
+            else                   ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::Trail:
+        case core::OrderType::TrailLimit:
+            if (o.trailingPercent > 0.0) ImGui::Text("tr %.2f%%", o.trailingPercent);
+            else if (o.auxPrice  > 0.0)  ImGui::Text("tr $%.2f",  o.auxPrice);
+            else                         ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::MIT:
+            if (o.auxPrice > 0.0) ImGui::Text("trig $%.2f", o.auxPrice);
+            else                  ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::LIT:
+            if (o.auxPrice > 0.0) ImGui::Text("trig $%.2f", o.auxPrice);
+            else                  ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::Midprice:
+            ImGui::TextDisabled("mid");
+            break;
+        case core::OrderType::Relative:
+            if (o.auxPrice > 0.0) ImGui::Text("off $%.3f", o.auxPrice);
+            else                  ImGui::TextDisabled("REL");
+            break;
+        default:
+            ImGui::TextDisabled("—");
+            break;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        if (o.limitPrice      > 0.0) ImGui::Text("Limit:    $%.4f", o.limitPrice);
+        if (o.stopPrice       > 0.0) ImGui::Text("Stop:     $%.4f", o.stopPrice);
+        if (o.auxPrice        > 0.0) ImGui::Text("Aux:      $%.4f", o.auxPrice);
+        if (o.trailingPercent > 0.0) ImGui::Text("Trail %%: %.4f",  o.trailingPercent);
+        if (o.trailStopPrice  > 0.0) ImGui::Text("Stop cap: $%.4f", o.trailStopPrice);
+        if (o.lmtPriceOffset != 0.0) ImGui::Text("Lmt off:  $%.4f", o.lmtPriceOffset);
+        ImGui::EndTooltip();
+    }
+
+    // 6 — Aux (secondary price for dual-leg / trail orders)
+    ImGui::TableSetColumnIndex(6);
+    switch (o.type) {
+        case core::OrderType::StopLimit:
+            if (o.limitPrice > 0.0) ImGui::Text("lmt $%.2f", o.limitPrice);
+            else                    ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::LIT:
+            if (o.limitPrice > 0.0) ImGui::Text("lmt $%.2f", o.limitPrice);
+            else                    ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::TrailLimit:
+            if (o.lmtPriceOffset != 0.0) ImGui::Text("off $%.3f", o.lmtPriceOffset);
+            else                         ImGui::TextDisabled("—");
+            if (o.trailStopPrice > 0.0 && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Stop cap: $%.2f", o.trailStopPrice);
+            break;
+        case core::OrderType::Trail:
+            if (o.trailStopPrice > 0.0) ImGui::Text("cap $%.2f", o.trailStopPrice);
+            else                        ImGui::TextDisabled("—");
+            break;
+        case core::OrderType::Midprice:
+            if (o.limitPrice > 0.0) ImGui::Text("cap $%.2f", o.limitPrice);
+            else                    ImGui::TextDisabled("—");
+            break;
+        default:
+            ImGui::TextDisabled("—");
+            break;
+    }
+
+    // 7 — TIF
+    ImGui::TableSetColumnIndex(7);
+    ImGui::TextUnformatted(core::TIFStr(o.tif));
+
+    // 8 — Ext RTH
+    ImGui::TableSetColumnIndex(8);
+    if (o.outsideRth)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+    ImGui::TextUnformatted(o.outsideRth ? "Y" : "—");
+    if (o.outsideRth) {
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Outside Regular Trading Hours allowed");
+    }
+
+    // 9 — Filled qty
+    ImGui::TableSetColumnIndex(9);
     if (o.filledQty > 0.0)
         ImGui::Text("%.0f", o.filledQty);
     else
         ImGui::TextDisabled("—");
 
-    // Limit price
-    ImGui::TableSetColumnIndex(6);
-    if (o.limitPrice > 0.0)
-        ImGui::Text("$%.2f", o.limitPrice);
-    else
-        ImGui::TextDisabled("MKT");
-
-    // Avg fill
-    ImGui::TableSetColumnIndex(7);
+    // 10 — Avg fill price
+    ImGui::TableSetColumnIndex(10);
     if (o.avgFillPrice > 0.0)
         ImGui::Text("$%.2f", o.avgFillPrice);
     else
         ImGui::TextDisabled("—");
 
-    // Commission (history tab) or Status (open tab)
-    if (!showCancel) {
-        // History: commission column
-        ImGui::TableSetColumnIndex(8);
-        if (o.commission > 0.0)
-            ImGui::Text("-$%.2f", o.commission);
-        else
+    // 11 — Commission
+    ImGui::TableSetColumnIndex(11);
+    if (o.commission > 0.0)
+        ImGui::Text("-$%.2f", o.commission);
+    else
+        ImGui::TextDisabled("—");
+
+    // 12 — Time (submitted for open orders, updated for history)
+    ImGui::TableSetColumnIndex(12);
+    {
+        std::time_t ts = showCancel ? o.submittedAt : o.updatedAt;
+        if (ts != 0) {
+            char tbuf[16];
+            std::tm* lt = std::localtime(&ts);
+            std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", lt);
+            ImGui::TextDisabled("%s", tbuf);
+        } else {
             ImGui::TextDisabled("—");
-        // Status
-        ImGui::TableSetColumnIndex(9);
-    } else {
-        ImGui::TableSetColumnIndex(8);
+        }
     }
 
-    ImGui::PushStyleColor(ImGuiCol_Text, statusCol);
+    // 13 — Status
+    ImGui::TableSetColumnIndex(13);
+    ImGui::PushStyleColor(ImGuiCol_Text, StatusColor(o.status));
     ImGui::TextUnformatted(core::OrderStatusStr(o.status));
     ImGui::PopStyleColor();
-    if (!o.rejectReason.empty() && ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", o.rejectReason.c_str());
 
-    // Cancel button (open tab only)
+    // 14 — Cancel (open) or Reject reason (history)
+    ImGui::TableSetColumnIndex(14);
     if (showCancel) {
-        ImGui::TableSetColumnIndex(9);
-        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.10f, 0.10f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.15f, 0.15f, 1.0f));
-        if (ImGui::SmallButton("Cancel") && OnCancelOrder)
-            OnCancelOrder(o.orderId);
-        ImGui::PopStyleColor(2);
+        bool isActive = !IsTerminal(o.status);
+        if (isActive) {
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.10f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.15f, 0.15f, 1.0f));
+            if (ImGui::SmallButton("Cancel") && OnCancelOrder)
+                OnCancelOrder(o.orderId);
+            ImGui::PopStyleColor(2);
+        }
+    } else {
+        if (!o.rejectReason.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.90f, 0.35f, 0.35f, 1.0f));
+            ImGui::TextUnformatted(o.rejectReason.c_str());
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", o.rejectReason.c_str());
+        } else {
+            ImGui::TextDisabled("—");
+        }
     }
 
     ImGui::PopID();

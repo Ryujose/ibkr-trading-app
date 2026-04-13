@@ -25,23 +25,31 @@ static constexpr const char* kHistoryFile = "symbol_history.txt";
 // Order type table — shared by DrawTradePanel and DrawOverlays
 // ============================================================================
 struct OrderTypeDef {
-    const char* label;
-    const char* ibStr;
-    bool needsPrice;    // arms chart-click price placement
-    bool needsTrail;    // show trail-amount input
-    bool isDualPrice;   // needs two interactive chart lines (stop + limit)
+    const char*     label;
+    const char*     ibStr;        // IB order-type string (also used in PendingOrderLine)
+    core::OrderType coreType;
+    bool needsPrice;   // arms chart-click price placement
+    bool needsTrail;   // show trail $/% input
+    bool isDualPrice;  // two chart clicks needed (first line + second line)
+    bool firstIsAux;   // first click → auxPrice/trigger (true for LIT), else stop/price
+    bool tifLocked;    // lock TIF combo to DAY (MOC / LOC)
+    bool noRth;        // disable outside RTH option (MOC / LOC)
 };
+//                                                                       nP     nT     dP     fA     tL     nR
 static constexpr OrderTypeDef kOrderTypes[] = {
-    { "Market",                    "MKT",         false, false, false },
-    { "Limit",                     "LMT",         true,  false, false },
-    { "Stop",                      "STP",         true,  false, false },
-    { "Stop Limit",                "STP LMT",     true,  false, true  },
-    { "Market to Limit",           "MTL",         false, false, false },
-    { "Adjustable Stop",           "STP",         true,  false, false },
-    { "Trailing",                  "TRAIL",       false, true,  false },
-    { "Trailing Limit",            "TRAIL LIMIT", false, true,  false },
-    { "Trailing Limit If Touched", "LIT",         true,  true,  false },
-    { "Trailing Market If Touched","MIT",         true,  true,  false },
+    { "Market",          "MKT",        core::OrderType::Market,   false, false, false, false, false, false },
+    { "Limit",           "LMT",        core::OrderType::Limit,    true,  false, false, false, false, false },
+    { "Stop",            "STP",        core::OrderType::Stop,     true,  false, false, false, false, false },
+    { "Stop Limit",      "STP LMT",    core::OrderType::StopLimit,true,  false, true,  false, false, false },
+    { "Trail Stop",      "TRAIL",      core::OrderType::Trail,    false, true,  false, false, false, false },
+    { "Trail Limit",     "TRAIL LIMIT",core::OrderType::TrailLimit,false, true,  false, false, false, false },
+    { "Market On Close", "MOC",        core::OrderType::MOC,      false, false, false, false, true,  true  },
+    { "Limit On Close",  "LOC",        core::OrderType::LOC,      true,  false, false, false, true,  true  },
+    { "Market to Limit", "MTL",        core::OrderType::MTL,      false, false, false, false, false, false },
+    { "Mkt If Touched",  "MIT",        core::OrderType::MIT,      true,  false, false, false, false, false },
+    { "Lmt If Touched",  "LIT",        core::OrderType::LIT,      true,  false, true,  true,  false, false },
+    { "Midprice",        "MIDPRICE",   core::OrderType::Midprice, false, false, false, false, false, false },
+    { "Relative",        "REL",        core::OrderType::Relative, false, false, false, false, false, false },
 };
 static constexpr int kNumOrderTypes = (int)std::size(kOrderTypes);
 
@@ -119,9 +127,9 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     // Reset drawing / order state so NoInputs is never left armed on the new symbol
     m_drawTool    = DrawTool::Cursor;
     m_drawPending = false;
-    m_limitArmed  = false;
-    m_ctrlClickPopup = false;
-    m_limitPlaced    = false;
+    m_limitArmed        = false;
+    m_showConfirmPopup  = false;
+    m_limitPlaced       = false;
     m_placedDragging = false;
     m_dragPendingIdx    = -1;
     m_dragPendingActive = false;
@@ -411,6 +419,8 @@ bool ChartWindow::Render() {
     if (m_ind.volume) DrawVolumeChart();
     if (m_ind.rsi)    DrawRsiChart();
 
+    DrawConfirmPopup();
+
     ImGui::End();
     return m_open;
 }
@@ -649,19 +659,65 @@ void ChartWindow::DrawTradePanel() {
         ImGui::EndCombo();
     }
 
-    // ── Trail amount (only for trailing types) ───────────────────────────
+    // ── Trail amount (Trail Stop / Trail Limit) ───────────────────────────
     if (kOrderTypes[m_orderTypeIdx].needsTrail) {
-        row.item(FlexRow::textW("Trail $:"), 6);
-        ImGui::TextDisabled("Trail $:");
-        row.item(em(72), 4);
-        ImGui::SetNextItemWidth(em(72));
-        ImGui::InputDouble("##trail", &m_trailAmount, 0.0, 0.0, "%.2f");
-        if (m_trailAmount <= 0.0) m_trailAmount = 0.01;
+        // $/% toggle button
+        row.item(em(28), 6);
+        if (ImGui::Button(m_trailByPct ? "%##tpct" : "$##tpct", ImVec2(em(28), 0)))
+            m_trailByPct = !m_trailByPct;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle trail by $$ / %%");
+
+        if (m_trailByPct) {
+            row.item(FlexRow::textW("Trail %:"), 4);
+            ImGui::TextDisabled("Trail %%:");
+            row.item(em(60), 4);
+            ImGui::SetNextItemWidth(em(60));
+            ImGui::InputDouble("##trailpct", &m_trailPercent, 0.0, 0.0, "%.2f");
+            if (m_trailPercent <= 0.0) m_trailPercent = 0.1;
+        } else {
+            row.item(FlexRow::textW("Trail $:"), 4);
+            ImGui::TextDisabled("Trail $:");
+            row.item(em(60), 4);
+            ImGui::SetNextItemWidth(em(60));
+            ImGui::InputDouble("##trail", &m_trailAmount, 0.0, 0.0, "%.2f");
+            if (m_trailAmount <= 0.0) m_trailAmount = 0.01;
+        }
+
+        // Lmt offset (Trail Limit only)
+        if (kOrderTypes[m_orderTypeIdx].coreType == core::OrderType::TrailLimit) {
+            row.item(FlexRow::textW("Lmt Off:"), 8);
+            ImGui::TextDisabled("Lmt Off:");
+            row.item(em(60), 4);
+            ImGui::SetNextItemWidth(em(60));
+            ImGui::InputDouble("##lmtoff", &m_limitOffset, 0.0, 0.0, "%.2f");
+        }
+
+        // Optional stop cap (both Trail Stop and Trail Limit)
+        row.item(FlexRow::textW("Stop Cap:"), 8);
+        ImGui::TextDisabled("Stop Cap:");
+        row.item(em(68), 4);
+        ImGui::SetNextItemWidth(em(68));
+        ImGui::InputDouble("##trailstp", &m_trailStopPrice, 0.0, 0.0, "%.2f");
+        if (m_trailStopPrice < 0.0) m_trailStopPrice = 0.0;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Initial stop price cap (0 = let IB compute)");
+    }
+
+    // ── Peg offset (Relative orders) ─────────────────────────────────────
+    if (kOrderTypes[m_orderTypeIdx].coreType == core::OrderType::Relative) {
+        row.item(FlexRow::textW("Offset:"), 6);
+        ImGui::TextDisabled("Offset:");
+        row.item(em(60), 4);
+        ImGui::SetNextItemWidth(em(60));
+        ImGui::InputDouble("##pegoff", &m_pegOffset, 0.0, 0.0, "%.2f");
+        if (m_pegOffset <= 0.0) m_pegOffset = 0.01;
     }
 
     // ── Session ─────────────────────────────────────────────────────────────
+    bool rthDisabled = kOrderTypes[m_orderTypeIdx].noRth;
     row.item(em(95), 10);
     ImGui::SetNextItemWidth(em(95));
+    if (rthDisabled) ImGui::BeginDisabled();
     if (ImGui::BeginCombo("##sess", kSessions[m_sessionIdx])) {
         for (int i = 0; i < 4; i++) {
             bool sel = (i == m_sessionIdx);
@@ -670,11 +726,14 @@ void ChartWindow::DrawTradePanel() {
         }
         ImGui::EndCombo();
     }
+    if (rthDisabled) ImGui::EndDisabled();
 
     // ── TIF ─────────────────────────────────────────────────────────────────
+    bool tifLocked = kOrderTypes[m_orderTypeIdx].tifLocked;
     row.item(em(52), 6);
     ImGui::SetNextItemWidth(em(52));
-    if (ImGui::BeginCombo("##tif", kTIFs[m_tifIdx])) {
+    if (tifLocked) ImGui::BeginDisabled();
+    if (ImGui::BeginCombo("##tif", tifLocked ? "DAY" : kTIFs[m_tifIdx])) {
         for (int i = 0; i < 3; i++) {
             bool sel = (i == m_tifIdx);
             if (ImGui::Selectable(kTIFs[i], sel)) m_tifIdx = i;
@@ -682,6 +741,7 @@ void ChartWindow::DrawTradePanel() {
         }
         ImGui::EndCombo();
     }
+    if (tifLocked) ImGui::EndDisabled();
 
     // ── BUY / SELL buttons ────────────────────────────────────────────────
     row.item(kBtnW, 14);
@@ -704,67 +764,74 @@ void ChartWindow::DrawTradePanel() {
                          ? ImVec4(0.4f, 0.7f, 1.f, 1.f)
                          : ImVec4(1.f, 0.4f, 0.4f, 1.f);
         const char* hint = m_firstPricePlaced
-            ? "Stop set — click chart to set limit price | Esc=cancel"
+            ? (kOrderTypes[m_orderTypeIdx].firstIsAux
+                ? "Trigger set — click chart for limit price | Esc=cancel"
+                : "Stop set — click chart for limit price | Esc=cancel")
             : kOrderTypes[m_orderTypeIdx].isDualPrice
-                ? "Click chart to set STOP price | Esc=cancel"
-                : "Click to send | Ctrl+click for confirmation | Esc=cancel";
+                ? (kOrderTypes[m_orderTypeIdx].firstIsAux
+                    ? "Click chart to set TRIGGER price | Esc=cancel"
+                    : "Click chart to set STOP price | Esc=cancel")
+                : m_transmitInstantly
+                    ? "Click to send | Ctrl+click for confirmation | Esc=cancel"
+                    : "Click to preview & confirm | Esc=cancel";
         row.item(FlexRow::textW(hint), 12);
         ImGui::TextColored(hintCol, "%s", hint);
     }
 
-    // ── Ctrl+Click price confirmation popup ─────────────────────────────────
-    if (m_ctrlClickPopup)
-        ImGui::OpenPopup("##limitconfirm");
-    m_ctrlClickPopup = false;
-
-    if (ImGui::BeginPopup("##limitconfirm")) {
-        ImVec4 titleCol = (m_limitSide == "BUY")
-                          ? ImVec4(0.4f, 0.8f, 1.f, 1.f)
-                          : ImVec4(1.f, 0.45f, 0.45f, 1.f);
-        ImGui::TextColored(titleCol, "Confirm %s Order", m_limitSide.c_str());
-        ImGui::Separator();
-        ImGui::Text("Type: %s", kOrderTypes[m_orderTypeIdx].label);
-        ImGui::SetNextItemWidth(em(100));
-        ImGui::InputDouble("Price##confirm", &m_pendingPrice, 0.01, 0.10, "$%.2f");
-        ImGui::SetNextItemWidth(em(80));
-        int qty = m_orderQty;
-        ImGui::InputInt("Qty##confirm", &qty, 1, 10);
-        if (qty < 1) qty = 1;
-        m_orderQty = qty;
-        ImGui::Spacing();
-        bool confirm = ImGui::Button("Confirm##cp", ImVec2(80, 0));
-        ImGui::SameLine(0, 8);
-        bool cancel = ImGui::Button("Cancel##cp",  ImVec2(80, 0));
-        if (confirm) {
-            if (OnOrderSubmit) {
-                const auto& ot  = kOrderTypes[m_orderTypeIdx];
-                bool outsideRth = (m_sessionIdx != 0);
-                std::string tif = kTIFs[m_tifIdx];
-                double aux = ot.needsTrail ? m_trailAmount : 0.0;
-                OnOrderSubmit(m_symbol, m_limitSide, ot.ibStr,
-                              m_orderQty, m_pendingPrice, tif, outsideRth, aux);
-            }
-            m_limitArmed       = false;
-            m_firstPricePlaced = false;
-            ImGui::CloseCurrentPopup();
-        }
-        if (cancel) ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
+    // ── Transmit Instantly checkbox ─────────────────────────────────────────
+    row.item(FlexRow::checkboxW("Transmit Instantly"), 16);
+    ImGui::Checkbox("Transmit Instantly", &m_transmitInstantly);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("When ON: orders fire immediately on chart click.\n"
+                          "When OFF: a confirmation popup shows full order\n"
+                          "details before sending.");
 
     // ── Button logic ────────────────────────────────────────────────────────
-    auto fireOrder = [&](const std::string& side) {
-        const auto& ot      = kOrderTypes[m_orderTypeIdx];
-        bool outsideRth     = (m_sessionIdx != 0);
-        std::string tif     = kTIFs[m_tifIdx];
+    auto buildOrder = [&](const std::string& side) -> core::Order {
+        const auto& ot = kOrderTypes[m_orderTypeIdx];
+        static constexpr core::TimeInForce kTIFEnum[] = {
+            core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+        };
+        core::Order o;
+        o.symbol     = m_symbol;
+        o.side       = (side == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+        o.type       = ot.coreType;
+        o.quantity   = static_cast<double>(m_orderQty);
+        o.tif        = ot.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
+        o.outsideRth = !ot.noRth && (m_sessionIdx != 0);
+        switch (ot.coreType) {
+            case core::OrderType::Trail:
+                if (m_trailByPct) o.trailingPercent = m_trailPercent;
+                else              o.auxPrice         = m_trailAmount;
+                if (m_trailStopPrice > 0.0) o.trailStopPrice = m_trailStopPrice;
+                break;
+            case core::OrderType::TrailLimit:
+                if (m_trailByPct) o.trailingPercent = m_trailPercent;
+                else              o.auxPrice         = m_trailAmount;
+                o.lmtPriceOffset = m_limitOffset;
+                if (m_trailStopPrice > 0.0) o.trailStopPrice = m_trailStopPrice;
+                break;
+            case core::OrderType::Relative:
+                o.auxPrice = m_pegOffset;
+                break;
+            default: break;
+        }
+        return o;
+    };
 
+    auto fireOrder = [&](const std::string& side) {
+        const auto& ot = kOrderTypes[m_orderTypeIdx];
         if (!ot.needsPrice) {
-            // Market / Market-to-Limit / Trailing (no chart click needed)
-            if (OnOrderSubmit)
-                OnOrderSubmit(m_symbol, side, ot.ibStr,
-                              m_orderQty, 0.0, tif, outsideRth, m_trailAmount);
+            // MKT / MTL / MOC / Trail / Midprice / REL — no chart click needed
+            core::Order o = buildOrder(side);
+            if (m_transmitInstantly) {
+                if (OnOrderSubmit) OnOrderSubmit(o);
+            } else {
+                m_pendingConfirmOrder = o;
+                m_showConfirmPopup    = true;
+            }
         } else {
-            // Arm chart-click placement mode
+            // Arm chart-click placement mode (LMT, STP, STP LMT, LOC, MIT, LIT)
             m_limitArmed = true;
             m_limitSide  = side;
         }
@@ -778,6 +845,179 @@ void ChartWindow::DrawTradePanel() {
         m_limitArmed       = false;
         m_firstPricePlaced = false;
     }
+}
+
+// ============================================================================
+// Order confirmation popup
+// ============================================================================
+void ChartWindow::DrawConfirmPopup() {
+    if (m_showConfirmPopup) {
+        ImGui::OpenPopup("##chartconfirm");
+        m_showConfirmPopup = false;
+    }
+
+    // Centre over this window's viewport (works whether docked or floating)
+    ImVec2 center = ImGui::GetWindowViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(em(300), 0), ImGuiCond_Always);
+
+    if (!ImGui::BeginPopupModal("##chartconfirm", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize |
+                                ImGuiWindowFlags_NoTitleBar)) return;
+
+    core::Order& o = m_pendingConfirmOrder;
+    bool isBuy = (o.side == core::OrderSide::Buy);
+
+    // ── Title ────────────────────────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        isBuy ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+              : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+    ImGui::Text("  %s ORDER", isBuy ? "BUY" : "SELL");
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+
+    // ── Order fields (read-only) ─────────────────────────────────────────────
+    ImGui::Text("Symbol:     %s",  o.symbol.c_str());
+    ImGui::Text("Type:       %s",  core::OrderTypeStr(o.type));
+    ImGui::Text("Quantity:   %.0f shares", o.quantity);
+
+    ImGui::Spacing();
+
+    // Per-type price display
+    switch (o.type) {
+        case core::OrderType::Limit:
+        case core::OrderType::LOC:
+            ImGui::Text("Limit:      $%.4f", o.limitPrice);
+            break;
+
+        case core::OrderType::Stop:
+            ImGui::Text("Stop:       $%.4f", o.stopPrice);
+            break;
+
+        case core::OrderType::StopLimit:
+            ImGui::Text("Stop:       $%.4f", o.stopPrice);
+            ImGui::Text("Limit:      $%.4f", o.limitPrice);
+            break;
+
+        case core::OrderType::Trail:
+            if (o.trailingPercent > 0.0)
+                ImGui::Text("Trail %%:    %.2f%%", o.trailingPercent);
+            else
+                ImGui::Text("Trail $:    $%.4f", o.auxPrice);
+            if (o.trailStopPrice > 0.0)
+                ImGui::Text("Stop Cap:   $%.4f", o.trailStopPrice);
+            else
+                ImGui::TextDisabled("Stop cap:   (IB computes initial stop)");
+            break;
+
+        case core::OrderType::TrailLimit:
+            if (o.trailingPercent > 0.0)
+                ImGui::Text("Trail %%:    %.2f%%", o.trailingPercent);
+            else
+                ImGui::Text("Trail $:    $%.4f", o.auxPrice);
+            ImGui::Text("Lmt Offset: $%.4f", o.lmtPriceOffset);
+            if (o.trailStopPrice > 0.0)
+                ImGui::Text("Stop Cap:   $%.4f", o.trailStopPrice);
+            else
+                ImGui::TextDisabled("Stop cap:   (IB computes initial stop)");
+            break;
+
+        case core::OrderType::MIT:
+            ImGui::Text("Trigger:    $%.4f", o.auxPrice);
+            break;
+
+        case core::OrderType::LIT:
+            ImGui::Text("Trigger:    $%.4f", o.auxPrice);
+            ImGui::Text("Limit:      $%.4f", o.limitPrice);
+            break;
+
+        case core::OrderType::Midprice:
+            if (o.limitPrice > 0.0)
+                ImGui::Text("Price Cap:  $%.4f", o.limitPrice);
+            else
+                ImGui::TextDisabled("Price:      midpoint (no cap)");
+            break;
+
+        case core::OrderType::Relative:
+            ImGui::Text("Peg Offset: $%.4f", o.auxPrice);
+            if (o.limitPrice > 0.0)
+                ImGui::Text("Price Cap:  $%.4f", o.limitPrice);
+            break;
+
+        case core::OrderType::Market:
+        case core::OrderType::MOC:
+        case core::OrderType::MTL:
+            ImGui::TextDisabled("Price:      market (no limit)");
+            break;
+
+        default: break;
+    }
+
+    ImGui::Spacing();
+
+    // TIF + outside RTH
+    ImGui::Text("TIF:        %s", core::TIFStr(o.tif));
+    if (o.outsideRth) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.20f, 1.0f));
+        ImGui::TextUnformatted("Outside RTH: YES");
+        ImGui::PopStyleColor();
+    }
+
+    // Estimated value
+    {
+        double refP = 0.0;
+        switch (o.type) {
+            case core::OrderType::Limit:
+            case core::OrderType::LOC:
+            case core::OrderType::LIT:       refP = o.limitPrice; break;
+            case core::OrderType::Stop:
+            case core::OrderType::StopLimit: refP = o.stopPrice;  break;
+            case core::OrderType::MIT:       refP = o.auxPrice;   break;
+            default:
+                if (!m_closes.empty()) refP = m_closes.back();
+                break;
+        }
+        if (refP > 0.0) {
+            ImGui::Spacing();
+            ImGui::Text("Est. value: $%.2f", o.quantity * refP);
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── Confirm / Cancel ─────────────────────────────────────────────────────
+    ImGui::PushStyleColor(ImGuiCol_Button, isBuy
+        ? ImVec4(0.12f, 0.55f, 0.25f, 1.0f)
+        : ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, isBuy
+        ? ImVec4(0.18f, 0.70f, 0.35f, 1.0f)
+        : ImVec4(0.80f, 0.22f, 0.22f, 1.0f));
+    if (ImGui::Button("Confirm##cpok", ImVec2(em(130), 0))) {
+        if (OnOrderSubmit) OnOrderSubmit(o);
+        m_limitArmed       = false;
+        m_firstPricePlaced = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::PopStyleColor(2);
+
+    ImGui::SameLine();
+
+    if (ImGui::Button("Cancel##cpcancel", ImVec2(em(130), 0))) {
+        m_limitArmed       = false;
+        m_firstPricePlaced = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    // Escape key also cancels
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        m_limitArmed       = false;
+        m_firstPricePlaced = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
 }
 
 // ============================================================================
@@ -1158,7 +1398,9 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         // Pre-compute label text and cancel-button rect so we can exclude the
         // button area from the drag-start hit-test (same click must not do both).
         char lbl[128];
-        const char* legTag = isAux ? "LMT" : (order.orderType == "STP LMT" ? "STP" : "");
+        const char* legTag = isAux ? "LMT"
+                           : (order.orderType == "STP LMT" ? "STP"
+                           : order.orderType == "LIT"      ? "TRIG" : "");
         {
             double pnl = calcOrderPnL(drawPrice);
             if (isDragging) {
@@ -1280,8 +1522,9 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     for (int oi = 0; oi < (int)m_pendingOrders.size(); oi++) {
         auto& order = m_pendingOrders[oi];
         if (order.price <= 0.0) continue;
-        bool isDualOrder = (order.orderType == "STP LMT" && order.auxPrice > 0.0);
-        drawOrderLeg(oi, false);          // main (stop / limit) leg
+        bool isDualOrder = ((order.orderType == "STP LMT" || order.orderType == "LIT")
+                            && order.auxPrice > 0.0);
+        drawOrderLeg(oi, false);          // main (stop / trigger) leg
         // Guard: OnCancelOrder fired inside drawOrderLeg may have replaced
         // m_pendingOrders (via SetPendingOrders). Check index is still valid.
         if (isDualOrder && oi < (int)m_pendingOrders.size())
@@ -1290,7 +1533,6 @@ void ChartWindow::DrawOverlays(double /*step*/) {
 
     // ── Armed price line(s) ───────────────────────────────────────────────
     if (m_limitArmed && hovered) {
-        static constexpr const char* kTIFs[] = {"DAY","GTC","GTD"};
         bool isDual   = kOrderTypes[m_orderTypeIdx].isDualPrice;
         bool isBuy    = (m_limitSide == "BUY");
         double cursorPrice = std::round(mp.y / 0.01) * 0.01;
@@ -1365,23 +1607,44 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         ImU32 lmtBg   = IM_COL32(100, 55,  5,255);
 
         if (isDual && m_firstPricePlaced) {
-            // Phase 2: fixed stop line + moving limit line
+            // Phase 2: fixed first line + moving limit line
             // P&L shown on the limit leg (the fill price that determines profit)
-            drawArmedLine(m_firstPrice, stopCol, stopBg, "STOP", false);
+            bool firstIsAux = kOrderTypes[m_orderTypeIdx].firstIsAux;
+            const char* firstTag = firstIsAux ? "TRIG" : "STOP";
+            drawArmedLine(m_firstPrice, stopCol, stopBg, firstTag, false);
             drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
                           calcArmedPnL(cursorPrice));
 
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                if (OnOrderSubmit) {
-                    bool outsideRth = (m_sessionIdx != 0);
-                    // STP LMT: price=stopTrigger, auxPrice=limitPrice
-                    OnOrderSubmit(m_symbol, m_limitSide,
-                                  kOrderTypes[m_orderTypeIdx].ibStr,
-                                  m_orderQty, m_firstPrice,
-                                  kTIFs[m_tifIdx], outsideRth, cursorPrice);
+                const auto& ot = kOrderTypes[m_orderTypeIdx];
+                static constexpr core::TimeInForce kTIFEnum[] = {
+                    core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+                };
+                core::Order o;
+                o.symbol     = m_symbol;
+                o.side       = (m_limitSide == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+                o.type       = ot.coreType;
+                o.quantity   = static_cast<double>(m_orderQty);
+                o.tif        = ot.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
+                o.outsideRth = !ot.noRth && (m_sessionIdx != 0);
+                if (firstIsAux) {
+                    // LIT: first click = trigger (auxPrice), second = limit
+                    o.auxPrice   = m_firstPrice;
+                    o.limitPrice = cursorPrice;
+                } else {
+                    // STP LMT: first click = stop, second = limit
+                    o.stopPrice  = m_firstPrice;
+                    o.limitPrice = cursorPrice;
                 }
-                m_limitArmed       = false;
-                m_firstPricePlaced = false;
+                if (m_transmitInstantly) {
+                    if (OnOrderSubmit) OnOrderSubmit(o);
+                    m_limitArmed       = false;
+                    m_firstPricePlaced = false;
+                } else {
+                    m_pendingConfirmOrder = o;
+                    m_showConfirmPopup    = true;
+                    // leave m_limitArmed / m_firstPricePlaced — reset in popup confirm/cancel
+                }
             }
         } else {
             // Phase 1: single moving line (stop/trigger for dual, price for single)
@@ -1395,25 +1658,37 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             bool ctrlHeld = ImGui::GetIO().KeyCtrl;
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (isDual) {
-                    // Dual-price: lock stop price, arm limit line
+                    // Dual-price: lock first price, arm second-click line
                     m_firstPrice       = cursorPrice;
                     m_firstPricePlaced = true;
                     // m_limitArmed stays true for phase 2
-                } else if (ctrlHeld) {
-                    m_pendingPrice   = cursorPrice;
-                    m_ctrlClickPopup = true;
                 } else {
-                    // Single-price: immediate send
-                    if (OnOrderSubmit) {
-                        bool outsideRth = (m_sessionIdx != 0);
-                        double aux = kOrderTypes[m_orderTypeIdx].needsTrail
-                                     ? m_trailAmount : 0.0;
-                        OnOrderSubmit(m_symbol, m_limitSide,
-                                      kOrderTypes[m_orderTypeIdx].ibStr,
-                                      m_orderQty, cursorPrice,
-                                      kTIFs[m_tifIdx], outsideRth, aux);
+                    // Single-price: build order from cursor position
+                    const auto& ot = kOrderTypes[m_orderTypeIdx];
+                    static constexpr core::TimeInForce kTIFEnum[] = {
+                        core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+                    };
+                    core::Order o;
+                    o.symbol     = m_symbol;
+                    o.side       = (m_limitSide == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+                    o.type       = ot.coreType;
+                    o.quantity   = static_cast<double>(m_orderQty);
+                    o.tif        = ot.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
+                    o.outsideRth = !ot.noRth && (m_sessionIdx != 0);
+                    switch (ot.coreType) {
+                        case core::OrderType::Stop: o.stopPrice  = cursorPrice; break;
+                        case core::OrderType::MIT:  o.auxPrice   = cursorPrice; break;
+                        default:                    o.limitPrice = cursorPrice; break;
                     }
-                    m_limitArmed = false;
+                    // Ctrl+click always shows confirmation; otherwise respect m_transmitInstantly
+                    if (ctrlHeld || !m_transmitInstantly) {
+                        m_pendingConfirmOrder = o;
+                        m_showConfirmPopup    = true;
+                        // leave m_limitArmed armed — reset when popup is confirmed/cancelled
+                    } else {
+                        if (OnOrderSubmit) OnOrderSubmit(o);
+                        m_limitArmed = false;
+                    }
                 }
             }
         }

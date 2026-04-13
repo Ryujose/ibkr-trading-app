@@ -144,12 +144,22 @@ static void UpdateChartPendingOrders(ui::ChartWindow* win) {
             ln.price     = o.stopPrice;
             ln.auxPrice  = o.limitPrice;
             ln.orderType = "STP LMT";
+        } else if (o.type == core::OrderType::LIT) {
+            ln.price     = o.auxPrice;    // trigger price — drawn as main leg
+            ln.auxPrice  = o.limitPrice;  // limit price — drawn as aux leg
+            ln.orderType = "LIT";
         } else if (o.type == core::OrderType::Stop) {
             ln.price     = o.stopPrice;
             ln.orderType = "STP";
         } else if (o.type == core::OrderType::Limit) {
             ln.price     = o.limitPrice;
             ln.orderType = "LMT";
+        } else if (o.type == core::OrderType::LOC) {
+            ln.price     = o.limitPrice;
+            ln.orderType = "LOC";
+        } else if (o.type == core::OrderType::MIT) {
+            ln.price     = o.auxPrice;
+            ln.orderType = "MIT";
         } else {
             continue;
         }
@@ -573,37 +583,20 @@ static void SpawnChartWindow(int idx) {
                                       useRTH, endDT);
     };
 
-    e.win->OnOrderSubmit = [](const std::string& sym, const std::string& side,
-                              const std::string& orderType, double qty, double price,
-                              const std::string& tif, bool outsideRth, double auxPrice) {
+    e.win->OnOrderSubmit = [](const core::Order& o) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         int id = g_nextOrderId++;
         for (auto& te : g_tradingEntries)
             if (te.win) te.win->SetNextOrderId(g_nextOrderId);
-        core::Order pending;
-        pending.orderId     = id;
-        pending.symbol      = sym;
-        pending.side        = (side == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
-        pending.quantity    = qty;
-        pending.status      = core::OrderStatus::Pending;
-        pending.submittedAt = std::time(nullptr);
-        pending.updatedAt   = pending.submittedAt;
-        if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
-            pending.type = core::OrderType::Limit;
-        else if (orderType == "STP")
-            pending.type = core::OrderType::Stop;
-        else if (orderType == "STP LMT")
-            pending.type = core::OrderType::StopLimit;
-        else
-            pending.type = core::OrderType::Market;
-        if (orderType == "LMT" || orderType == "LIT" || orderType == "TRAIL LIMIT")
-            pending.limitPrice = price;
-        if (orderType == "STP" || orderType == "STP LMT" || orderType == "MIT")
-            pending.stopPrice = price;
-        g_liveOrders[id] = pending;
-        if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(pending);
+        core::Order order   = o;
+        order.orderId       = id;
+        order.status        = core::OrderStatus::Pending;
+        order.submittedAt   = std::time(nullptr);
+        order.updatedAt     = order.submittedAt;
+        g_liveOrders[id]    = order;
+        if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
         UpdateAllChartPendingOrders();
-        g_IBClient->PlaceOrder(id, sym, side, orderType, qty, price, tif, outsideRth, auxPrice);
+        g_IBClient->PlaceOrder(order);
     };
 
     e.win->OnCancelOrder = [](int orderId) {
@@ -627,21 +620,15 @@ static void SpawnChartWindow(int idx) {
         rep.updatedAt         = rep.submittedAt;
         rep.filledQty         = 0.0;
         rep.avgFillPrice      = 0.0;
-        double mainPrice = newPrice, auxPrice = 0.0;
-        if (old.type == core::OrderType::Limit)      { rep.limitPrice = newPrice; rep.stopPrice = 0.0; }
-        else if (old.type == core::OrderType::Stop)  { rep.stopPrice = newPrice; rep.limitPrice = 0.0; }
+        if (old.type == core::OrderType::Limit)     { rep.limitPrice = newPrice;  rep.stopPrice  = 0.0; }
+        else if (old.type == core::OrderType::Stop) { rep.stopPrice  = newPrice;  rep.limitPrice = 0.0; }
         else if (old.type == core::OrderType::StopLimit) {
             rep.stopPrice = newPrice; rep.limitPrice = newAuxPrice;
-            mainPrice = newPrice; auxPrice = newAuxPrice;
         }
         g_liveOrders[newId] = rep;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(rep);
         UpdateAllChartPendingOrders();
-        g_IBClient->PlaceOrder(newId, old.symbol,
-                               core::OrderSideStr(old.side),
-                               core::OrderTypeStr(old.type),
-                               old.quantity, mainPrice,
-                               core::TIFStr(old.tif), false, auxPrice);
+        g_IBClient->PlaceOrder(rep);
     };
 
     g_chartEntries.push_back(std::move(e));
@@ -656,15 +643,10 @@ static void SpawnTradingWindow(int idx) {
     e.win->setGroupId(idx + 1);
     e.win->SetNextOrderId(g_nextOrderId);
 
-    e.win->OnOrderSubmit = [](int orderId, const std::string& sym,
-                               const std::string& action,
-                               const std::string& orderType,
-                               double qty, double price, double auxPrice,
-                               const std::string& tif, bool outsideRth) {
+    e.win->OnOrderSubmit = [](const core::Order& order) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
-        g_IBClient->PlaceOrder(orderId, sym, action, orderType, qty, price,
-                               tif, outsideRth, auxPrice);
-        if (orderId >= g_nextOrderId) g_nextOrderId = orderId + 1;
+        g_IBClient->PlaceOrder(order);
+        if (order.orderId >= g_nextOrderId) g_nextOrderId = order.orderId + 1;
     };
 
     e.win->OnOrderCancel = [](int orderId) {
@@ -2141,8 +2123,10 @@ static void RenderTradingUI() {
         ImGuiWindowFlags_NoMove        | ImGuiWindowFlags_NoBringToFrontOnFocus |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
 
-    // Taller menu bar via FramePadding; distinct bar background
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 7.0f));
+    // Taller menu bar via FramePadding — scale with font size so Large mode doesn't clip
+    const float kMenuBarScale = ImGui::GetFontSize() / 13.0f;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(6.0f * kMenuBarScale, 9.0f * kMenuBarScale));
     ImGui::PushStyleColor(ImGuiCol_MenuBarBg, ImVec4(0.020f, 0.027f, 0.039f, 1.0f)); // #050709
 
     if (ImGui::Begin("##TradingHost", nullptr, hostFlags)) {

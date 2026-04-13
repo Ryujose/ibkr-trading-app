@@ -8,7 +8,13 @@ namespace core {
 // ---- Enumerations -----------------------------------------------------------
 
 enum class OrderSide   { Buy, Sell };
-enum class OrderType   { Market, Limit, Stop, StopLimit };
+enum class OrderType {
+    Market, Limit, Stop, StopLimit,          // basic
+    Trail, TrailLimit,                        // trailing stop
+    MOC, LOC, MTL,                            // market/limit variants
+    MIT, LIT,                                 // if-touched
+    Midprice, Relative                        // smart / pegged-to-primary
+};
 enum class TimeInForce { Day, GTC, IOC, FOK };
 enum class OrderStatus { Pending, Working, PartialFill, Filled, Cancelled, Rejected };
 
@@ -38,10 +44,15 @@ struct Order {
     OrderSide   side        = OrderSide::Buy;
     OrderType   type        = OrderType::Market;
     TimeInForce tif         = TimeInForce::Day;
-    double      quantity    = 0.0;
-    double      limitPrice  = 0.0;
-    double      stopPrice   = 0.0;
-    double      filledQty    = 0.0;
+    double      quantity       = 0.0;
+    double      limitPrice     = 0.0;
+    double      stopPrice      = 0.0;
+    double      auxPrice       = 0.0;   // trigger for MIT/LIT; offset for REL; trail $ for TRAIL*
+    double      trailingPercent= 0.0;   // trailing % for TRAIL / TRAIL LIMIT
+    double      trailStopPrice = 0.0;   // initial stop cap for TRAIL / TRAIL LIMIT (optional)
+    double      lmtPriceOffset = 0.0;   // limit offset from trail stop for TRAIL LIMIT
+    bool        outsideRth     = false; // allow pre/after-hours fills
+    double      filledQty      = 0.0;
     double      avgFillPrice = 0.0;
     double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)
     OrderStatus status       = OrderStatus::Pending;
@@ -75,6 +86,15 @@ inline const char* OrderTypeStr(OrderType t) {
         case OrderType::Limit:     return "LMT";
         case OrderType::Stop:      return "STP";
         case OrderType::StopLimit: return "STP LMT";
+        case OrderType::Trail:     return "TRAIL";
+        case OrderType::TrailLimit:return "TRAIL LIMIT";
+        case OrderType::MOC:       return "MOC";
+        case OrderType::LOC:       return "LOC";
+        case OrderType::MTL:       return "MTL";
+        case OrderType::MIT:       return "MIT";
+        case OrderType::LIT:       return "LIT";
+        case OrderType::Midprice:  return "MIDPRICE";
+        case OrderType::Relative:  return "REL";
         default:                   return "?";
     }
 }
