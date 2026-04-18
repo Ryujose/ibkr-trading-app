@@ -122,6 +122,13 @@ static std::unordered_map<int, core::Order> g_liveOrders;
 static std::unordered_map<std::string, core::Position> g_positions;
 static std::unordered_map<std::string, double>          g_symbolCommissions;
 
+// Real-time P&L subscription state
+static std::string                      g_accountId;           // captured from first updateAccountValue
+static bool                             g_pnlSubscribed = false;
+static std::unordered_map<long, int>    g_pnlSingleConIds;     // conId → reqId
+static int                              g_pnlSingleNextReqId = 9001;
+static std::unordered_map<int, std::string> g_pnlReqIdToSymbol; // reqId → symbol
+
 static bool IsTerminalOrderStatus(core::OrderStatus s) {
     return s == core::OrderStatus::Filled   ||
            s == core::OrderStatus::Cancelled ||
@@ -185,6 +192,7 @@ static void UpdateChartPosition(ui::ChartWindow* win) {
         info.avgCost     = it->second.avgCost;
         info.lastPrice   = it->second.marketPrice;
         info.unrealPnL   = it->second.unrealizedPnL;
+        info.dailyPnL    = it->second.dailyPnL;
         auto cit = g_symbolCommissions.find(sym);
         info.commission  = (cit != g_symbolCommissions.end()) ? cit->second : 0.0;
     }
@@ -1126,6 +1134,14 @@ static void WireIBCallbacks() {
                                     const std::string& acct) {
         if (g_PortfolioWindow)
             g_PortfolioWindow->OnAccountValue(key, val, currency, acct);
+        // Capture account ID on first receipt and subscribe account-level P&L.
+        if (!acct.empty() && g_accountId.empty()) {
+            g_accountId = acct;
+        }
+        if (!g_pnlSubscribed && !g_accountId.empty() && g_IBClient) {
+            g_pnlSubscribed = true;
+            g_IBClient->ReqPnL(9000, g_accountId);
+        }
     };
 
     // ── Account summary (base currency via reqAccountSummary) ─────────────
@@ -1134,6 +1150,25 @@ static void WireIBCallbacks() {
                                       const std::string& /*currency*/) {
         if (tag == "Currency" && !value.empty() && g_PortfolioWindow)
             g_PortfolioWindow->SetBaseCurrency(value);
+    };
+
+    // ── Real-time P&L ─────────────────────────────────────────────────────
+    g_IBClient->onPnL = [](int /*reqId*/, double daily, double unrealized, double realized) {
+        if (g_PortfolioWindow) g_PortfolioWindow->OnPnL(daily, unrealized, realized);
+    };
+
+    g_IBClient->onPnLSingle = [](int reqId, double daily,
+                                  double /*unrealized*/, double /*realized*/, double /*value*/) {
+        auto sit = g_pnlReqIdToSymbol.find(reqId);
+        if (sit == g_pnlReqIdToSymbol.end()) return;
+        const std::string& sym = sit->second;
+        // Update the shared position map so ChartWindow picks it up.
+        auto pit = g_positions.find(sym);
+        if (pit != g_positions.end()) {
+            pit->second.dailyPnL = daily;
+            UpdateAllChartPositions();
+        }
+        if (g_PortfolioWindow) g_PortfolioWindow->OnPnLSingle(reqId, sym, daily);
     };
 
     // ── Positions ─────────────────────────────────────────────────────────
@@ -1161,12 +1196,24 @@ static void WireIBCallbacks() {
     // ── Portfolio updates (P&L etc.) ──────────────────────────────────────
     g_IBClient->onPortfolioUpdate = [](const core::Position& pos) {
         if (g_PortfolioWindow) g_PortfolioWindow->OnPositionUpdate(pos);
+        // Preserve dailyPnL already populated by onPnLSingle before overwriting.
+        auto it = g_positions.find(pos.symbol);
+        double savedDailyPnL = (it != g_positions.end()) ? it->second.dailyPnL : 0.0;
         g_positions[pos.symbol] = pos;
+        g_positions[pos.symbol].dailyPnL = savedDailyPnL;
         UpdateAllChartPositions();
         // Keep order book windows in sync with live position data
         for (auto& te : g_tradingEntries)
             if (te.win && te.win->getSymbol() == pos.symbol)
                 te.win->SetPosition(pos.quantity, pos.avgCost);
+        // Subscribe per-position real-time P&L the first time we see a conId.
+        if (pos.conId > 0 && g_pnlSingleConIds.find(pos.conId) == g_pnlSingleConIds.end()
+                && !g_accountId.empty() && g_IBClient) {
+            int rid = g_pnlSingleNextReqId++;
+            g_pnlSingleConIds[pos.conId]   = rid;
+            g_pnlReqIdToSymbol[rid]        = pos.symbol;
+            g_IBClient->ReqPnLSingle(rid, g_accountId, "", static_cast<int>(pos.conId));
+        }
     };
 
     // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
@@ -1464,10 +1511,19 @@ static void StartSilentReconnect() {
 static void Disconnect() {
     if (g_IBClient) {
         g_IBClient->ReqAccountUpdates(false);
+        if (g_pnlSubscribed)
+            g_IBClient->CancelPnL(9000);
+        for (auto& [conId, rid] : g_pnlSingleConIds)
+            g_IBClient->CancelPnLSingle(rid);
         g_IBClient->Disconnect();
         delete g_IBClient;
         g_IBClient = nullptr;
     }
+    g_accountId.clear();
+    g_pnlSubscribed = false;
+    g_pnlSingleConIds.clear();
+    g_pnlReqIdToSymbol.clear();
+    g_pnlSingleNextReqId = 9001;
     g_Login.state       = ConnectionState::Disconnected;
     g_Login.connectedAs.clear();
     g_Login.errorMsg.clear();

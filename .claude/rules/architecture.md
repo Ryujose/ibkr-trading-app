@@ -69,6 +69,7 @@ Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScanner
 - News stock conId: 2000-2009 · port conId: 2010-2199 · hist stock: 2210-2219 · hist port: 2220-2399
 - News articles: 2500-3499 (100 per instance) · hist market: 3500-3599 · market conId: 3600-3699
 - Account: 900
+- P&L account-wide: 9000 · P&L single per-position: 9001–9999
 
 ## UiScale — Responsive Toolbar Helpers
 

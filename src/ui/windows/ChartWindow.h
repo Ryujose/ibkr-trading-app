@@ -42,6 +42,7 @@ public:
         double lastPrice   = 0.0;   // most recent market price
         double unrealPnL   = 0.0;   // from portfolio update (IB-computed)
         double commission  = 0.0;   // total commissions paid for this symbol
+        double dailyPnL    = 0.0;   // IB-computed today's P&L from reqPnLSingle (0 = not yet available)
     };
 
     ChartWindow();

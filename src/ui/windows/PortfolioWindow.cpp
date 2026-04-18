@@ -109,6 +109,25 @@ void PortfolioWindow::OnPositionUpdate(const core::Position& pos)
     SortPositions();
 }
 
+void PortfolioWindow::OnPnL(double daily, double unrealized, double realized)
+{
+    m_account.dayPnL       = daily;
+    m_account.unrealizedPnL = unrealized;
+    m_account.realizedPnL   = realized;
+    double priorNetLiq = m_account.netLiquidation - daily;
+    m_account.dayPnLPct = (priorNetLiq > 1e-9) ? (daily / priorNetLiq) * 100.0 : 0.0;
+}
+
+void PortfolioWindow::OnPnLSingle(int /*reqId*/, const std::string& symbol, double daily)
+{
+    for (auto& p : m_positions) {
+        if (p.symbol == symbol) {
+            p.dailyPnL = daily;
+            return;
+        }
+    }
+}
+
 void PortfolioWindow::OnTradeExecuted(const core::TradeRecord& trade)
 {
     m_trades.insert(m_trades.begin(), trade);
@@ -305,6 +324,7 @@ void PortfolioWindow::DrawPositionsTable()
     if (m_showAvgCost)   ++colCount;
     if (m_showCostBasis) ++colCount;
     if (m_showRealPnL)   ++colCount;
+    if (m_showDayPnL)    ++colCount;
     if (m_showDayChg)    ++colCount;
     if (m_showWeight)    ++colCount;
 
@@ -333,6 +353,7 @@ void PortfolioWindow::DrawPositionsTable()
     ImGui::TableSetupColumn("Unreal P&L", ImGuiTableColumnFlags_WidthFixed, 88.f);
     ImGui::TableSetupColumn("Unreal %",   ImGuiTableColumnFlags_WidthFixed, 68.f);
     if (m_showRealPnL)   ImGui::TableSetupColumn("Real P&L",    ImGuiTableColumnFlags_WidthFixed, 88.f);
+    if (m_showDayPnL)    ImGui::TableSetupColumn("Day P&L",     ImGuiTableColumnFlags_WidthFixed, 88.f);
     if (m_showDayChg)    ImGui::TableSetupColumn("Day Chg%",    ImGuiTableColumnFlags_WidthFixed, 68.f);
     if (m_showWeight)    ImGui::TableSetupColumn("Weight",      ImGuiTableColumnFlags_WidthFixed, 58.f);
 
@@ -442,6 +463,18 @@ void PortfolioWindow::DrawPositionsTable()
                                FmtDollar(std::abs(p.realizedPnL)).c_str());
         }
 
+        // Daily P&L (from reqPnLSingle — zero until subscription fires)
+        if (m_showDayPnL) {
+            ImGui::TableSetColumnIndex(col++);
+            if (p.dailyPnL != 0.0)
+                ImGui::TextColored(PnLColor(p.dailyPnL), "%s%s%s",
+                                   p.dailyPnL >= 0 ? "+" : "-",
+                                   CurrSym(m_account.baseCurrency),
+                                   FmtDollar(std::abs(p.dailyPnL)).c_str());
+            else
+                ImGui::TextDisabled("--");
+        }
+
         // Day Change %
         if (m_showDayChg) {
             ImGui::TableSetColumnIndex(col++);
@@ -471,6 +504,7 @@ void PortfolioWindow::DrawColumnChooserPopup()
     ImGui::Checkbox("Avg Cost",     &m_showAvgCost);
     ImGui::Checkbox("Cost Basis",   &m_showCostBasis);
     ImGui::Checkbox("Realized P&L", &m_showRealPnL);
+    ImGui::Checkbox("Day P&L",      &m_showDayPnL);
     ImGui::Checkbox("Day Chg %",    &m_showDayChg);
     ImGui::Checkbox("Weight",       &m_showWeight);
     ImGui::EndPopup();
