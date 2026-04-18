@@ -48,6 +48,10 @@ public:
     void OnTradeExecuted(const core::TradeRecord& trade);
     void OnAccountEnd();
 
+    // Real-time P&L from reqPnL / reqPnLSingle (supersedes updateAccountValue values).
+    void OnPnL(double daily, double unrealized, double realized);
+    void OnPnLSingle(int reqId, const std::string& symbol, double daily);
+
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;
@@ -69,6 +73,7 @@ private:
     bool m_showAvgCost   = true;
     bool m_showCostBasis = false;
     bool m_showRealPnL   = true;
+    bool m_showDayPnL    = true;
     bool m_showDayChg    = true;
     bool m_showWeight    = true;
 

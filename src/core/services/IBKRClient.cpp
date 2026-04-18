@@ -334,6 +334,20 @@ void IBKRClient::ReqOpenOrders() {
     m_client->reqOpenOrders();
 }
 
+void IBKRClient::ReqPnL(int reqId, const std::string& account, const std::string& modelCode) {
+    m_client->reqPnL(reqId, account, modelCode);
+}
+void IBKRClient::CancelPnL(int reqId) {
+    m_client->cancelPnL(reqId);
+}
+void IBKRClient::ReqPnLSingle(int reqId, const std::string& account,
+                               const std::string& modelCode, int conId) {
+    m_client->reqPnLSingle(reqId, account, modelCode, conId);
+}
+void IBKRClient::CancelPnLSingle(int reqId) {
+    m_client->cancelPnLSingle(reqId);
+}
+
 // ============================================================================
 // UI-thread pump
 // ============================================================================
@@ -423,6 +437,12 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgAcctSummary>) {
                 if (onAccountSummary) onAccountSummary(m.tag, m.value, m.currency);
+
+            } else if constexpr (std::is_same_v<T, MsgPnL>) {
+                if (onPnL) onPnL(m.reqId, m.daily, m.unrealized, m.realized);
+
+            } else if constexpr (std::is_same_v<T, MsgPnLSingle>) {
+                if (onPnLSingle) onPnLSingle(m.reqId, m.daily, m.unrealized, m.realized, m.value);
             }
         }, msg);
 
@@ -577,6 +597,7 @@ void IBKRClient::updatePortfolio(const Contract& contract, Decimal position,
     pos.assetClass    = contract.secType;
     pos.exchange      = contract.exchange;
     pos.currency      = contract.currency;
+    pos.conId         = contract.conId;
     pos.quantity      = DecimalFunctions::decimalToDouble(position);
     pos.avgCost       = averageCost;
     pos.marketPrice   = marketPrice;
@@ -815,6 +836,17 @@ void IBKRClient::accountSummary(int /*reqId*/, const std::string& /*account*/,
 
 void IBKRClient::accountSummaryEnd(int /*reqId*/) {
     // Nothing to do; all data was already pushed item-by-item.
+}
+
+// ── Real-time P&L ────────────────────────────────────────────────────────────
+
+void IBKRClient::pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL) {
+    Push(MsgPnL{reqId, dailyPnL, unrealizedPnL, realizedPnL});
+}
+
+void IBKRClient::pnlSingle(int reqId, Decimal /*pos*/, double dailyPnL,
+                            double unrealizedPnL, double realizedPnL, double value) {
+    Push(MsgPnLSingle{reqId, dailyPnL, unrealizedPnL, realizedPnL, value});
 }
 
 } // namespace core::services

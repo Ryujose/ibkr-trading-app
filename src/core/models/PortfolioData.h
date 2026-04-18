@@ -46,6 +46,8 @@ struct Position {
     std::string exchange;
     std::string currency;
 
+    long conId           = 0;        // IB contract ID — required for reqPnLSingle
+
     double quantity      = 0.0;      // positive = long, negative = short
     double avgCost       = 0.0;      // average fill price (cost basis per share)
     double marketPrice   = 0.0;      // current bid/ask mid
@@ -55,6 +57,7 @@ struct Position {
     double unrealizedPnL = 0.0;      // marketValue - costBasis
     double unrealizedPct = 0.0;      // unrealizedPnL / |costBasis|
     double realizedPnL   = 0.0;      // cumulative realized for this symbol
+    double dailyPnL      = 0.0;      // today's P&L from reqPnLSingle (real-time)
 
     double dayChange     = 0.0;      // price change today
     double dayChangePct  = 0.0;

@@ -65,6 +65,8 @@ struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
 struct MsgHistoricalNewsEnd { int reqId; };
 struct MsgNewsArticle    { int reqId; std::string text; };
 struct MsgAcctSummary    { std::string tag; std::string value; std::string currency; };
+struct MsgPnL       { int reqId; double daily, unrealized, realized; };
+struct MsgPnLSingle { int reqId; double daily, unrealized, realized, value; };
 
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
@@ -73,7 +75,7 @@ using IBMessage = std::variant<
     MsgError, MsgNextOrderId,
     MsgOpenOrder, MsgOpenOrderEnd,
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
-    MsgAcctSummary
+    MsgAcctSummary, MsgPnL, MsgPnLSingle
 >;
 
 // ============================================================================
@@ -144,6 +146,13 @@ public:
     void ReqAccountUpdates(bool subscribe, const std::string& acctCode = "");
     void ReqPositions();
 
+    // Real-time P&L subscriptions (account-level and per-position).
+    // reqPnL reqId: 9000. reqPnLSingle reqIds: 9001–9999.
+    void ReqPnL(int reqId, const std::string& account, const std::string& modelCode = "");
+    void CancelPnL(int reqId);
+    void ReqPnLSingle(int reqId, const std::string& account, const std::string& modelCode, int conId);
+    void CancelPnLSingle(int reqId);
+
     // Request account summary (reliable base-currency retrieval).
     // tags: comma-separated AccountSummaryTags, e.g. "Currency" or "Currency,NetLiquidation"
     void ReqAccountSummary(int reqId, const std::string& tags = "Currency");
@@ -206,6 +215,13 @@ public:
     // Full article body (articleType 0 = plain text, 1 = HTML)
     std::function<void(int reqId, int articleType,
                        const std::string& text)>                            onNewsArticle;
+
+    // Real-time P&L (account-level and per-position)
+    std::function<void(int reqId, double daily,
+                       double unrealized, double realized)>                 onPnL;
+    std::function<void(int reqId, double daily,
+                       double unrealized, double realized,
+                       double value)>                                       onPnLSingle;
 
 private:
     // ── IB API handles ────────────────────────────────────────────────────
@@ -328,6 +344,11 @@ private:
     void accountSummary(int reqId, const std::string& account, const std::string& tag,
                         const std::string& value, const std::string& currency) override;
     void accountSummaryEnd(int reqId) override;
+
+    void pnl(int reqId, double dailyPnL, double unrealizedPnL,
+              double realizedPnL) override;
+    void pnlSingle(int reqId, Decimal pos, double dailyPnL,
+                   double unrealizedPnL, double realizedPnL, double value) override;
 };
 
 } // namespace core::services

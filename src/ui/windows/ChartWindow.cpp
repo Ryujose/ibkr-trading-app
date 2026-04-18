@@ -1769,14 +1769,17 @@ void ChartWindow::DrawPositionStrip() {
         ImGui::TextUnformatted(commBuf);
     }
 
-    row.item(FlexRow::textW("Net:"), 16);
-    ImGui::TextDisabled("Net:");
+    // Prefer IB-computed daily P&L when available; fall back to gross-minus-comm.
+    double displayNet   = (m_position.dailyPnL != 0.0) ? m_position.dailyPnL : net;
+    const char* netLabel = (m_position.dailyPnL != 0.0) ? "Day P&L:" : "Net:";
+    row.item(FlexRow::textW(netLabel), 16);
+    ImGui::TextDisabled("%s", netLabel);
     char netBuf[16];
-    std::snprintf(netBuf, sizeof(netBuf), "%+.2f", net);
+    std::snprintf(netBuf, sizeof(netBuf), "%+.2f", displayNet);
     row.item(FlexRow::textW(netBuf), 4);
     ImGui::PushStyleColor(ImGuiCol_Text,
-        net >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
-                 : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+        displayNet >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+                        : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
     ImGui::TextUnformatted(netBuf);
     ImGui::PopStyleColor();
 
