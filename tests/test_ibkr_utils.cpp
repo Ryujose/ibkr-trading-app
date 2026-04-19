@@ -52,7 +52,10 @@ TEST_CASE("ParseStatus - PartialFill", "[parsestatus]") {
 TEST_CASE("ParseStatus - Pending variants", "[parsestatus]") {
     REQUIRE(ParseStatus("Pending")       == core::OrderStatus::Pending);
     REQUIRE(ParseStatus("PendingSubmit") == core::OrderStatus::Pending);
-    REQUIRE(ParseStatus("PendingCancel") == core::OrderStatus::Pending);
+}
+
+TEST_CASE("ParseStatus - PendingCancel maps to PendingCancel", "[parsestatus]") {
+    REQUIRE(ParseStatus("PendingCancel") == core::OrderStatus::PendingCancel);
 }
 
 TEST_CASE("ParseStatus - empty string maps to Pending", "[parsestatus]") {
