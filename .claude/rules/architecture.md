@@ -121,8 +121,35 @@ The `###` triple-hash gives ImGui a stable identity while the display label chan
 ## IBKRUtils
 
 `src/core/services/IBKRUtils.h` — standalone header with no IB API dependency:
-- `ParseStatus(const std::string&) → core::OrderStatus` — maps IB order-status strings to enum
+- `ParseStatus(const std::string&) → core::OrderStatus` — maps IB order-status strings to enum; `"PendingCancel"` → `OrderStatus::PendingCancel`
 - `ParseIBTime(const std::string&) → std::time_t` — parses IB date/timestamp formats (YYYYMMDD, Unix string, formatted datetime)
+
+## Symbol Search
+
+`src/ui/SymbolSearch.h` — reusable autocomplete widget, no IB API dependency (takes a callback):
+
+```cpp
+struct SymbolSearchState {
+    std::vector<SymbolResult> results;
+    double  debounceEnd = 0.0;  int selected = -1;
+    char    lastQuery[33]     = {};
+    char    lastConfirmed[33] = {};  // last IB-validated symbol — reverted to on bad input
+    char    searchedQuery[33] = {};  // query actually sent to IB (race guard)
+    bool    popupOpen = false;  ImGuiID ownerID = 0;
+    bool    searching = false;  bool searched = false;
+};
+bool DrawSymbolInput(const char* label, char* buf, int bufSize,
+                     std::function<void(const std::string&)> reqMatchFn,
+                     SymbolSearchState& state);
+```
+
+- Debounces 300 ms before firing `reqMatchFn`
+- Opens tooltip-style popup with up to 10 results; arrow-key + Enter to select
+- On empty IB results: reverts `buf` to `lastConfirmed` (prevents non-existent symbols)
+- On focus-lost without confirm: reverts `buf` to `lastConfirmed`
+- All confirm paths (click, Enter) update `lastConfirmed`
+- Returns `true` when a confirmed symbol change occurs
+- reqId 8000 (cancel-before-reissue pattern); each window has its own `SymbolSearchState`
 
 Both were previously private statics on `IBKRClient`. Extracting them allows unit testing without linking ibapi-lib.
 
@@ -154,9 +181,14 @@ Midprice, Relative                 // smart / pegged-to-primary
 - `trailStopPrice` — initial stop cap for TRAIL / TRAIL LIMIT (0 = let IB compute)
 - `lmtPriceOffset` — limit offset from trail stop price for TRAIL LIMIT
 - `outsideRth` — allow pre/after-hours fills (was a separate callback param, now on struct)
+- `account` — IB account code; stamped from `g_selectedAccount` at submit time in `main.cpp`
+
+`core::OrderStatus` enum: `Pending, Working, PartialFill, Filled, Cancelled, Rejected, PendingCancel`
+- `PendingCancel` maps to IB string `"PendingCancel"` and renders as `"CANCELLING"` in the UI
+- `onError` handler skips marking `PendingCancel` orders as Rejected (errors 10148/10149 are informational)
 
 `TradingWindow::OnOrderSubmit` callback: `std::function<void(const core::Order&)>`  
-`ChartWindow::OnOrderSubmit` callback: unchanged (string-based, basic types only — main.cpp lambda builds a `core::Order` and calls `PlaceOrder`).
+`ChartWindow::OnOrderSubmit` callback: `std::function<void(const core::Order&)>` — main.cpp lambda stamps account and calls `PlaceOrder`.
 
 ## Connection State Machine
 
@@ -166,9 +198,12 @@ Midprice, Relative                 // smart / pegged-to-primary
 |---|---|
 | `Disconnected` | Not connected — login screen shown |
 | `Connecting` | Initial connect in progress |
+| `SelectingAccount` | IB `managedAccounts()` fired, waiting for user to pick an account (multi-account live sessions only) |
 | `Connected` | Live session — trading UI shown |
 | `LostConnection` | Unexpected drop — trading UI stays alive, DISCONNECTED badge shown, auto-reconnect polling |
 | `Error` | Initial connect failed — login screen with error message |
+
+**`FinishConnect(bool isReconnect)`** — called once account is known (immediately on single-account, or after modal confirm on multi-account). Calls `ReqAccountUpdates`, `ReqPositions`, `ReqAccountSummary`, `ReqOpenOrders`, `ReqAllOpenOrders`, `ReqExecutions(8001)`. On first connect also creates trading windows and subscribes initial symbols. On reconnect re-subscribes all open chart/trading windows.
 
 **Auto-reconnect** (`StartSilentReconnect()`):
 - Polled every frame from main loop when `LostConnection && !g_IBClient`
@@ -176,7 +211,9 @@ Midprice, Relative                 // smart / pegged-to-primary
 - On success (`onConnectionChanged(true)` with `isReconnect=true`): skips `DestroyTradingWindows`/`CreateTradingWindows`, re-subscribes each chart/trading window using `getSymbol()`/`getTimeframe()` accessors
 - On failure: schedules next retry in 5s, stays `LostConnection`
 
-**DISCONNECTED badge**: orange background rect + yellow text, left of `[LIVE]`/`[PAPER]` in menu bar.
+**DISCONNECTED badge**: orange background rect + yellow text, left of account selector in menu bar.
+
+**Account selector** (menu bar, right of DISCONNECTED badge, left of `[LIVE]`/`[PAPER]`): always visible after connect. Single-account: shows account ID as plain text. Multi-account: shows a clickable combo that opens an inline popup to switch accounts (re-calls `FinishConnect`). Globals: `g_managedAccounts` (all accounts from `managedAccounts()` callback), `g_selectedAccount` (active account), `g_pendingReconnect` (deferred reconnect flag used when account modal is shown during reconnect).
 
 ## Window Groups & Symbol Sync
 

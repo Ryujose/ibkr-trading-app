@@ -319,6 +319,9 @@ void IBKRClient::PlaceOrder(const ::core::Order& o) {
                 break;
         }
 
+        if (!o.account.empty())
+            ibOrder.account = o.account;
+
         m_client->placeOrder(o.orderId, c, ibOrder);
     });
 }
@@ -334,6 +337,15 @@ void IBKRClient::ReqOpenOrders() {
     m_client->reqOpenOrders();
 }
 
+void IBKRClient::ReqAllOpenOrders() {
+    m_client->reqAllOpenOrders();
+}
+
+void IBKRClient::ReqExecutions(int reqId) {
+    ExecutionFilter filter;   // all defaults = no filter → full day's history
+    m_client->reqExecutions(reqId, filter);
+}
+
 void IBKRClient::ReqPnL(int reqId, const std::string& account, const std::string& modelCode) {
     m_client->reqPnL(reqId, account, modelCode);
 }
@@ -346,6 +358,26 @@ void IBKRClient::ReqPnLSingle(int reqId, const std::string& account,
 }
 void IBKRClient::CancelPnLSingle(int reqId) {
     m_client->cancelPnLSingle(reqId);
+}
+
+void IBKRClient::ReqMatchingSymbols(int reqId, const std::string& pattern) {
+    m_client->reqMatchingSymbols(reqId, pattern);
+}
+
+void IBKRClient::ReqPositionsMulti(int reqId, const std::string& account,
+                                    const std::string& modelCode) {
+    m_client->reqPositionsMulti(reqId, account, modelCode);
+}
+void IBKRClient::CancelPositionsMulti(int reqId) {
+    m_client->cancelPositionsMulti(reqId);
+}
+void IBKRClient::ReqAccountUpdatesMulti(int reqId, const std::string& account,
+                                         const std::string& modelCode,
+                                         bool ledgerAndNLV) {
+    m_client->reqAccountUpdatesMulti(reqId, account, modelCode, ledgerAndNLV);
+}
+void IBKRClient::CancelAccountUpdatesMulti(int reqId) {
+    m_client->cancelAccountUpdatesMulti(reqId);
 }
 
 // ============================================================================
@@ -443,6 +475,21 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgPnLSingle>) {
                 if (onPnLSingle) onPnLSingle(m.reqId, m.daily, m.unrealized, m.realized, m.value);
+
+            } else if constexpr (std::is_same_v<T, MsgSymbolSamples>) {
+                if (onSymbolSamples) onSymbolSamples(m.reqId, m.results);
+
+            } else if constexpr (std::is_same_v<T, MsgManagedAccts>) {
+                if (onManagedAccounts) onManagedAccounts(m.accounts);
+
+            } else if constexpr (std::is_same_v<T, MsgPositionMulti>) {
+                if (onPositionMulti)
+                    onPositionMulti(m.reqId, m.account, m.modelCode, m.pos, m.done);
+
+            } else if constexpr (std::is_same_v<T, MsgAccountUpdateMulti>) {
+                if (onAccountUpdateMulti)
+                    onAccountUpdateMulti(m.reqId, m.account, m.modelCode,
+                                         m.key, m.val, m.currency, m.done);
             }
         }, msg);
 
@@ -491,8 +538,11 @@ void IBKRClient::error(int id, time_t /*errorTime*/, int errorCode,
                         const std::string& errorString,
                         const std::string& /*advancedOrderRejectJson*/) {
     // Filter pure informational codes (market data farm connection status, etc.)
+    // 10148: order already in PendingCancel — duplicate cancel, not a rejection.
+    // 10149: cancel attempt on PreSubmitted/Submitted order in transition — same.
     static const int info_codes[] = {
-        2100, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2158, 10182
+        2100, 2103, 2104, 2105, 2106, 2107, 2108, 2119, 2158, 10182,
+        10148, 10149
     };
     for (int c : info_codes) {
         if (errorCode == c) return;
@@ -627,6 +677,52 @@ void IBKRClient::position(const std::string& /*account*/,
 
 void IBKRClient::positionEnd() {
     Push(MsgPosition{{}, true});
+}
+
+// ── Managed accounts / multi-account ──────────────────────────────────────
+
+void IBKRClient::managedAccounts(const std::string& accountsList) {
+    std::vector<std::string> accts;
+    std::istringstream ss(accountsList);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        // trim whitespace
+        tok.erase(0, tok.find_first_not_of(" \t"));
+        tok.erase(tok.find_last_not_of(" \t") + 1);
+        if (!tok.empty()) accts.push_back(tok);
+    }
+    Push(MsgManagedAccts{std::move(accts)});
+}
+
+void IBKRClient::positionMulti(int reqId, const std::string& account,
+                                const std::string& modelCode,
+                                const Contract& contract,
+                                Decimal pos, double avgCost) {
+    ::core::Position p;
+    p.symbol     = contract.symbol;
+    p.assetClass = contract.secType;
+    p.exchange   = contract.exchange;
+    p.currency   = contract.currency;
+    p.conId      = contract.conId;
+    p.quantity   = DecimalFunctions::decimalToDouble(pos);
+    p.avgCost    = avgCost;
+    Push(MsgPositionMulti{reqId, account, modelCode, p, false});
+}
+
+void IBKRClient::positionMultiEnd(int reqId) {
+    Push(MsgPositionMulti{reqId, {}, {}, {}, true});
+}
+
+void IBKRClient::accountUpdateMulti(int reqId, const std::string& account,
+                                     const std::string& modelCode,
+                                     const std::string& key,
+                                     const std::string& value,
+                                     const std::string& currency) {
+    Push(MsgAccountUpdateMulti{reqId, account, modelCode, key, value, currency, false});
+}
+
+void IBKRClient::accountUpdateMultiEnd(int reqId) {
+    Push(MsgAccountUpdateMulti{reqId, {}, {}, {}, {}, {}, true});
 }
 
 // ── Orders ─────────────────────────────────────────────────────────────────
@@ -847,6 +943,22 @@ void IBKRClient::pnl(int reqId, double dailyPnL, double unrealizedPnL, double re
 void IBKRClient::pnlSingle(int reqId, Decimal /*pos*/, double dailyPnL,
                             double unrealizedPnL, double realizedPnL, double value) {
     Push(MsgPnLSingle{reqId, dailyPnL, unrealizedPnL, realizedPnL, value});
+}
+
+void IBKRClient::symbolSamples(int reqId,
+                                const std::vector<ContractDescription>& contractDescriptions) {
+    MsgSymbolSamples msg;
+    msg.reqId = reqId;
+    msg.results.reserve(contractDescriptions.size());
+    for (const auto& cd : contractDescriptions) {
+        ContractDesc d;
+        d.symbol      = cd.contract.symbol;
+        d.secType     = cd.contract.secType;
+        d.primaryExch = cd.contract.primaryExchange;
+        d.currency    = cd.contract.currency;
+        msg.results.push_back(std::move(d));
+    }
+    Push(std::move(msg));
 }
 
 } // namespace core::services

@@ -16,7 +16,8 @@ enum class OrderType {
     Midprice, Relative                        // smart / pegged-to-primary
 };
 enum class TimeInForce { Day, GTC, IOC, FOK };
-enum class OrderStatus { Pending, Working, PartialFill, Filled, Cancelled, Rejected };
+enum class OrderStatus { Pending, Working, PartialFill, Filled,
+                         Cancelled, Rejected, PendingCancel };
 
 // ---- Market depth -----------------------------------------------------------
 
@@ -52,6 +53,7 @@ struct Order {
     double      trailStopPrice = 0.0;   // initial stop cap for TRAIL / TRAIL LIMIT (optional)
     double      lmtPriceOffset = 0.0;   // limit offset from trail stop for TRAIL LIMIT
     bool        outsideRth     = false; // allow pre/after-hours fills
+    std::string account;               // IB account code (required for multi-account / FA)
     double      filledQty      = 0.0;
     double      avgFillPrice = 0.0;
     double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)
@@ -109,13 +111,14 @@ inline const char* TIFStr(TimeInForce t) {
 }
 inline const char* OrderStatusStr(OrderStatus s) {
     switch (s) {
-        case OrderStatus::Pending:     return "PENDING";
-        case OrderStatus::Working:     return "WORKING";
-        case OrderStatus::PartialFill: return "PARTIAL";
-        case OrderStatus::Filled:      return "FILLED";
-        case OrderStatus::Cancelled:   return "CANCELLED";
-        case OrderStatus::Rejected:    return "REJECTED";
-        default:                       return "?";
+        case OrderStatus::Pending:       return "PENDING";
+        case OrderStatus::Working:       return "WORKING";
+        case OrderStatus::PartialFill:   return "PARTIAL";
+        case OrderStatus::Filled:        return "FILLED";
+        case OrderStatus::Cancelled:     return "CANCELLED";
+        case OrderStatus::Rejected:      return "REJECTED";
+        case OrderStatus::PendingCancel: return "CANCELLING";
+        default:                         return "?";
     }
 }
 

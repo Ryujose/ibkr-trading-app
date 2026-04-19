@@ -1,5 +1,6 @@
 #include "ui/UiScale.h"
 #include "ui/windows/ChartWindow.h"
+#include "ui/SymbolSearch.h"
 
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
@@ -435,15 +436,16 @@ void ChartWindow::DrawToolbar() {
     row.item(FlexRow::buttonW("G1"), 0);
     core::DrawGroupPicker(m_groupId, "##chart_grp");
 
-    // Symbol input
+    // Symbol input with live IB autocomplete
     row.item(em(80), 8);
-    ImGui::SetNextItemWidth(em(80));
-    if (ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
-                         ImGuiInputTextFlags_EnterReturnsTrue)) {
-        m_viewInitialized = false;
-        AddToHistory(m_symbol);
-        RequestNewData();
-    }
+    DrawSymbolInput("##sym", m_symbol, sizeof(m_symbol), em(80),
+                    [this](const std::string& sym) {
+                        std::strncpy(m_symbol, sym.c_str(), sizeof(m_symbol) - 1);
+                        m_symbol[sizeof(m_symbol) - 1] = '\0';
+                        m_viewInitialized = false;
+                        AddToHistory(m_symbol);
+                        RequestNewData();
+                    });
 
     // History dropdown button
     row.item(FlexRow::buttonW("v"), 2);

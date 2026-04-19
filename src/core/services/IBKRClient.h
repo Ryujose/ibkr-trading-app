@@ -67,6 +67,20 @@ struct MsgNewsArticle    { int reqId; std::string text; };
 struct MsgAcctSummary    { std::string tag; std::string value; std::string currency; };
 struct MsgPnL       { int reqId; double daily, unrealized, realized; };
 struct MsgPnLSingle { int reqId; double daily, unrealized, realized, value; };
+struct MsgManagedAccts   { std::vector<std::string> accounts; };
+struct MsgPositionMulti  { int reqId; std::string account, modelCode;
+                           ::core::Position pos; bool done; };
+struct MsgAccountUpdateMulti { int reqId; std::string account, modelCode,
+                                key, val, currency; bool done; };
+
+// Symbol-search result (subset of IB ContractDescription)
+struct ContractDesc {
+    std::string symbol;
+    std::string secType;
+    std::string primaryExch;
+    std::string currency;
+};
+struct MsgSymbolSamples { int reqId; std::vector<ContractDesc> results; };
 
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
@@ -75,7 +89,8 @@ using IBMessage = std::variant<
     MsgError, MsgNextOrderId,
     MsgOpenOrder, MsgOpenOrderEnd,
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
-    MsgAcctSummary, MsgPnL, MsgPnLSingle
+    MsgAcctSummary, MsgPnL, MsgPnLSingle, MsgSymbolSamples,
+    MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti
 >;
 
 // ============================================================================
@@ -146,6 +161,21 @@ public:
     void ReqAccountUpdates(bool subscribe, const std::string& acctCode = "");
     void ReqPositions();
 
+    // Symbol autocomplete — fires onSymbolSamples with up to 16 matches.
+    // IB matches both ticker prefix and company-name fragment.
+    // reqId 8000 (cancel-before-reissue: just call again with the same reqId).
+    void ReqMatchingSymbols(int reqId, const std::string& pattern);
+
+    // Multi-account position and account-update subscriptions.
+    // reqId: multi-positions 8030, multi-account-updates 8031–8040.
+    void ReqPositionsMulti(int reqId, const std::string& account,
+                           const std::string& modelCode = "");
+    void CancelPositionsMulti(int reqId);
+    void ReqAccountUpdatesMulti(int reqId, const std::string& account,
+                                const std::string& modelCode = "",
+                                bool ledgerAndNLV = false);
+    void CancelAccountUpdatesMulti(int reqId);
+
     // Real-time P&L subscriptions (account-level and per-position).
     // reqPnL reqId: 9000. reqPnLSingle reqIds: 9001–9999.
     void ReqPnL(int reqId, const std::string& account, const std::string& modelCode = "");
@@ -167,6 +197,11 @@ public:
     void PlaceOrder(const ::core::Order& order);
     void CancelOrder(int orderId);
     void ReqOpenOrders();
+    // Returns all open orders across all client IDs (including previous sessions).
+    void ReqAllOpenOrders();
+    // Requests execution (fill) history for the current day. reqId 8001.
+    // Empty filter = all executions. Results arrive via onFillReceived.
+    void ReqExecutions(int reqId);
 
     // ── UI-thread pump ────────────────────────────────────────────────────
     // Call once per frame from the render loop.
@@ -222,6 +257,24 @@ public:
     std::function<void(int reqId, double daily,
                        double unrealized, double realized,
                        double value)>                                       onPnLSingle;
+
+    // Symbol autocomplete results (from reqMatchingSymbols)
+    std::function<void(int reqId,
+                       const std::vector<ContractDesc>&)>                   onSymbolSamples;
+
+    // Managed accounts list (fires early during connection for FA / multi-account setups)
+    std::function<void(const std::vector<std::string>& accounts)>           onManagedAccounts;
+
+    // Multi-account position stream (reqPositionsMulti)
+    std::function<void(int reqId, const std::string& account,
+                       const std::string& modelCode,
+                       const ::core::Position&, bool done)>                 onPositionMulti;
+
+    // Multi-account value stream (reqAccountUpdatesMulti)
+    std::function<void(int reqId, const std::string& account,
+                       const std::string& modelCode,
+                       const std::string& key, const std::string& val,
+                       const std::string& currency, bool done)>             onAccountUpdateMulti;
 
 private:
     // ── IB API handles ────────────────────────────────────────────────────
@@ -349,6 +402,22 @@ private:
               double realizedPnL) override;
     void pnlSingle(int reqId, Decimal pos, double dailyPnL,
                    double unrealizedPnL, double realizedPnL, double value) override;
+
+    void symbolSamples(int reqId,
+                       const std::vector<ContractDescription>& contractDescriptions) override;
+
+    void managedAccounts(const std::string& accountsList) override;
+
+    void positionMulti(int reqId, const std::string& account,
+                       const std::string& modelCode, const Contract& contract,
+                       Decimal pos, double avgCost) override;
+    void positionMultiEnd(int reqId) override;
+
+    void accountUpdateMulti(int reqId, const std::string& account,
+                            const std::string& modelCode, const std::string& key,
+                            const std::string& value,
+                            const std::string& currency) override;
+    void accountUpdateMultiEnd(int reqId) override;
 };
 
 } // namespace core::services

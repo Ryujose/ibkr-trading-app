@@ -42,8 +42,9 @@ TEST_CASE("OrderStatusStr returns correct status strings", "[order]") {
     REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Working))     == "WORKING");
     REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::PartialFill)) == "PARTIAL");
     REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Filled))      == "FILLED");
-    REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Cancelled))   == "CANCELLED");
-    REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Rejected))    == "REJECTED");
+    REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Cancelled))     == "CANCELLED");
+    REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::Rejected))      == "REJECTED");
+    REQUIRE(std::string(core::OrderStatusStr(core::OrderStatus::PendingCancel)) == "CANCELLING");
 }
 
 // ── Order struct defaults ─────────────────────────────────────────────────────

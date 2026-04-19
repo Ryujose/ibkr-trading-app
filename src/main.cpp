@@ -30,6 +30,7 @@
 #include "ui/windows/ScannerWindow.h"
 #include "ui/windows/PortfolioWindow.h"
 #include "ui/windows/OrdersWindow.h"
+#include "ui/SymbolSearch.h"
 
 #include "core/services/IBKRClient.h"
 #include "core/models/WindowGroup.h"
@@ -121,6 +122,11 @@ static std::unordered_map<int, core::Order> g_liveOrders;
 // Per-symbol positions and commissions for the chart P&L strip
 static std::unordered_map<std::string, core::Position> g_positions;
 static std::unordered_map<std::string, double>          g_symbolCommissions;
+
+// Multi-account state
+static std::vector<std::string>         g_managedAccounts;     // all accounts from managedAccounts()
+static std::string                      g_selectedAccount;     // currently active account
+static bool                             g_pendingReconnect = false; // deferred reconnect flag
 
 // Real-time P&L subscription state
 static std::string                      g_accountId;           // captured from first updateAccountValue
@@ -224,7 +230,10 @@ inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
 inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,...,1900
 inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,...,908
 
-static constexpr int ACCT_SUMMARY_REQID  = 900;  // reqAccountSummary for base currency
+static constexpr int ACCT_SUMMARY_REQID  = 900;
+static constexpr const char* ACCT_SUMMARY_TAGS =
+    "Currency,NetLiquidation,TotalCashValue,BuyingPower,"
+    "UnrealizedPnL,RealizedPnL,InitMarginReq,MaintMarginReq,ExcessLiquidity";
 
 // News reqId layout (per-instance, idx 0-9):
 //   Stock conId:   2000+idx
@@ -250,7 +259,8 @@ static constexpr int kMktSeedCount   = 5;
 // ============================================================================
 // Connection / Login state
 // ============================================================================
-enum class ConnectionState { Disconnected, Connecting, Connected, LostConnection, Error };
+enum class ConnectionState { Disconnected, Connecting, Connected,
+                             SelectingAccount, LostConnection, Error };
 enum class ApiType          { TWS = 0, Gateway };
 
 struct LoginState {
@@ -598,6 +608,7 @@ static void SpawnChartWindow(int idx) {
             if (te.win) te.win->SetNextOrderId(g_nextOrderId);
         core::Order order   = o;
         order.orderId       = id;
+        order.account       = g_selectedAccount;
         order.status        = core::OrderStatus::Pending;
         order.submittedAt   = std::time(nullptr);
         order.updatedAt     = order.submittedAt;
@@ -623,6 +634,7 @@ static void SpawnChartWindow(int idx) {
             if (te.win) te.win->SetNextOrderId(g_nextOrderId);
         core::Order rep       = old;
         rep.orderId           = newId;
+        rep.account           = g_selectedAccount;
         rep.status            = core::OrderStatus::Pending;
         rep.submittedAt       = std::time(nullptr);
         rep.updatedAt         = rep.submittedAt;
@@ -651,8 +663,10 @@ static void SpawnTradingWindow(int idx) {
     e.win->setGroupId(idx + 1);
     e.win->SetNextOrderId(g_nextOrderId);
 
-    e.win->OnOrderSubmit = [](const core::Order& order) {
+    e.win->OnOrderSubmit = [](const core::Order& o) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        core::Order order = o;
+        order.account     = g_selectedAccount;
         g_IBClient->PlaceOrder(order);
         if (order.orderId >= g_nextOrderId) g_nextOrderId = order.orderId + 1;
     };
@@ -823,92 +837,108 @@ static void DestroyTradingWindows() {
 }
 
 // ============================================================================
+// Post-account-selection connect setup (called once account is known)
+// ============================================================================
+static void FinishConnect(bool isReconnect) {
+    g_Login.state = ConnectionState::Connected;
+
+    g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 4);
+
+    if (!isReconnect) {
+        DestroyTradingWindows();
+        CreateTradingWindows();
+
+        g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
+        g_IBClient->ReqPositions();
+        g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, ACCT_SUMMARY_TAGS);
+        g_IBClient->ReqOpenOrders();
+        g_IBClient->ReqAllOpenOrders();
+        g_IBClient->ReqExecutions(8001);
+        for (auto& se : g_scannerEntries)
+            g_IBClient->CancelScannerData(se.activeScanId);
+
+        const std::string sym = "AAPL";
+        if (!g_chartEntries.empty()) {
+            auto& ce = g_chartEntries[0];
+            ce.pendingBars.symbol    = sym;
+            ce.pendingBars.timeframe = core::Timeframe::D1;
+            g_tickerSymbols[ce.mktId] = sym;
+            g_IBClient->ReqHistoricalData(ce.histId, sym,
+                                          core::TimeframeIBDuration(core::Timeframe::D1),
+                                          core::TimeframeIBBarSize(core::Timeframe::D1),
+                                          true);
+            g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+        }
+        if (!g_tradingEntries.empty())
+            ApplyTradingSymbol(g_tradingEntries[0], sym);
+
+        g_IBClient->SubscribeToNews(NEWS_RT_REQID);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
+            for (int i = 0; i < kMktSeedCount; ++i)
+                g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+    } else {
+        printf("[IB] Reconnected — re-subscribing all windows.\n");
+        g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
+        g_IBClient->ReqPositions();
+        g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, ACCT_SUMMARY_TAGS);
+        g_IBClient->ReqOpenOrders();
+        g_IBClient->ReqAllOpenOrders();
+        g_IBClient->ReqExecutions(8001);
+        for (auto& se : g_scannerEntries)
+            g_IBClient->CancelScannerData(se.activeScanId);
+
+        for (auto& ce : g_chartEntries) {
+            if (!ce.win) continue;
+            std::string sym = ce.win->getSymbol();
+            if (sym.empty()) continue;
+            core::Timeframe tf = ce.win->getTimeframe();
+            g_tickerSymbols[ce.mktId] = sym;
+            ce.pendingBars.symbol    = sym;
+            ce.pendingBars.timeframe = tf;
+            g_IBClient->ReqHistoricalData(ce.histId, sym,
+                                          core::TimeframeIBDuration(tf),
+                                          core::TimeframeIBBarSize(tf),
+                                          true);
+            g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+        }
+        for (auto& te : g_tradingEntries) {
+            if (!te.win) continue;
+            std::string sym = te.win->getSymbol();
+            if (!sym.empty()) ApplyTradingSymbol(te, sym);
+        }
+
+        g_IBClient->SubscribeToNews(NEWS_RT_REQID);
+        for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
+            for (int i = 0; i < kMktSeedCount; ++i)
+                g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+    }
+}
+
+// ============================================================================
 // IB API connection wiring
 // ============================================================================
 static void WireIBCallbacks() {
+    // ── Managed accounts (fires before nextValidId so account is known early) ─
+    g_IBClient->onManagedAccounts = [](const std::vector<std::string>& accts) {
+        g_managedAccounts = accts;
+        if (accts.size() == 1)
+            g_selectedAccount = accts[0];
+        printf("[IB] Managed accounts: %zu account(s)\n", accts.size());
+    };
+
     // ── Connection state ──────────────────────────────────────────────────
     g_IBClient->onConnectionChanged = [](bool connected, const std::string& info) {
         if (connected) {
             bool isReconnect = (g_Login.state == ConnectionState::LostConnection);
-            g_Login.state       = ConnectionState::Connected;
             g_Login.connectedAs = g_Login.isLive ? "[LIVE]" : "[PAPER]";
             printf("[IB] %s\n", info.c_str());
 
-            // Set market data type before any subscriptions.
-            // Live:  type 1 (real-time, requires active data subscriptions).
-            // Paper: type 4 (delayed-frozen — 15-20 min delayed during RTH, shows
-            //        last known price outside RTH so NBBO doesn't go blank after hours).
-            g_IBClient->ReqMarketDataType(g_Login.isLive ? 1 : 4);
-
-            if (!isReconnect) {
-                // ── First connect: create all windows, load default symbol ────────
-                DestroyTradingWindows();
-                CreateTradingWindows();
-
-                g_IBClient->ReqAccountUpdates(true);
-                g_IBClient->ReqPositions();
-                g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
-                g_IBClient->ReqOpenOrders();
-                for (auto& se : g_scannerEntries)
-                    g_IBClient->CancelScannerData(se.activeScanId);
-
-                const std::string sym = "AAPL";
-                if (!g_chartEntries.empty()) {
-                    auto& ce = g_chartEntries[0];
-                    ce.pendingBars.symbol    = sym;
-                    ce.pendingBars.timeframe = core::Timeframe::D1;
-                    g_tickerSymbols[ce.mktId] = sym;
-                    g_IBClient->ReqHistoricalData(ce.histId, sym,
-                                                  core::TimeframeIBDuration(core::Timeframe::D1),
-                                                  core::TimeframeIBBarSize(core::Timeframe::D1),
-                                                  true);
-                    g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
-                }
-                if (!g_tradingEntries.empty())
-                    ApplyTradingSymbol(g_tradingEntries[0], sym);
-
-                g_IBClient->SubscribeToNews(NEWS_RT_REQID);
-                for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
-                    for (int i = 0; i < kMktSeedCount; ++i)
-                        g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+            if (g_selectedAccount.empty() && g_managedAccounts.size() > 1) {
+                // Multi-account: defer window creation until user picks account.
+                g_Login.state      = ConnectionState::SelectingAccount;
+                g_pendingReconnect = isReconnect;
             } else {
-                // ── Silent reconnect: windows already exist, re-subscribe data ───
-                printf("[IB] Reconnected — re-subscribing all windows.\n");
-                g_IBClient->ReqAccountUpdates(true);
-                g_IBClient->ReqPositions();
-                g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, "Currency");
-                g_IBClient->ReqOpenOrders();
-                // Cancel any stale scanner subs the gateway may have retained.
-                for (auto& se : g_scannerEntries)
-                    g_IBClient->CancelScannerData(se.activeScanId);
-
-                // Re-subscribe each chart window with its current symbol + timeframe.
-                for (auto& ce : g_chartEntries) {
-                    if (!ce.win) continue;
-                    std::string sym = ce.win->getSymbol();
-                    if (sym.empty()) continue;
-                    core::Timeframe tf = ce.win->getTimeframe();
-                    g_tickerSymbols[ce.mktId] = sym;
-                    ce.pendingBars.symbol    = sym;
-                    ce.pendingBars.timeframe = tf;
-                    g_IBClient->ReqHistoricalData(ce.histId, sym,
-                                                  core::TimeframeIBDuration(tf),
-                                                  core::TimeframeIBBarSize(tf),
-                                                  true);
-                    g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
-                }
-
-                // Re-subscribe each trading window with its current symbol.
-                for (auto& te : g_tradingEntries) {
-                    if (!te.win) continue;
-                    std::string sym = te.win->getSymbol();
-                    if (!sym.empty()) ApplyTradingSymbol(te, sym);
-                }
-
-                g_IBClient->SubscribeToNews(NEWS_RT_REQID);
-                for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
-                    for (int i = 0; i < kMktSeedCount; ++i)
-                        g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+                FinishConnect(isReconnect);
             }
         } else {
             // Any disconnect while not in the normal "initial Connecting" flow
@@ -1138,18 +1168,21 @@ static void WireIBCallbacks() {
         if (!acct.empty() && g_accountId.empty()) {
             g_accountId = acct;
         }
-        if (!g_pnlSubscribed && !g_accountId.empty() && g_IBClient) {
+        if (!g_pnlSubscribed && !g_selectedAccount.empty() && g_IBClient) {
             g_pnlSubscribed = true;
-            g_IBClient->ReqPnL(9000, g_accountId);
+            g_IBClient->ReqPnL(9000, g_selectedAccount);
         }
     };
 
     // ── Account summary (base currency via reqAccountSummary) ─────────────
     // tag="Currency", value="USD" — this is the authoritative source.
     g_IBClient->onAccountSummary = [](const std::string& tag, const std::string& value,
-                                      const std::string& /*currency*/) {
-        if (tag == "Currency" && !value.empty() && g_PortfolioWindow)
-            g_PortfolioWindow->SetBaseCurrency(value);
+                                      const std::string& currency) {
+        if (!g_PortfolioWindow) return;
+        // Route every financial tag through OnAccountValue so the portfolio
+        // header always has live data even when reqAccountUpdates is slow or
+        // delivers currency-suffixed variants on live accounts.
+        g_PortfolioWindow->OnAccountValue(tag, value, currency, g_selectedAccount);
     };
 
     // ── Real-time P&L ─────────────────────────────────────────────────────
@@ -1169,6 +1202,19 @@ static void WireIBCallbacks() {
             UpdateAllChartPositions();
         }
         if (g_PortfolioWindow) g_PortfolioWindow->OnPnLSingle(reqId, sym, daily);
+    };
+
+    // ── Symbol autocomplete ───────────────────────────────────────────────
+    ui::g_symbolSearchFn = [](const std::string& pattern) {
+        if (g_IBClient) g_IBClient->ReqMatchingSymbols(8000, pattern);
+    };
+    g_IBClient->onSymbolSamples = [](int /*reqId*/,
+                                      const std::vector<core::services::ContractDesc>& results) {
+        std::vector<ui::SymbolResult> out;
+        out.reserve(results.size());
+        for (const auto& r : results)
+            out.push_back({r.symbol, r.secType, r.primaryExch, r.currency});
+        ui::UpdateSymbolSearchResults(std::move(out));
     };
 
     // ── Positions ─────────────────────────────────────────────────────────
@@ -1212,7 +1258,7 @@ static void WireIBCallbacks() {
             int rid = g_pnlSingleNextReqId++;
             g_pnlSingleConIds[pos.conId]   = rid;
             g_pnlReqIdToSymbol[rid]        = pos.symbol;
-            g_IBClient->ReqPnLSingle(rid, g_accountId, "", static_cast<int>(pos.conId));
+            g_IBClient->ReqPnLSingle(rid, g_selectedAccount, "", static_cast<int>(pos.conId));
         }
     };
 
@@ -1412,8 +1458,10 @@ static void WireIBCallbacks() {
         // IB has already set the order to Working state.
         auto it = g_liveOrders.find(reqId);
         if (it != g_liveOrders.end() &&
-            (it->second.status == core::OrderStatus::Pending ||
-             it->second.status == core::OrderStatus::Working)) {
+            (it->second.status == core::OrderStatus::Pending  ||
+             it->second.status == core::OrderStatus::Working  ||
+             it->second.status == core::OrderStatus::PartialFill) &&
+             it->second.status != core::OrderStatus::PendingCancel) {
             char reason[512];
             std::snprintf(reason, sizeof(reason), "[%d] %s", code, msg.c_str());
             it->second.status       = core::OrderStatus::Rejected;
@@ -1519,11 +1567,15 @@ static void Disconnect() {
         delete g_IBClient;
         g_IBClient = nullptr;
     }
+    g_managedAccounts.clear();
+    g_selectedAccount.clear();
+    g_pendingReconnect = false;
     g_accountId.clear();
     g_pnlSubscribed = false;
     g_pnlSingleConIds.clear();
     g_pnlReqIdToSymbol.clear();
     g_pnlSingleNextReqId = 9001;
+    ui::g_symbolSearchFn = nullptr;
     g_Login.state       = ConnectionState::Disconnected;
     g_Login.connectedAs.clear();
     g_Login.errorMsg.clear();
@@ -2282,13 +2334,27 @@ static void RenderTradingUI() {
             if (ImGui::MenuItem("Settings"))
                 g_settingsOpen = !g_settingsOpen;
 
-            // Status indicator
+            // Status indicator (right-aligned): [acct v]  DISCONNECTED  [LIVE]/[PAPER]
             const std::string& who = g_Login.connectedAs;
             bool lostConn = (g_Login.state == ConnectionState::LostConnection);
             static const char* kDiscLabel = " DISCONNECTED ";
             float discW = lostConn ? ImGui::CalcTextSize(kDiscLabel).x + 8.0f : 0.0f;
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x
-                            - discW - ImGui::CalcTextSize(who.c_str()).x - 12.0f);
+            float whoW  = ImGui::CalcTextSize(who.c_str()).x;
+
+            // Account label/selector width
+            std::string acctMenuLabel;
+            float acctW = 0.0f;
+            if (!g_selectedAccount.empty()) {
+                if (g_managedAccounts.size() > 1)
+                    acctMenuLabel = g_selectedAccount + " v";
+                else
+                    acctMenuLabel = g_selectedAccount;
+                acctW = ImGui::CalcTextSize(acctMenuLabel.c_str()).x + 10.0f;
+            }
+
+            float totalR = discW + (acctW > 0 ? acctW + 6.0f : 0.0f) + whoW + 12.0f;
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - totalR);
+
             if (lostConn) {
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 ImVec2 sz = ImGui::CalcTextSize(kDiscLabel);
@@ -2303,6 +2369,34 @@ static void RenderTradingUI() {
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
             }
+
+            if (!g_selectedAccount.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.8f, 1.0f, 1.0f));
+                if (g_managedAccounts.size() > 1) {
+                    if (ImGui::BeginMenu(acctMenuLabel.c_str())) {
+                        for (const auto& acct : g_managedAccounts) {
+                            bool sel = (acct == g_selectedAccount);
+                            if (ImGui::MenuItem(acct.c_str(), nullptr, sel) && !sel) {
+                                g_selectedAccount = acct;
+                                if (g_IBClient) {
+                                    g_IBClient->ReqAccountUpdates(false, "");
+                                    g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
+                                    if (g_pnlSubscribed) {
+                                        g_IBClient->CancelPnL(9000);
+                                        g_pnlSubscribed = false;
+                                    }
+                                }
+                            }
+                        }
+                        ImGui::EndMenu();
+                    }
+                } else {
+                    ImGui::TextUnformatted(acctMenuLabel.c_str());
+                }
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+            }
+
             ImGui::PushStyleColor(ImGuiCol_Text,
                 g_Login.isLive ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
                                : ImVec4(0.4f, 1.0f, 0.5f, 1.0f));
@@ -2341,10 +2435,36 @@ static void RenderTradingUI() {
 // ============================================================================
 // Top-level UI dispatcher
 // ============================================================================
+static void RenderAccountSelectorUI() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 center(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Always);
+    ImGui::Begin("Select Account##acctsel",
+                 nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoSavedSettings);
+
+    ImGui::TextUnformatted("Multiple accounts found. Select one to continue:");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    for (const auto& acct : g_managedAccounts) {
+        if (ImGui::Button(acct.c_str(), ImVec2(-1, 0))) {
+            g_selectedAccount = acct;
+            FinishConnect(g_pendingReconnect);
+        }
+    }
+    ImGui::End();
+}
+
 static void RenderMainUI() {
     if (g_Login.state == ConnectionState::Connected ||
         g_Login.state == ConnectionState::LostConnection)
         RenderTradingUI();
+    else if (g_Login.state == ConnectionState::SelectingAccount)
+        RenderAccountSelectorUI();
     else
         RenderLoginWindow();
     RenderCustomTitleBar(); // always last so it renders on top of everything
