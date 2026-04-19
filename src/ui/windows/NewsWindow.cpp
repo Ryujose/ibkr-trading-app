@@ -1,5 +1,6 @@
 #include "ui/UiScale.h"
 #include "ui/windows/NewsWindow.h"
+#include "ui/SymbolSearch.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
 
@@ -232,19 +233,16 @@ void NewsWindow::DrawTabPortfolio() {
 void NewsWindow::DrawTabStock() {
     ImGui::Text("Symbol:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(em(80));
-    bool entered = ImGui::InputText("##stocksym", m_stockSymbol, sizeof(m_stockSymbol),
-                                    ImGuiInputTextFlags_EnterReturnsTrue |
-                                    ImGuiInputTextFlags_CharsUppercase);
-    for (char* p = m_stockSymbol; *p; ++p) *p = (char)toupper((unsigned char)*p);
-
-    ImGui::SameLine();
-    bool clicked = ImGui::Button("Load");
-
-    if (entered || clicked) {
+    auto loadStock = [this]() {
         RefreshStock(m_stockSymbol);
         if (OnSymbolChanged) OnSymbolChanged(m_stockSymbol);
-    }
+    };
+    DrawSymbolInput("##stocksym", m_stockSymbol, sizeof(m_stockSymbol), em(80),
+                    [&](const std::string&) { loadStock(); });
+
+    ImGui::SameLine();
+    if (ImGui::Button("Load"))
+        loadStock();
 
     const char* syms[] = {"AAPL","MSFT","GOOGL","TSLA","AMZN","NVDA","SPY"};
     for (const char* s : syms) {

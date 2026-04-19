@@ -16,7 +16,8 @@ inline ::core::OrderStatus ParseStatus(const std::string& s) {
     if (s == "Cancelled" || s == "ApiCancelled" || s == "Inactive")      return ::core::OrderStatus::Cancelled;
     if (s == "Submitted"  || s == "PreSubmitted" || s == "ApiPending")   return ::core::OrderStatus::Working;
     if (s == "PartiallyFilled")                                           return ::core::OrderStatus::PartialFill;
-    if (s == "Pending" || s == "PendingSubmit" || s == "PendingCancel")  return ::core::OrderStatus::Pending;
+    if (s == "Pending" || s == "PendingSubmit")                           return ::core::OrderStatus::Pending;
+    if (s == "PendingCancel")                                             return ::core::OrderStatus::PendingCancel;
     if (s.empty())                                                        return ::core::OrderStatus::Pending;
     return ::core::OrderStatus::Rejected;
 }

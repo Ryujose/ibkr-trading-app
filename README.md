@@ -12,11 +12,13 @@ The “Interactive Brokers API Usage Notice” section must be reviewed prior to
 
 - **Candlestick Charts** — Multi-timeframe OHLCV with SMA, EMA, Bollinger Bands, VWAP, RSI, and volume
 - **DOM / Level II** — Live order book ladder with click-to-trade
-- **Order Management** — Place, track, and cancel Market, Limit, Stop, Stop-Limit, Trailing, MOC/LOC, MTL, MIT/LIT, Midprice, and Relative orders
+- **Order Management** — Place, track, and cancel Market, Limit, Stop, Stop-Limit, Trailing, MOC/LOC, MTL, MIT/LIT, Midprice, and Relative orders; full order status lifecycle including CANCELLING state
 - **Market Scanner** — Scan for Top Gainers/Losers, Volume Leaders, 52W Highs/Lows, RSI extremes, and more
 - **News Feed** — Real-time and historical news across Market, Portfolio, and per-Stock tabs with sentiment indicators
-- **Portfolio Dashboard** — Account summary, positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
-- **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L
+- **Portfolio Dashboard** — Real-time account-level P&L (daily, unrealized, realized), positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
+- **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L; order history restored automatically after reconnect
+- **Symbol Autocomplete** — IB-validated symbol search with 300 ms debounce across all windows; invalid symbols automatically revert to the last confirmed ticker
+- **Multi-Account Support** — On live sessions with multiple accounts, a selector modal appears at connect time; active account shown in the menu bar and stamped on every order
 - **Paper & Live accounts** — Toggle between paper and live trading from the login screen
 - **Multi-Instance Windows** — Open up to 10 simultaneous Chart, Order Book, Scanner, and News windows to monitor multiple assets at once
 - **Window Groups** — Link any windows into a color-coded group (G1–G4); changing the asset in one window instantly syncs all others in the same group
@@ -201,6 +203,8 @@ On launch, a login dialog appears before the trading UI loads.
 
 Click **Connect**. The app waits for `nextValidId` from IB (which signals the connection is ready) before showing the trading UI. If connection fails, an error message is displayed with the IB error code.
 
+On **live sessions with multiple accounts**, an account selector modal appears after the connection handshake completes. The selected account is displayed in the menu bar and stamped on every order placed during the session.
+
 ---
 
 ## Windows
@@ -280,7 +284,7 @@ Professional Depth of Market ladder for market microstructure analysis and fast 
 - BUY / SELL buttons confirm submission
 
 **Tabs:**
-- **Open Orders** — Working and partially-filled orders with cancel button
+- **Open Orders** — Working, partially-filled, and cancelling orders with cancel button; status badge covers the full lifecycle (PENDING → WORKING → PARTIAL → CANCELLING → FILLED/CANCELLED/REJECTED)
 - **Execution Log** — Filled orders with commission and realized P&L
 - **Time & Sales** — Live tape of last 80 executed trades with uptick/downtick coloring
 
@@ -353,6 +357,8 @@ Auto-refreshes every 30 seconds (configurable). Falls back to simulated data whe
 
 Full account and position dashboard.
 
+**Real-time P&L header** — Account-level daily P&L, unrealized P&L, and realized P&L streamed live from IB and shown above the positions table.
+
 **Summary cards (top row):**
 - Net Liquidation Value
 - Cash Balance
@@ -378,9 +384,9 @@ Full account and position dashboard.
 
 Live order blotter with two tabs.
 
-**Open Tab** — All submitted, working, and partially-filled orders. Shows order type, quantity, limit/stop prices, current fill amount, avg fill price, commission, and a color-coded status badge. Cancel button per order.
+**Open Tab** — All submitted, working, partially-filled, and cancelling orders. Shows order type, quantity, limit/stop/aux prices, TIF, filled qty, avg fill price, commission, submission time, and a color-coded status badge. Cancel button per order.
 
-**History Tab** — Filled and cancelled orders sorted by execution time (newest first).
+**History Tab** — Filled and cancelled orders sorted by execution time (newest first). Order history is restored automatically after reconnect — orders placed in previous sessions during the same trading day are recovered via `reqAllOpenOrders` and `reqExecutions`.
 
 ---
 
@@ -389,9 +395,10 @@ Live order blotter with two tabs.
 If IB Gateway or TWS closes unexpectedly while the app is running:
 
 - The trading UI **stays open** with last-known chart data and positions still visible.
-- An orange **DISCONNECTED** badge appears to the left of the `[LIVE]` / `[PAPER]` label in the menu bar.
+- An orange **DISCONNECTED** badge appears in the menu bar next to the account selector.
 - The app **automatically retries** the connection every 5 seconds in the background.
 - When Gateway comes back up, the app reconnects silently and re-subscribes all open chart and order book windows to live data — no need to restart or re-enter credentials.
+- **Order history is recovered** — open orders from all client sessions and today's fill history are re-fetched automatically on reconnect.
 
 ---
 

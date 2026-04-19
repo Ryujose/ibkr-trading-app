@@ -1,5 +1,6 @@
 #include "ui/UiScale.h"
 #include "ui/windows/TradingWindow.h"
+#include "ui/SymbolSearch.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
 
@@ -978,13 +979,7 @@ void TradingWindow::DrawOrderEntry() {
         row.item(FlexRow::textW("Symbol"), 8);
         ImGui::Text("Symbol");
         row.item(em(72), 6);
-        ImGui::SetNextItemWidth(em(72));
-        bool symEntered = ImGui::InputText("##sym", m_symbol, sizeof(m_symbol),
-                                           ImGuiInputTextFlags_CharsUppercase |
-                                           ImGuiInputTextFlags_EnterReturnsTrue);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Type a symbol and press Enter to subscribe");
-        if (symEntered && m_symbol[0] != '\0') {
+        auto applySymbol = [this]() {
             m_bids.clear();
             m_asks.clear();
             m_volAtPrice.clear();
@@ -999,7 +994,9 @@ void TradingWindow::DrawOrderEntry() {
             m_mktDataStatus  = SubStatus::Unknown;
             m_depthStatus    = SubStatus::Unknown;
             if (OnSymbolChanged) OnSymbolChanged(m_symbol);
-        }
+        };
+        DrawSymbolInput("##sym", m_symbol, sizeof(m_symbol), em(72),
+                        [&](const std::string&) { applySymbol(); });
         char midBuf[24];
         std::snprintf(midBuf, sizeof(midBuf), "Mid: $%.2f", m_midPrice);
         row.item(FlexRow::textW(midBuf), 8);
