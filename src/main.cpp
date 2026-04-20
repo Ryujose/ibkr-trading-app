@@ -43,6 +43,8 @@ struct ChartEntry {
     int              histId      = 0;   // reqHistoricalData id
     int              extId       = 0;   // extend-history (pan-left) id
     int              mktId       = 0;   // reqMarketData id (chart ticks)
+    int              wshId       = 0;   // reqContractDetails / reqWshEventData id
+    bool             wshConIdFired = false;
     core::BarSeries  pendingBars;
     core::BarSeries  pendingExtBars;
 };
@@ -51,6 +53,7 @@ struct TradingEntry {
     ui::TradingWindow* win          = nullptr;
     int                depthId      = 0;   // reqMktDepth id
     int                mktId        = 0;   // reqMarketData id (NBBO ticks)
+    int                tickId       = 0;   // reqTickByTickData id (Time & Sales)
     double nbboBid = 0, nbboBidSz = 0;
     double nbboAsk = 0, nbboAskSz = 0;
     double lastTickPrice = 0, lastTickSize = 0;
@@ -227,6 +230,8 @@ inline int ChartExtId    (int idx) { return 2    + idx * 2; }   // 2,4,6,...,20
 inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-109
 inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119
 inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
+inline int TradingTickId (int idx) { return 130  + idx; }       // 130-139
+inline int ChartWshId    (int idx) { return 8020 + idx; }       // 8020-8029
 inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,...,1900
 inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,...,908
 
@@ -521,9 +526,11 @@ static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
     if (!g_IBClient) return;
     g_IBClient->CancelMarketData(te.mktId);
     g_IBClient->CancelMktDepth(te.depthId);
+    g_IBClient->CancelTickByTickData(te.tickId);
     g_tickerSymbols[te.mktId] = sym;
     g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
     g_IBClient->ReqMktDepth(te.depthId, sym, 20);
+    g_IBClient->ReqTickByTickData(te.tickId, sym);
 }
 
 // Propagate a symbol change to all windows in the same group.
@@ -574,6 +581,7 @@ static void SpawnChartWindow(int idx) {
     e.histId = ChartHistId(idx);
     e.extId  = ChartExtId(idx);
     e.mktId  = ChartMktId(idx);
+    e.wshId  = ChartWshId(idx);
     e.win    = new ui::ChartWindow();
     e.win->setInstanceId(idx + 1);
     e.win->setGroupId(idx + 1);
@@ -585,6 +593,13 @@ static void SpawnChartWindow(int idx) {
         UpdateChartPendingOrders(ce.win);
         UpdateChartPosition(ce.win);
         BroadcastGroupSymbol(ce.win->groupId(), sym);
+        // WSH: clear stale markers and subscribe for the new symbol
+        if (g_IBClient) {
+            ce.win->ClearWshEvents();
+            ce.wshConIdFired = false;
+            g_IBClient->CancelWshEventData(ce.wshId);
+            g_IBClient->ReqContractDetails(ce.wshId, sym);
+        }
     };
 
     e.win->OnExtendHistory = [idx](const std::string& sym, core::Timeframe tf,
@@ -658,6 +673,7 @@ static void SpawnTradingWindow(int idx) {
     TradingEntry e;
     e.depthId = TradingDepthId(idx);
     e.mktId   = TradingMktId(idx);
+    e.tickId  = TradingTickId(idx);
     e.win     = new ui::TradingWindow();
     e.win->setInstanceId(idx + 1);
     e.win->setGroupId(idx + 1);
@@ -805,6 +821,11 @@ static void CreateTradingWindows() {
     };
     g_OrdersWindow->OnRefresh = []() {
         if (g_IBClient) g_IBClient->ReqOpenOrders();
+    };
+    g_OrdersWindow->OnLoadHistory = [](const std::string& sym,
+                                       const std::string& side,
+                                       const std::string& dateFrom) {
+        if (g_IBClient) g_IBClient->ReqExecutions(8001, sym, side, dateFrom);
     };
 }
 
@@ -1310,7 +1331,19 @@ static void WireIBCallbacks() {
         }
         UpdateAllChartPositions();
     };
-
+    g_IBClient->onQueriedFill = [](const core::Fill& fill) {
+        if (g_OrdersWindow) g_OrdersWindow->OnQueriedFill(fill);
+    };
+    g_IBClient->onTickByTick = [](int reqId, const core::Tick& tick) {
+        for (auto& te : g_tradingEntries)
+            if (te.tickId == reqId && te.win) te.win->OnTickByTick(tick);
+    };
+    g_IBClient->onWshEvent = [](int reqId, const std::string& data) {
+        WshData::WshEvent ev = WshData::ParseWshEvent(data);
+        for (int ci = 0; ci < (int)g_chartEntries.size(); ++ci)
+            if (reqId == ChartWshId(ci) && g_chartEntries[ci].win)
+                g_chartEntries[ci].win->OnWshEvent(ev);
+    };
 
     // ── Scanner ───────────────────────────────────────────────────────────
     g_IBClient->onScanItem = [](int reqId, const core::ScanResult& result) {
@@ -1369,7 +1402,19 @@ static void WireIBCallbacks() {
     g_IBClient->onContractConId = [](int reqId, long conId) {
         if (!g_IBClient) return;
         // IB may call contractDetails multiple times (one per exchange match).
-        // Only use the first conId per reqId so we don't issue duplicate news requests.
+        // Only use the first conId per reqId so we don't issue duplicate requests.
+
+        // Chart WSH event markers (reqIds 8020–8029)
+        for (int ci = 0; ci < (int)g_chartEntries.size(); ++ci) {
+            auto& ce = g_chartEntries[ci];
+            if (reqId == ChartWshId(ci)) {
+                if (ce.wshConIdFired) return;
+                ce.wshConIdFired = true;
+                g_IBClient->ReqWshEventData(reqId, (int)conId);
+                return;
+            }
+        }
+
         for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
             auto& ne = g_newsEntries[ni];
             if (reqId == NewsStockConId(ni)) {

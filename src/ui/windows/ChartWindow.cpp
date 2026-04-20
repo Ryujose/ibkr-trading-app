@@ -347,6 +347,12 @@ void ChartWindow::SetPosition(const PositionInfo& pos) {
     m_position = pos;
 }
 
+void ChartWindow::OnWshEvent(const WshData::WshEvent& event) {
+    for (const auto& e : m_wshEvents)
+        if (e.date == event.date && e.type == event.type) return;
+    m_wshEvents.push_back(event);
+}
+
 void ChartWindow::RequestNewData() {
     m_series = core::BarSeries{};
     m_xs.clear(); m_opens.clear(); m_highs.clear();
@@ -628,7 +634,7 @@ void ChartWindow::DrawTradePanel() {
     static constexpr const char* kSessions[] = {
         "Regular", "Pre-Market", "After Hours", "Overnight"
     };
-    static constexpr const char* kTIFs[] = { "DAY", "GTC", "GTD" };
+    static constexpr const char* kTIFs[] = { "DAY", "GTC", "GTD", "OPG", "OVERNIGHT" };
 
     ImGui::Spacing();
 
@@ -792,7 +798,8 @@ void ChartWindow::DrawTradePanel() {
     auto buildOrder = [&](const std::string& side) -> core::Order {
         const auto& ot = kOrderTypes[m_orderTypeIdx];
         static constexpr core::TimeInForce kTIFEnum[] = {
-            core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+            core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
+            core::TimeInForce::OPG, core::TimeInForce::Overnight
         };
         core::Order o;
         o.symbol     = m_symbol;
@@ -1620,7 +1627,8 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 const auto& ot = kOrderTypes[m_orderTypeIdx];
                 static constexpr core::TimeInForce kTIFEnum[] = {
-                    core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+                    core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
+                    core::TimeInForce::OPG, core::TimeInForce::Overnight
                 };
                 core::Order o;
                 o.symbol     = m_symbol;
@@ -1668,7 +1676,8 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                     // Single-price: build order from cursor position
                     const auto& ot = kOrderTypes[m_orderTypeIdx];
                     static constexpr core::TimeInForce kTIFEnum[] = {
-                        core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC
+                        core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
+                    core::TimeInForce::OPG, core::TimeInForce::Overnight
                     };
                     core::Order o;
                     o.symbol     = m_symbol;
@@ -1874,6 +1883,7 @@ void ChartWindow::DrawCandleChart() {
     DrawCandlesticks(halfBarW);
     DrawOverlays(1.0);
     DrawHoverTooltip();
+    DrawWshMarkers();
 
     ImPlot::EndPlot();
 }
@@ -1992,6 +2002,78 @@ void ChartWindow::DrawHoverTooltip() {
     if (m_ind.rsi   && i < (int)m_rsi.size()  && m_rsi[i]  > 0.0)
         ImGui::TextDisabled("RSI14:  %.1f",  m_rsi[i]);
     ImGui::EndTooltip();
+}
+
+// ============================================================================
+// WSH corporate event markers — vertical dashed lines with label and tooltip
+// Called inside BeginPlot / EndPlot of the candle chart.
+// ============================================================================
+void ChartWindow::DrawWshMarkers() {
+    if (m_wshEvents.empty()) return;
+    int n = (int)m_xs.size();
+    if (n == 0) return;
+
+    ImDrawList* dl   = ImPlot::GetPlotDrawList();
+    ImVec2      pMin = ImPlot::GetPlotPos();
+    ImVec2      pMax = ImVec2(pMin.x + ImPlot::GetPlotSize().x,
+                               pMin.y + ImPlot::GetPlotSize().y);
+    ImVec2 mouse = ImGui::GetMousePos();
+
+    for (const auto& ev : m_wshEvents) {
+        int yr = 0, mo = 0, dy = 0;
+        if (std::sscanf(ev.date.c_str(), "%d-%d-%d", &yr, &mo, &dy) != 3) continue;
+        char evDate[11];
+        std::snprintf(evDate, sizeof(evDate), "%04d-%02d-%02d", yr, mo, dy);
+
+        // First bar on or after the event date
+        double plotIdx = -1.0;
+        for (int i = 0; i < n; ++i) {
+            std::time_t t  = (std::time_t)m_xs[i];
+            struct tm*  tm = std::gmtime(&t);
+            char barDate[11];
+            std::snprintf(barDate, sizeof(barDate), "%04d-%02d-%02d",
+                          tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+            if (std::strcmp(barDate, evDate) >= 0) { plotIdx = m_idxs[i]; break; }
+        }
+        if (plotIdx < 0.0) continue;
+
+        float x = ImPlot::PlotToPixels(plotIdx, 0.0).x;
+        if (x < pMin.x || x > pMax.x) continue;
+
+        // Color by event type
+        std::string tl = ev.type;
+        for (auto& c : tl) c = (char)std::tolower((unsigned char)c);
+        unsigned int col =
+            (tl.find("earn")  != std::string::npos) ? IM_COL32(255, 220,   0, 220) :
+            (tl.find("div")   != std::string::npos) ? IM_COL32(  0, 220, 220, 220) :
+            (tl.find("split") != std::string::npos) ? IM_COL32(180, 100, 255, 220) :
+                                                       IM_COL32(200, 200, 200, 180);
+
+        // Dashed vertical line
+        for (float y = pMin.y; y < pMax.y; y += 10.f)
+            dl->AddLine(ImVec2(x, y), ImVec2(x, std::min(y + 6.f, pMax.y)), col, 1.5f);
+
+        // Single-char label box at top
+        const char* label =
+            (tl.find("earn")  != std::string::npos) ? "E" :
+            (tl.find("div")   != std::string::npos) ? "D" :
+            (tl.find("split") != std::string::npos) ? "S" : "W";
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        float  bx = x - ts.x * 0.5f - 2.f;
+        float  by = pMin.y + 1.f;
+        dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + ts.x + 4.f, by + ts.y + 2.f),
+                          (col & 0x00FFFFFF) | 0x88000000);
+        dl->AddText(ImVec2(bx + 2.f, by + 1.f), col, label);
+
+        // Hover tooltip
+        if (std::fabs(mouse.x - x) < 6.f && mouse.y >= pMin.y && mouse.y <= pMax.y) {
+            ImGui::BeginTooltip();
+            ImGui::Text("%s  %s", ev.date.c_str(), ev.type.c_str());
+            if (!ev.description.empty()) ImGui::TextUnformatted(ev.description.c_str());
+            if (!ev.importance.empty())  ImGui::Text("Importance: %s", ev.importance.c_str());
+            ImGui::EndTooltip();
+        }
+    }
 }
 
 // ============================================================================

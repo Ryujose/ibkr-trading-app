@@ -64,6 +64,13 @@ void OrdersWindow::OnFill(const core::Fill& fill) {
     }
 }
 
+void OrdersWindow::OnQueriedFill(const core::Fill& fill) {
+    // Deduplicate by execId so repeated Load calls don't stack duplicates
+    for (const auto& f : m_queriedFills)
+        if (f.execId == fill.execId) return;
+    m_queriedFills.push_back(fill);
+}
+
 // ============================================================================
 // Render
 // ============================================================================
@@ -152,46 +159,114 @@ void OrdersWindow::DrawOpenTab() {
 }
 
 void OrdersWindow::DrawHistoryTab() {
+    // ── Filter toolbar ────────────────────────────────────────────────────
+    ImGui::SetNextItemWidth(88);
+    ImGui::InputText("##fsym", m_filterSymbol, sizeof(m_filterSymbol));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Symbol (empty = all)");
+    ImGui::SameLine(0, 4);
+    static constexpr const char* kSides[] = {"All", "BUY", "SELL"};
+    ImGui::SetNextItemWidth(62);
+    ImGui::Combo("##fside", &m_filterSideIdx, kSides, 3);
+    ImGui::SameLine(0, 4);
+    ImGui::SetNextItemWidth(78);
+    ImGui::InputText("##fdate", m_filterDate, sizeof(m_filterDate));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Date from: YYYYMMDD (empty = today)");
+    ImGui::SameLine(0, 4);
+    if (ImGui::Button("Load##hist")) {
+        if (OnLoadHistory) {
+            const char* sideStr = (m_filterSideIdx == 1) ? "BUY"
+                                : (m_filterSideIdx == 2) ? "SELL" : "";
+            OnLoadHistory(m_filterSymbol, sideStr, m_filterDate);
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Query IB for filtered execution history");
+    if (!m_queriedFills.empty()) {
+        ImGui::SameLine(0, 8);
+        if (ImGui::SmallButton("Clear##qf")) m_queriedFills.clear();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear queried results");
+    }
+    ImGui::Separator();
+
     bool anyHistory = false;
     for (const auto& [id, o] : m_orders)
         if (IsTerminal(o.status)) { anyHistory = true; break; }
+    bool hasQueried = !m_queriedFills.empty();
 
+    float availH = ImGui::GetContentRegionAvail().y;
+    float liveH  = hasQueried ? availH * 0.55f : availH;
+
+    // ── Live session history ──────────────────────────────────────────────
     if (!anyHistory) {
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0.0f);
+        ImGui::BeginChild("##livehistory", ImVec2(-1, liveH));
         ImGui::Spacing();
-        ImGui::TextDisabled("  No order history yet.");
-        return;
+        ImGui::TextDisabled("  No live order history.");
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+    } else {
+        static ImGuiTableFlags flags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+            ImGuiTableFlags_SizingFixedFit;
+
+        if (ImGui::BeginTable("##history", 15, flags, ImVec2(-1, liveH))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  52);
+            ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  68);
+            ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  42);
+            ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  72);
+            ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  55);
+            ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed,  80);
+            ImGui::TableSetupColumn("Aux",      ImGuiTableColumnFlags_WidthFixed,  78);
+            ImGui::TableSetupColumn("TIF",      ImGuiTableColumnFlags_WidthFixed,  38);
+            ImGui::TableSetupColumn("Ext",      ImGuiTableColumnFlags_WidthFixed,  30);
+            ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  52);
+            ImGui::TableSetupColumn("Avg $",    ImGuiTableColumnFlags_WidthFixed,  70);
+            ImGui::TableSetupColumn("Comm $",   ImGuiTableColumnFlags_WidthFixed,  62);
+            ImGui::TableSetupColumn("Updated",  ImGuiTableColumnFlags_WidthFixed,  62);
+            ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100);
+            ImGui::TableSetupColumn("Reject",   ImGuiTableColumnFlags_WidthFixed, 120);
+            ImGui::TableHeadersRow();
+
+            for (auto& [id, o] : m_orders) {
+                if (!IsTerminal(o.status)) continue;
+                DrawOrderRow(o, false);
+            }
+            ImGui::EndTable();
+        }
     }
 
-    static ImGuiTableFlags flags =
-        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
-        ImGuiTableFlags_SizingFixedFit;
+    // ── Queried fills (from filtered reqExecutions) ───────────────────────
+    if (hasQueried) {
+        float queryH = availH - liveH - ImGui::GetFrameHeightWithSpacing();
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.30f, 1.0f));
+        ImGui::Text("Queried results (%d)", static_cast<int>(m_queriedFills.size()));
+        ImGui::PopStyleColor();
+        ImGui::Separator();
 
-    if (!ImGui::BeginTable("##history", 15, flags, ImVec2(-1, -1))) return;
+        static ImGuiTableFlags qflags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+            ImGuiTableFlags_SizingFixedFit;
 
-    ImGui::TableSetupScrollFreeze(0, 1);
-    ImGui::TableSetupColumn("ID",       ImGuiTableColumnFlags_WidthFixed,  52);
-    ImGui::TableSetupColumn("Symbol",   ImGuiTableColumnFlags_WidthFixed,  68);
-    ImGui::TableSetupColumn("Side",     ImGuiTableColumnFlags_WidthFixed,  42);
-    ImGui::TableSetupColumn("Type",     ImGuiTableColumnFlags_WidthFixed,  72);
-    ImGui::TableSetupColumn("Qty",      ImGuiTableColumnFlags_WidthFixed,  55);
-    ImGui::TableSetupColumn("Price",    ImGuiTableColumnFlags_WidthFixed,  80);
-    ImGui::TableSetupColumn("Aux",      ImGuiTableColumnFlags_WidthFixed,  78);
-    ImGui::TableSetupColumn("TIF",      ImGuiTableColumnFlags_WidthFixed,  38);
-    ImGui::TableSetupColumn("Ext",      ImGuiTableColumnFlags_WidthFixed,  30);
-    ImGui::TableSetupColumn("Filled",   ImGuiTableColumnFlags_WidthFixed,  52);
-    ImGui::TableSetupColumn("Avg $",    ImGuiTableColumnFlags_WidthFixed,  70);
-    ImGui::TableSetupColumn("Comm $",   ImGuiTableColumnFlags_WidthFixed,  62);
-    ImGui::TableSetupColumn("Updated",  ImGuiTableColumnFlags_WidthFixed,  62);
-    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 100);
-    ImGui::TableSetupColumn("Reject",   ImGuiTableColumnFlags_WidthFixed, 120);
-    ImGui::TableHeadersRow();
+        if (ImGui::BeginTable("##qfills", 8, qflags, ImVec2(-1, queryH - ImGui::GetFrameHeightWithSpacing()))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Time",    ImGuiTableColumnFlags_WidthFixed,  62);
+            ImGui::TableSetupColumn("Symbol",  ImGuiTableColumnFlags_WidthFixed,  68);
+            ImGui::TableSetupColumn("Side",    ImGuiTableColumnFlags_WidthFixed,  42);
+            ImGui::TableSetupColumn("Qty",     ImGuiTableColumnFlags_WidthFixed,  55);
+            ImGui::TableSetupColumn("Price",   ImGuiTableColumnFlags_WidthFixed,  80);
+            ImGui::TableSetupColumn("Comm $",  ImGuiTableColumnFlags_WidthFixed,  62);
+            ImGui::TableSetupColumn("P&L",     ImGuiTableColumnFlags_WidthFixed,  72);
+            ImGui::TableSetupColumn("OrderId", ImGuiTableColumnFlags_WidthFixed,  58);
+            ImGui::TableHeadersRow();
 
-    for (auto& [id, o] : m_orders) {
-        if (!IsTerminal(o.status)) continue;
-        DrawOrderRow(o, false);
+            for (const auto& f : m_queriedFills)
+                DrawQueriedFillRow(f);
+            ImGui::EndTable();
+        }
     }
-    ImGui::EndTable();
 }
 
 // ============================================================================
@@ -399,6 +474,74 @@ void OrdersWindow::DrawOrderRow(core::Order& o, bool showCancel) {
             ImGui::TextDisabled("—");
         }
     }
+
+    ImGui::PopID();
+}
+
+// ============================================================================
+// Queried fill row (8 columns: Time | Symbol | Side | Qty | Price | Comm | P&L | OrderId)
+// ============================================================================
+void OrdersWindow::DrawQueriedFillRow(const core::Fill& f) {
+    ImGui::TableNextRow();
+    ImGui::PushID(f.execId.c_str());
+
+    // Amber tint to distinguish from live-session orders
+    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+        ImGui::ColorConvertFloat4ToU32(ImVec4(0.25f, 0.20f, 0.05f, 0.35f)));
+
+    // 0 — Time
+    ImGui::TableSetColumnIndex(0);
+    if (f.timestamp != 0) {
+        char tbuf[16];
+        std::tm* lt = std::localtime(&f.timestamp);
+        std::strftime(tbuf, sizeof(tbuf), "%H:%M:%S", lt);
+        ImGui::TextDisabled("%s", tbuf);
+    } else {
+        ImGui::TextDisabled("—");
+    }
+
+    // 1 — Symbol
+    ImGui::TableSetColumnIndex(1);
+    ImGui::TextUnformatted(f.symbol.c_str());
+
+    // 2 — Side
+    ImGui::TableSetColumnIndex(2);
+    ImGui::PushStyleColor(ImGuiCol_Text,
+        f.side == core::OrderSide::Buy
+            ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+            : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+    ImGui::TextUnformatted(core::OrderSideStr(f.side));
+    ImGui::PopStyleColor();
+
+    // 3 — Qty
+    ImGui::TableSetColumnIndex(3);
+    ImGui::Text("%.0f", f.quantity);
+
+    // 4 — Price
+    ImGui::TableSetColumnIndex(4);
+    ImGui::Text("$%.2f", f.price);
+
+    // 5 — Commission
+    ImGui::TableSetColumnIndex(5);
+    if (f.commission > 0.0) ImGui::Text("-$%.2f", f.commission);
+    else                    ImGui::TextDisabled("—");
+
+    // 6 — Realized P&L
+    ImGui::TableSetColumnIndex(6);
+    if (f.realizedPnL != 0.0) {
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            f.realizedPnL >= 0.0
+                ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+                : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+        ImGui::Text("%+.2f", f.realizedPnL);
+        ImGui::PopStyleColor();
+    } else {
+        ImGui::TextDisabled("—");
+    }
+
+    // 7 — OrderId
+    ImGui::TableSetColumnIndex(7);
+    ImGui::TextDisabled("%d", f.orderId);
 
     ImGui::PopID();
 }

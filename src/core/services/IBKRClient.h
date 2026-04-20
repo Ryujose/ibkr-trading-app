@@ -34,6 +34,9 @@ struct Order;
 struct OrderCancel;
 struct OrderState;
 struct NewsProvider;
+struct TickAttribLast;
+struct TickAttribBidAsk;
+struct WshEventData;
 
 namespace core::services {
 
@@ -48,7 +51,7 @@ struct MsgPosition    { ::core::Position pos; bool done; };
 struct MsgPortfolio   { ::core::Position pos; };
 struct MsgOrderStatus { int orderId; ::core::OrderStatus status;
                         double filled; double avgPrice; };
-struct MsgFill        { ::core::Fill fill; };
+struct MsgFill        { ::core::Fill fill; bool fromQuery = false; };
 struct MsgDepth       { int id; bool isBid; int pos; int op;
                         double price; double size; };
 struct MsgScanItem    { int reqId; ::core::ScanResult result; };
@@ -82,6 +85,21 @@ struct ContractDesc {
 };
 struct MsgSymbolSamples { int reqId; std::vector<ContractDesc> results; };
 
+// WSH (Wall Street Horizon) corporate event — one JSON blob per event
+struct MsgWshEvent { int reqId; std::string data; };
+
+// Tick-by-tick trade (AllLast / Last) — Time & Sales tape
+struct MsgTickByTick {
+    int         reqId;
+    double      price;
+    double      size;
+    std::time_t time;
+    std::string exchange;
+    std::string specialConds;
+    bool        isUptick  = true;
+    bool        isNeutral = false;
+};
+
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
     MsgAccountVal, MsgPosition, MsgPortfolio, MsgOrderStatus,
@@ -90,7 +108,8 @@ using IBMessage = std::variant<
     MsgOpenOrder, MsgOpenOrderEnd,
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
     MsgAcctSummary, MsgPnL, MsgPnLSingle, MsgSymbolSamples,
-    MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti
+    MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti,
+    MsgTickByTick, MsgWshEvent
 >;
 
 // ============================================================================
@@ -200,8 +219,28 @@ public:
     // Returns all open orders across all client IDs (including previous sessions).
     void ReqAllOpenOrders();
     // Requests execution (fill) history for the current day. reqId 8001.
-    // Empty filter = all executions. Results arrive via onFillReceived.
-    void ReqExecutions(int reqId);
+    // Empty filter = all executions → results arrive via onFillReceived.
+    // Non-empty filter (symbol/side/dateFrom) → results arrive via onQueriedFill.
+    // dateFrom format: "YYYYMMDD HH:MM:SS" or "YYYYMMDD" (IB ExecutionFilter.m_time).
+    // WSH (Wall Street Horizon) corporate event calendar.
+    // reqWshMetaData: describe available event types (reqId 8010).
+    // reqWshEventData: fetch events for a conId (reqId range 8020–8029 per chart instance).
+    void ReqWshMetaData(int reqId);
+    void CancelWshMetaData(int reqId);
+    void ReqWshEventData(int reqId, long conId, int totalLimit = 50);
+    void CancelWshEventData(int reqId);
+
+    // Tick-by-tick real-time tape (Time & Sales). tickType: "AllLast", "Last", "BidAsk", "MidPoint".
+    // numberOfTicks=0 = continuous stream. ignoreSize=true = ignore odd-lot-only prints.
+    // reqId range 130–139 (one per TradingWindow instance).
+    void ReqTickByTickData(int reqId, const std::string& symbol,
+                           const std::string& tickType = "AllLast",
+                           int numberOfTicks = 0, bool ignoreSize = true);
+    void CancelTickByTickData(int reqId);
+
+    void ReqExecutions(int reqId, const std::string& symbol = "",
+                       const std::string& side = "",
+                       const std::string& dateFrom = "");
 
     // ── UI-thread pump ────────────────────────────────────────────────────
     // Call once per frame from the render loop.
@@ -220,6 +259,14 @@ public:
     std::function<void(int orderId, ::core::OrderStatus,
                        double filled, double avgPrice)>                     onOrderStatusChanged;
     std::function<void(const ::core::Fill&)>                                onFillReceived;
+    // Fills from a user-triggered filtered reqExecutions (distinct tint in OrdersWindow)
+    std::function<void(const ::core::Fill&)>                                onQueriedFill;
+
+    // Tick-by-tick trades (AllLast) routed by reqId to the owning TradingWindow
+    std::function<void(int reqId, const ::core::Tick&)>                     onTickByTick;
+
+    // WSH corporate event (one raw JSON blob per event; parse with WshData::ParseWshEvent)
+    std::function<void(int reqId, const std::string& data)>                 onWshEvent;
     std::function<void(int id, bool isBid, int pos, int op,
                        double price, double size)>                          onDepthUpdate;
     std::function<void(int reqId, const ::core::ScanResult&)>              onScanItem;
@@ -308,9 +355,15 @@ private:
     void PostSend(std::function<void()> cmd);
     void SendLoop();
 
-    // Fills cached by execId until commissionReport arrives to complete them
-    std::mutex                                       m_fillsMutex;
-    std::unordered_map<std::string, ::core::Fill>    m_pendingFills;
+    // Fills cached by execId until commissionReport arrives to complete them.
+    // bool = fromQuery: true when fill originates from a filtered reqExecutions call.
+    std::mutex                                                          m_fillsMutex;
+    std::unordered_map<std::string,
+        std::pair<::core::Fill, bool>>                                  m_pendingFills;
+    int                                                                 m_filterReqId = -1;
+
+    // Last trade price per tick-by-tick reqId — for uptick/downtick classification
+    std::unordered_map<int, double>                                     m_lastTickPrice;
 
     // ── Helpers ───────────────────────────────────────────────────────────
     Contract MakeStockContract(const std::string& symbol) const;
@@ -397,6 +450,14 @@ private:
     void accountSummary(int reqId, const std::string& account, const std::string& tag,
                         const std::string& value, const std::string& currency) override;
     void accountSummaryEnd(int reqId) override;
+
+    void tickByTickAllLast(int reqId, int tickType, time_t time, double price,
+                           Decimal size, const TickAttribLast& attrib,
+                           const std::string& exchange,
+                           const std::string& specialConditions) override;
+
+    void wshMetaData(int reqId, const std::string& dataJson) override;
+    void wshEventData(int reqId, const std::string& dataJson) override;
 
     void pnl(int reqId, double dailyPnL, double unrealizedPnL,
               double realizedPnL) override;

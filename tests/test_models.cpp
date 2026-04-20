@@ -33,8 +33,10 @@ TEST_CASE("OrderTypeStr returns correct IB order type strings", "[order]") {
 TEST_CASE("TIFStr returns correct time-in-force strings", "[order]") {
     REQUIRE(std::string(core::TIFStr(core::TimeInForce::Day)) == "DAY");
     REQUIRE(std::string(core::TIFStr(core::TimeInForce::GTC)) == "GTC");
-    REQUIRE(std::string(core::TIFStr(core::TimeInForce::IOC)) == "IOC");
-    REQUIRE(std::string(core::TIFStr(core::TimeInForce::FOK)) == "FOK");
+    REQUIRE(std::string(core::TIFStr(core::TimeInForce::IOC))       == "IOC");
+    REQUIRE(std::string(core::TIFStr(core::TimeInForce::FOK))       == "FOK");
+    REQUIRE(std::string(core::TIFStr(core::TimeInForce::Overnight)) == "OVERNIGHT");
+    REQUIRE(std::string(core::TIFStr(core::TimeInForce::OPG))       == "OPG");
 }
 
 TEST_CASE("OrderStatusStr returns correct status strings", "[order]") {

@@ -2,6 +2,7 @@
 
 #include "core/models/MarketData.h"
 #include "core/models/OrderData.h"
+#include "ui/WshData.h"
 #include <string>
 #include <vector>
 #include <deque>
@@ -105,6 +106,10 @@ public:
     // newAuxPrice = new limit price for STP LMT; 0.0 for single-leg types.
     // Host must cancel the old order and re-submit a replacement.
     std::function<void(int orderId, double newPrice, double newAuxPrice)> OnModifyOrder;
+
+    // WSH corporate event markers — called once per event JSON from IBKRClient
+    void OnWshEvent(const WshData::WshEvent& event);
+    void ClearWshEvents() { m_wshEvents.clear(); }
 
 private:
     // ---- Indicator settings -------------------------------------------------
@@ -221,6 +226,9 @@ private:
     bool        m_firstPricePlaced  = false; // stop price has been clicked, limit line active
     double      m_firstPrice        = 0.0;  // the placed stop/trigger price
 
+    // ---- WSH corporate event markers ----------------------------------------
+    std::vector<WshData::WshEvent> m_wshEvents;
+
     // ---- Symbol history -----------------------------------------------------
     static constexpr int kMaxHistory = 10;
     std::deque<std::string> m_symbolHistory;
@@ -252,6 +260,7 @@ private:
     void DrawRsiChart();
     void DrawCandlesticks(double halfBarWidth);
     void DrawHoverTooltip();
+    void DrawWshMarkers();
 
     // Called inside BeginPlot/EndPlot — renders drawings + limit line, handles clicks
     void DrawOverlays(double step);

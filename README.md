@@ -18,6 +18,7 @@ The “Interactive Brokers API Usage Notice” section must be reviewed prior to
 - **Portfolio Dashboard** — Real-time account-level P&L (daily, unrealized, realized), positions, equity curve, allocation donut, and performance metrics (Sharpe, Max Drawdown, Alpha, Beta, Win Rate)
 - **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L; order history restored automatically after reconnect
 - **Symbol Autocomplete** — IB-validated symbol search with 300 ms debounce across all windows; invalid symbols automatically revert to the last confirmed ticker
+- **WSH Corporate Event Markers** — Upcoming earnings, dividends, and splits shown as colour-coded vertical markers on the price chart (yellow = Earnings, cyan = Dividend, purple = Split) with hover tooltips; sourced live from Wall Street Horizon via the IB API
 - **Multi-Account Support** — On live sessions with multiple accounts, a selector modal appears at connect time; active account shown in the menu bar and stamped on every order
 - **Paper & Live accounts** — Toggle between paper and live trading from the login screen
 - **Multi-Instance Windows** — Open up to 10 simultaneous Chart, Order Book, Scanner, and News windows to monitor multiple assets at once
@@ -257,6 +258,8 @@ Real-time candlestick charting with technical analysis overlays.
 - **Current price line** — dashed horizontal line tracking the latest price, with a right-aligned price tag inside the chart
 - RTH toggle to include or exclude pre/post-market bars
 
+**Corporate event markers:** Upcoming earnings, dividends, and splits from Wall Street Horizon appear as vertical dashed lines on the price chart, colour-coded by type, with a hover tooltip showing date, type, description, and importance.
+
 **Session bands:** Chart shades premarket, regular hours, after-hours, and overnight regions.
 
 **Symbol history:** Last 10 symbols are remembered for quick switching.
@@ -280,13 +283,13 @@ Professional Depth of Market ladder for market microstructure analysis and fast 
 **Interactive order placement (via IBKR API):**
 - Click any price level to pre-fill an order at that price
 - Select order type: MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MIDPRICE, REL
-- Select time-in-force: DAY, GTC, IOC, FOK
+- Select time-in-force: DAY, GTC, IOC, FOK, Overnight, OPG (on-open)
 - BUY / SELL buttons confirm submission
 
 **Tabs:**
 - **Open Orders** — Working, partially-filled, and cancelling orders with cancel button; status badge covers the full lifecycle (PENDING → WORKING → PARTIAL → CANCELLING → FILLED/CANCELLED/REJECTED)
 - **Execution Log** — Filled orders with commission and realized P&L
-- **Time & Sales** — Live tape of last 80 executed trades with uptick/downtick coloring
+- **Time & Sales** — Live tape of last 2,000 tick-by-tick trades (IB `reqTickByTickData`); columns: Time, Price, Size, volume histogram bar, Exchange / Conditions; green/red/grey row tinting for uptick/downtick/neutral
 
 ---
 
@@ -386,7 +389,7 @@ Live order blotter with two tabs.
 
 **Open Tab** — All submitted, working, partially-filled, and cancelling orders. Shows order type, quantity, limit/stop/aux prices, TIF, filled qty, avg fill price, commission, submission time, and a color-coded status badge. Cancel button per order.
 
-**History Tab** — Filled and cancelled orders sorted by execution time (newest first). Order history is restored automatically after reconnect — orders placed in previous sessions during the same trading day are recovered via `reqAllOpenOrders` and `reqExecutions`.
+**History Tab** — Filled and cancelled orders sorted by execution time (newest first). Order history is restored automatically after reconnect — orders placed in previous sessions during the same trading day are recovered via `reqAllOpenOrders` and `reqExecutions`. A filter toolbar (symbol, side, date-from, Load/Clear buttons) queries IB for historical fills beyond the current session; results appear with an amber tint to distinguish them from live-session captures.
 
 ---
 
