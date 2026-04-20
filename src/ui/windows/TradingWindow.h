@@ -43,6 +43,7 @@ public:
                        double filled, double avgPrice);
     void OnFill(const core::Fill& fill);
     void OnTick(double price, double size, bool isUptick);
+    void OnTickByTick(const core::Tick& tick);
     void OnNBBO(double bid, double bidSz, double ask, double askSz);
     void OnMktDataError(int code);
     void OnDepthError(int code);
@@ -146,8 +147,9 @@ private:
     void DrawExecutionLog();
 
     // ── Time & Sales ─────────────────────────────────────────────────────────
-    static constexpr int kMaxTicks = 80;
+    static constexpr int kMaxTicks = 2000;
     std::deque<core::Tick> m_ticks;
+    double m_maxTickSize = 1.0;   // max size in current visible window (for histogram bar)
     void DrawTimeSales();
 
     // ── Layout ratios (user-draggable splitters) ─────────────────────────────

@@ -14,6 +14,9 @@
 #include "CommonDefs.h"
 #include "Decimal.h"
 #include "bar.h"
+#include "TickAttribLast.h"
+#include "TickAttribBidAsk.h"
+#include "WshEventData.h"
 
 #include <cstring>
 #include <ctime>
@@ -209,6 +212,34 @@ void IBKRClient::CancelMktDepth(int reqId) {
     m_client->cancelMktDepth(reqId, false);
 }
 
+void IBKRClient::ReqTickByTickData(int reqId, const std::string& symbol,
+                                    const std::string& tickType,
+                                    int numberOfTicks, bool ignoreSize) {
+    Contract c = MakeStockContract(symbol);
+    m_client->reqTickByTickData(reqId, c, tickType, numberOfTicks, ignoreSize);
+}
+
+void IBKRClient::CancelTickByTickData(int reqId) {
+    m_client->cancelTickByTickData(reqId);
+}
+
+void IBKRClient::ReqWshMetaData(int reqId) {
+    m_client->reqWshMetaData(reqId);
+}
+void IBKRClient::CancelWshMetaData(int reqId) {
+    m_client->cancelWshMetaData(reqId);
+}
+void IBKRClient::ReqWshEventData(int reqId, long conId, int totalLimit) {
+    WshEventData d(static_cast<int>(conId),
+                   false, false, false,   // fillWatchlist/Portfolio/Competitors
+                   "", "",                 // startDate, endDate (all)
+                   totalLimit);
+    m_client->reqWshEventData(reqId, d);
+}
+void IBKRClient::CancelWshEventData(int reqId) {
+    m_client->cancelWshEventData(reqId);
+}
+
 void IBKRClient::ReqAccountUpdates(bool subscribe, const std::string& acctCode) {
     m_client->reqAccountUpdates(subscribe, acctCode);
 }
@@ -252,7 +283,7 @@ void IBKRClient::PlaceOrder(const ::core::Order& o) {
         ibOrder.outsideRth    = o.outsideRth;
 
         // TIF
-        static constexpr const char* kTIFs[] = {"DAY", "GTC", "IOC", "FOK"};
+        static constexpr const char* kTIFs[] = {"DAY", "GTC", "IOC", "FOK", "OVERNIGHT", "OPG"};
         ibOrder.tif = kTIFs[static_cast<int>(o.tif)];
 
         // Price fields per order type
@@ -341,8 +372,15 @@ void IBKRClient::ReqAllOpenOrders() {
     m_client->reqAllOpenOrders();
 }
 
-void IBKRClient::ReqExecutions(int reqId) {
-    ExecutionFilter filter;   // all defaults = no filter → full day's history
+void IBKRClient::ReqExecutions(int reqId, const std::string& symbol,
+                                const std::string& side, const std::string& dateFrom) {
+    ExecutionFilter filter;
+    if (!symbol.empty())   filter.m_symbol = symbol;
+    if (!side.empty())     filter.m_side   = side;
+    if (!dateFrom.empty()) filter.m_time   = dateFrom;
+    // Track whether this call is a user-triggered filtered query
+    bool isFiltered = (!symbol.empty() || !side.empty() || !dateFrom.empty());
+    m_filterReqId = isFiltered ? reqId : -1;
     m_client->reqExecutions(reqId, filter);
 }
 
@@ -427,7 +465,11 @@ void IBKRClient::ProcessMessages() {
                     onOrderStatusChanged(m.orderId, m.status, m.filled, m.avgPrice);
 
             } else if constexpr (std::is_same_v<T, MsgFill>) {
-                if (onFillReceived) onFillReceived(m.fill);
+                if (m.fromQuery) {
+                    if (onQueriedFill) onQueriedFill(m.fill);
+                } else {
+                    if (onFillReceived) onFillReceived(m.fill);
+                }
 
             } else if constexpr (std::is_same_v<T, MsgDepth>) {
                 if (onDepthUpdate)
@@ -490,6 +532,22 @@ void IBKRClient::ProcessMessages() {
                 if (onAccountUpdateMulti)
                     onAccountUpdateMulti(m.reqId, m.account, m.modelCode,
                                          m.key, m.val, m.currency, m.done);
+
+            } else if constexpr (std::is_same_v<T, MsgTickByTick>) {
+                if (onTickByTick) {
+                    ::core::Tick t;
+                    t.price        = m.price;
+                    t.size         = m.size;
+                    t.timestamp    = m.time;
+                    t.isUptick     = m.isUptick;
+                    t.isNeutral    = m.isNeutral;
+                    t.exchange     = m.exchange;
+                    t.specialConds = m.specialConds;
+                    onTickByTick(m.reqId, t);
+                }
+
+            } else if constexpr (std::is_same_v<T, MsgWshEvent>) {
+                if (onWshEvent) onWshEvent(m.reqId, m.data);
             }
         }, msg);
 
@@ -741,7 +799,7 @@ void IBKRClient::orderStatus(OrderId orderId, const std::string& status,
     });
 }
 
-void IBKRClient::execDetails(int /*reqId*/, const Contract& contract,
+void IBKRClient::execDetails(int reqId, const Contract& contract,
                               const Execution& execution) {
     ::core::Fill fill;
     fill.orderId   = static_cast<int>(execution.orderId);
@@ -752,22 +810,23 @@ void IBKRClient::execDetails(int /*reqId*/, const Contract& contract,
     fill.quantity  = DecimalFunctions::decimalToDouble(execution.shares);
     fill.price     = execution.price;
     fill.timestamp = std::time(nullptr);
+    bool fromQuery = (m_filterReqId >= 0 && reqId == m_filterReqId);
     // Cache; commissionAndFeesReport will complete and push it
     std::lock_guard<std::mutex> lk(m_fillsMutex);
-    m_pendingFills[fill.execId] = fill;
+    m_pendingFills[fill.execId] = {fill, fromQuery};
 }
 
 void IBKRClient::commissionAndFeesReport(const CommissionAndFeesReport& report) {
     std::unique_lock<std::mutex> lk(m_fillsMutex);
     auto it = m_pendingFills.find(report.execId);
     if (it == m_pendingFills.end()) return;  // stale / already handled
-    ::core::Fill fill      = it->second;
+    auto [fill, fromQuery] = it->second;
     m_pendingFills.erase(it);
     lk.unlock();
 
     fill.commission  = report.commissionAndFees;
     fill.realizedPnL = report.realizedPNL;
-    Push(MsgFill{fill});
+    Push(MsgFill{fill, fromQuery});
 }
 
 // ── Scanner ────────────────────────────────────────────────────────────────
@@ -825,9 +884,11 @@ static ::core::OrderType ParseOrderType(const std::string& t) {
 }
 
 static ::core::TimeInForce ParseTIF(const std::string& t) {
-    if (t == "GTC") return ::core::TimeInForce::GTC;
-    if (t == "IOC") return ::core::TimeInForce::IOC;
-    if (t == "FOK") return ::core::TimeInForce::FOK;
+    if (t == "GTC")       return ::core::TimeInForce::GTC;
+    if (t == "IOC")       return ::core::TimeInForce::IOC;
+    if (t == "FOK")       return ::core::TimeInForce::FOK;
+    if (t == "OVERNIGHT") return ::core::TimeInForce::Overnight;
+    if (t == "OPG")       return ::core::TimeInForce::OPG;
     return ::core::TimeInForce::Day;
 }
 
@@ -943,6 +1004,41 @@ void IBKRClient::pnl(int reqId, double dailyPnL, double unrealizedPnL, double re
 void IBKRClient::pnlSingle(int reqId, Decimal /*pos*/, double dailyPnL,
                             double unrealizedPnL, double realizedPnL, double value) {
     Push(MsgPnLSingle{reqId, dailyPnL, unrealizedPnL, realizedPnL, value});
+}
+
+// ── Tick-by-tick ──────────────────────────────────────────────────────────────
+
+void IBKRClient::tickByTickAllLast(int reqId, int /*tickType*/, time_t time,
+                                    double price, Decimal size,
+                                    const TickAttribLast& /*attrib*/,
+                                    const std::string& exchange,
+                                    const std::string& specialConditions) {
+    MsgTickByTick msg;
+    msg.reqId        = reqId;
+    msg.price        = price;
+    msg.size         = DecimalFunctions::decimalToDouble(size);
+    msg.time         = time;
+    msg.exchange     = exchange;
+    msg.specialConds = specialConditions;
+
+    auto it = m_lastTickPrice.find(reqId);
+    if (it == m_lastTickPrice.end() || it->second == 0.0) {
+        msg.isNeutral = false;
+        msg.isUptick  = true;
+    } else {
+        msg.isNeutral = (price == it->second);
+        msg.isUptick  = (price >= it->second);
+    }
+    m_lastTickPrice[reqId] = price;
+    Push(std::move(msg));
+}
+
+void IBKRClient::wshMetaData(int /*reqId*/, const std::string& /*dataJson*/) {
+    // Meta describes available event types; not needed for chart markers.
+}
+
+void IBKRClient::wshEventData(int reqId, const std::string& dataJson) {
+    Push(MsgWshEvent{reqId, dataJson});
 }
 
 void IBKRClient::symbolSamples(int reqId,

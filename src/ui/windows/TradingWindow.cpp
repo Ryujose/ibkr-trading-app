@@ -166,6 +166,19 @@ void TradingWindow::OnTick(double price, double size, bool isUptick) {
     }
 }
 
+void TradingWindow::OnTickByTick(const core::Tick& tick) {
+    m_ticks.push_front(tick);
+    if ((int)m_ticks.size() > kMaxTicks) m_ticks.pop_back();
+    if (tick.size > m_maxTickSize) m_maxTickSize = tick.size;
+
+    if (tick.price > 0.0 && tick.size > 0.0) {
+        int key = static_cast<int>(std::round(tick.price / 0.01));
+        double& v = m_volAtPrice[key];
+        v += tick.size;
+        if (v > m_maxVolAtPrice) m_maxVolAtPrice = v;
+    }
+}
+
 void TradingWindow::setInstanceId(int id) {
     m_instanceId = id;
     std::snprintf(m_title, sizeof(m_title), "Book Trading %d##trading%d", id, id);
@@ -1168,7 +1181,7 @@ void TradingWindow::DrawOrderEntry() {
     bool tifLocked = (m_typeIdx == 6 || m_typeIdx == 7); // MOC, LOC
     if (tifLocked) m_tifIdx = 0;
 
-    const char* tifs[] = {"DAY", "GTC", "IOC", "FOK"};
+    const char* tifs[] = {"DAY", "GTC", "IOC", "FOK", "OVERNIGHT", "OPG"};
     ImGui::Text("TIF");
     ImGui::SameLine(labelCol);
     ImGui::SetNextItemWidth(em(80));
@@ -1909,33 +1922,91 @@ void TradingWindow::DrawExecutionLog() {
 }
 
 // ============================================================================
-// Time & Sales simulation
-// ============================================================================
-// ============================================================================
 // Draw — Time & Sales
 // ============================================================================
 void TradingWindow::DrawTimeSales() {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.90f, 1.0f));
-    ImGui::Text("Time & Sales");
-    ImGui::PopStyleColor();
-    ImGui::Separator();
+    // Recompute max visible size for histogram bar scaling
+    double maxVis = 1.0;
+    for (const auto& t : m_ticks) if (t.size > maxVis) maxVis = t.size;
+    m_maxTickSize = maxVis;
 
-    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
-    ImGui::Text("%-8s %-9s %s", "Time", "Price", "Size");
-    ImGui::PopStyleColor();
-
-    ImGui::BeginChild("##ts_scroll", ImVec2(-1, -1), false,
-                      ImGuiWindowFlags_NoScrollbar);
-
-    for (const auto& t : m_ticks) {
-        ImVec4 col = t.isUptick ? kBuyGreen : kSellRed;
-        ImGui::PushStyleColor(ImGuiCol_Text, col);
-        ImGui::Text("%-8s %-9.2f %.0f",
-                    FmtTime(t.timestamp).c_str(), t.price, t.size);
-        ImGui::PopStyleColor();
+    if (m_ticks.empty()) {
+        ImGui::Spacing();
+        ImGui::TextDisabled("  Waiting for tick-by-tick data...");
+        return;
     }
 
-    ImGui::EndChild();
+    static ImGuiTableFlags flags =
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+
+    if (!ImGui::BeginTable("##ts", 5, flags, ImVec2(-1, -1))) return;
+
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Time",  ImGuiTableColumnFlags_WidthFixed,   62);
+    ImGui::TableSetupColumn("Price", ImGuiTableColumnFlags_WidthFixed,   72);
+    ImGui::TableSetupColumn("Size",  ImGuiTableColumnFlags_WidthFixed,   58);
+    ImGui::TableSetupColumn("Vol",   ImGuiTableColumnFlags_WidthFixed,   72);
+    ImGui::TableSetupColumn("Exch",  ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableHeadersRow();
+
+    for (const auto& t : m_ticks) {
+        ImGui::TableNextRow();
+
+        ImVec4 rowTint = t.isNeutral
+            ? ImVec4(0.22f, 0.22f, 0.25f, 0.35f)
+            : t.isUptick ? ImVec4(0.08f, 0.22f, 0.10f, 0.35f)
+                         : ImVec4(0.24f, 0.08f, 0.08f, 0.35f);
+        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1,
+            ImGui::ColorConvertFloat4ToU32(rowTint));
+
+        ImVec4 textCol = t.isNeutral
+            ? ImVec4(0.65f, 0.65f, 0.68f, 1.0f)
+            : t.isUptick ? kBuyGreen : kSellRed;
+
+        // 0 — Time
+        ImGui::TableSetColumnIndex(0);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.58f, 1.f));
+        ImGui::TextUnformatted(FmtTime(t.timestamp).c_str());
+        ImGui::PopStyleColor();
+
+        // 1 — Price
+        ImGui::TableSetColumnIndex(1);
+        ImGui::PushStyleColor(ImGuiCol_Text, textCol);
+        ImGui::Text("%.2f", t.price);
+        ImGui::PopStyleColor();
+
+        // 2 — Size
+        ImGui::TableSetColumnIndex(2);
+        ImGui::PushStyleColor(ImGuiCol_Text, textCol);
+        ImGui::Text("%.0f", t.size);
+        ImGui::PopStyleColor();
+
+        // 3 — Size histogram bar
+        ImGui::TableSetColumnIndex(3);
+        float frac = (m_maxTickSize > 0.0) ? (float)(t.size / m_maxTickSize) : 0.0f;
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+            t.isNeutral ? ImVec4(0.42f, 0.42f, 0.45f, 0.85f)
+          : t.isUptick  ? ImVec4(0.18f, 0.68f, 0.32f, 0.85f)
+                        : ImVec4(0.78f, 0.22f, 0.22f, 0.85f));
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.10f, 0.12f, 0.5f));
+        ImGui::ProgressBar(frac, ImVec2(-1.0f, ImGui::GetTextLineHeight()));
+        ImGui::PopStyleColor(2);
+
+        // 4 — Exchange / Conditions
+        ImGui::TableSetColumnIndex(4);
+        if (!t.exchange.empty() || !t.specialConds.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.52f, 0.52f, 0.56f, 1.f));
+            if (t.specialConds.empty())
+                ImGui::TextUnformatted(t.exchange.c_str());
+            else if (t.exchange.empty())
+                ImGui::TextUnformatted(t.specialConds.c_str());
+            else
+                ImGui::Text("%s %s", t.exchange.c_str(), t.specialConds.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::EndTable();
 }
 
 // ============================================================================

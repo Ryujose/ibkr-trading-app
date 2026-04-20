@@ -15,7 +15,7 @@ enum class OrderType {
     MIT, LIT,                                 // if-touched
     Midprice, Relative                        // smart / pegged-to-primary
 };
-enum class TimeInForce { Day, GTC, IOC, FOK };
+enum class TimeInForce { Day, GTC, IOC, FOK, Overnight, OPG };
 enum class OrderStatus { Pending, Working, PartialFill, Filled,
                          Cancelled, Rejected, PendingCancel };
 
@@ -31,10 +31,13 @@ struct DepthLevel {
 // ---- Tick (time & sales) ----------------------------------------------------
 
 struct Tick {
-    double      price    = 0.0;
-    double      size     = 0.0;
-    std::time_t timestamp = 0;
-    bool        isUptick = true;   // vs downtick
+    double      price        = 0.0;
+    double      size         = 0.0;
+    std::time_t timestamp    = 0;
+    bool        isUptick     = true;   // vs downtick; false = downtick, neutral when equal
+    bool        isNeutral    = false;  // price == previous price
+    std::string exchange;
+    std::string specialConds;
 };
 
 // ---- Order ------------------------------------------------------------------
@@ -105,8 +108,10 @@ inline const char* TIFStr(TimeInForce t) {
         case TimeInForce::Day: return "DAY";
         case TimeInForce::GTC: return "GTC";
         case TimeInForce::IOC: return "IOC";
-        case TimeInForce::FOK: return "FOK";
-        default:               return "?";
+        case TimeInForce::FOK:       return "FOK";
+        case TimeInForce::Overnight: return "OVERNIGHT";
+        case TimeInForce::OPG:       return "OPG";
+        default:                     return "?";
     }
 }
 inline const char* OrderStatusStr(OrderStatus s) {
