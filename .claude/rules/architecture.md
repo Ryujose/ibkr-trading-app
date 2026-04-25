@@ -69,6 +69,12 @@ Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScanner
 - News stock conId: 2000-2009 · port conId: 2010-2199 · hist stock: 2210-2219 · hist port: 2220-2399
 - News articles: 2500-3499 (100 per instance) · hist market: 3500-3599 · market conId: 3600-3699
 - Account: 900
+- Watchlist contract details: 6900–6909 · market data: 7000–7999 (watchlistIdx×100 + symbolSlot)
+- Symbol search: 8000 · Execution filter: 8001
+- WSH meta: 8010 · WSH events per chart instance: 8020–8029
+- Smart components per TradingWindow: 8050–8059
+- Display group query: 8060 · group subscriptions G1–G4: 8061–8064
+- WSH Calendar window (aggregate, per-position conId): 8070–8199
 - P&L account-wide: 9000 · P&L single per-position: 9001–9999
 
 ## UiScale — Responsive Toolbar Helpers

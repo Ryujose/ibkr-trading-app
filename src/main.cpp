@@ -7,6 +7,8 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -14,6 +16,7 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
+#include <filesystem>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
@@ -30,6 +33,8 @@
 #include "ui/windows/ScannerWindow.h"
 #include "ui/windows/PortfolioWindow.h"
 #include "ui/windows/OrdersWindow.h"
+#include "ui/windows/WatchlistWindow.h"
+#include "ui/windows/WshCalendarWindow.h"
 #include "ui/SymbolSearch.h"
 
 #include "core/services/IBKRClient.h"
@@ -47,6 +52,7 @@ struct ChartEntry {
     bool             wshConIdFired = false;
     core::BarSeries  pendingBars;
     core::BarSeries  pendingExtBars;
+    std::string      bboExchange;       // last bboExchange code from tickReqParams
 };
 
 struct TradingEntry {
@@ -57,6 +63,7 @@ struct TradingEntry {
     double nbboBid = 0, nbboBidSz = 0;
     double nbboAsk = 0, nbboAskSz = 0;
     double lastTickPrice = 0, lastTickSize = 0;
+    std::string        bboExchange;         // last bboExchange code from tickReqParams
 };
 
 struct ScannerEntry {
@@ -81,15 +88,21 @@ struct NewsEntry {
     std::unordered_map<int,bool> newsConIdFired;
 };
 
+struct WatchlistEntry {
+    ui::WatchlistWindow* win = nullptr;
+};
+
 // ---- Multi-instance containers -----------------------------------------------
-static std::vector<ChartEntry>   g_chartEntries;
-static std::vector<TradingEntry> g_tradingEntries;
-static std::vector<ScannerEntry> g_scannerEntries;
-static std::vector<NewsEntry>    g_newsEntries;
+static std::vector<ChartEntry>      g_chartEntries;
+static std::vector<TradingEntry>    g_tradingEntries;
+static std::vector<ScannerEntry>    g_scannerEntries;
+static std::vector<NewsEntry>       g_newsEntries;
+static std::vector<WatchlistEntry>  g_watchlistEntries;
 
 // ---- Singleton windows (one each) --------------------------------------------
-static ui::PortfolioWindow* g_PortfolioWindow = nullptr;
-static ui::OrdersWindow*    g_OrdersWindow    = nullptr;
+static ui::PortfolioWindow*    g_PortfolioWindow    = nullptr;
+static ui::OrdersWindow*       g_OrdersWindow       = nullptr;
+static ui::WshCalendarWindow*  g_WshCalendarWindow  = nullptr;
 
 // IB API client (created on Connect, deleted on Disconnect)
 static core::services::IBKRClient* g_IBClient = nullptr;
@@ -125,6 +138,17 @@ static std::unordered_map<int, core::Order> g_liveOrders;
 // Per-symbol positions and commissions for the chart P&L strip
 static std::unordered_map<std::string, core::Position> g_positions;
 static std::unordered_map<std::string, double>          g_symbolCommissions;
+
+// Smart components cache: bboExchange code → routing destinations
+// Populated by onSmartComponents; shared across all TradingWindow instances.
+static std::unordered_map<std::string, std::vector<core::SmartRoute>> g_smartComponents;
+
+// symbol → conId mapping populated from contractDetails callbacks.
+// Used by the IB display-group outbound sync to build contractInfo strings.
+static std::unordered_map<std::string, long> g_symbolConIds;
+
+// IB TWS Display Group sync toggle and subscription state.
+static bool g_twsGroupSync = false;   // user-controlled in Settings panel
 
 // Multi-account state
 static std::vector<std::string>         g_managedAccounts;     // all accounts from managedAccounts()
@@ -260,6 +284,12 @@ inline int NewsConIdMkt  (int idx) { return 3600 + idx * 10; }
 // Symbols fetched on connection to seed the Market-tab news feed.
 static const char* kMktSeedSymbols[] = { "AAPL", "SPY", "MSFT", "TSLA", "NVDA" };
 static constexpr int kMktSeedCount   = 5;
+
+// Watchlist reqId layout (per-instance, idx 0-9):
+//   contract details: 6900+idx   (transient, one in flight per instance)
+//   market data:      7000+idx*100  (+99 per instance, up to 100 symbols each)
+inline int WatchlistCdId (int idx) { return 6900 + idx; }
+inline int WatchlistMktBase(int idx) { return 7000 + idx * 100; }
 
 // ============================================================================
 // Connection / Login state
@@ -516,8 +546,10 @@ static void FramePresent(ImGui_ImplVulkanH_Window* wd) {
 // Update a trading entry's displayed symbol AND re-subscribe IB market data + depth.
 // Used both from BroadcastGroupSymbol and from OnSymbolChanged so the logic is in one place.
 static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
+    te.bboExchange.clear();
     if (te.win) {
         te.win->SetSymbol(sym, 0.0);
+        te.win->SetExchangeList({"SMART"});  // reset until tickReqParams arrives
         // Re-inject position from portfolio cache for the new symbol
         auto it = g_positions.find(sym);
         if (it != g_positions.end())
@@ -549,6 +581,18 @@ static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
     for (auto& ne : g_newsEntries)
         if (ne.win && ne.win->groupId() == groupId) ne.win->SetSymbol(sym);
     // ScannerWindow is a symbol source only — no inbound SetSymbol
+
+    // Outbound IB display-group sync: push new symbol into the matching TWS group.
+    if (g_twsGroupSync && g_IBClient && groupId >= 1 && groupId <= 4) {
+        long conId = 0;
+        auto cit = g_symbolConIds.find(sym);
+        if (cit != g_symbolConIds.end()) conId = cit->second;
+        if (conId > 0) {
+            std::string ci = std::to_string(conId) + "@SMART";
+            g_IBClient->UpdateDisplayGroup(8060 + groupId, ci);  // 8061–8064
+        }
+    }
+
     g_groupSyncInProgress = false;
 }
 
@@ -573,6 +617,9 @@ static void ReqChartData(int histId, int mktId,
         g_IBClient->CancelMarketData(mktId);
         g_tickerSymbols[mktId] = sym;
         g_IBClient->ReqMarketData(mktId, sym, MktDataTicks());
+        // Reset exchange list; tickReqParams will repopulate once the new sub is live.
+        for (auto& ce : g_chartEntries)
+            if (ce.mktId == mktId) { ce.bboExchange.clear(); if (ce.win) ce.win->SetExchangeList({"SMART"}); }
     }
 }
 
@@ -804,16 +851,149 @@ static void SpawnNewsWindow(int idx) {
     }
 }
 
+// ============================================================================
+// Watchlist persistence (Task #49)
+// ============================================================================
+static std::string WatchlistsFilePath() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    return std::string(home) + "/.config/ibkr-trading-app/watchlists.cfg";
+}
+
+static void EnsureWatchlistConfigDir() {
+    const char* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home || !*home) home = std::getenv("USERPROFILE");
+#endif
+    if (!home || !*home) return;
+    std::filesystem::create_directories(std::string(home) + "/.config/ibkr-trading-app");
+}
+
+static void SaveWatchlistsFile() {
+    if (g_watchlistEntries.empty()) return;
+    EnsureWatchlistConfigDir();
+    std::string path = WatchlistsFilePath();
+    std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp);
+        if (!f.is_open()) return;
+        for (const auto& we : g_watchlistEntries)
+            if (we.win) f << we.win->serialize();
+    }
+    std::rename(tmp.c_str(), path.c_str());
+}
+
+struct WatchlistSaveBlock {
+    int instanceId = 1;
+    int groupId    = 0;
+    std::vector<core::Watchlist> watchlists;
+};
+
+static std::vector<WatchlistSaveBlock> LoadWatchlistsFromFile() {
+    std::vector<WatchlistSaveBlock> result;
+    std::ifstream f(WatchlistsFilePath());
+    if (!f.is_open()) return result;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() >= 9 && line.substr(0, 9) == "INSTANCE:") {
+            WatchlistSaveBlock b;
+            try { b.instanceId = std::stoi(line.substr(9)); } catch (...) {}
+            result.push_back(std::move(b));
+        } else if (!result.empty() && line.size() >= 6 && line.substr(0, 6) == "GROUP:") {
+            try { result.back().groupId = std::stoi(line.substr(6)); } catch (...) {}
+        } else if (!result.empty() && line.size() >= 6 && line.substr(0, 6) == "WATCH:") {
+            result.back().watchlists.push_back({line.substr(6), {}});
+        } else if (!result.empty() && !result.back().watchlists.empty() && !line.empty()) {
+            core::WatchlistItem item;
+            std::istringstream ss(line);
+            std::string tok;
+            int col = 0;
+            while (std::getline(ss, tok, ',')) {
+                switch (col++) {
+                    case 0: item.symbol      = tok; break;
+                    case 1: item.secType     = tok; break;
+                    case 2: item.primaryExch = tok; break;
+                    case 3: item.currency    = tok; break;
+                    case 4: try { item.conId = std::stoi(tok); } catch (...) {} break;
+                    case 5: item.description = tok; break;
+                }
+            }
+            if (!item.symbol.empty())
+                result.back().watchlists.back().items.push_back(std::move(item));
+        }
+    }
+    return result;
+}
+
+static void SpawnWatchlistWindow(int idx) {
+    WatchlistEntry e;
+    e.win = new ui::WatchlistWindow();
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+    e.win->setReqIdBase(WatchlistCdId(idx), WatchlistMktBase(idx));
+
+    e.win->OnReqContractDetails = [idx](int reqId, const std::string& sym) {
+        if (g_IBClient && g_IBClient->IsConnected())
+            g_IBClient->ReqContractDetails(reqId, sym);
+    };
+    e.win->OnReqMktData = [](int reqId, const std::string& sym,
+                              const std::string& /*secType*/, const std::string& /*exch*/,
+                              const std::string& /*currency*/) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        g_IBClient->ReqMarketData(reqId, sym, "165,233");
+    };
+    e.win->OnCancelMktData = [](int reqId) {
+        if (g_IBClient && g_IBClient->IsConnected())
+            g_IBClient->CancelMarketData(reqId);
+    };
+    e.win->OnBroadcastSymbol = [idx](const std::string& sym) {
+        if (idx < (int)g_watchlistEntries.size() && g_watchlistEntries[idx].win)
+            BroadcastGroupSymbol(g_watchlistEntries[idx].win->groupId(), sym);
+    };
+    e.win->OnOpenChart = [](const std::string& sym) {
+        int newIdx = (int)g_chartEntries.size();
+        if (newIdx < kMaxMultiWin) {
+            SpawnChartWindow(newIdx);
+            if (!g_chartEntries.empty() && g_chartEntries.back().win)
+                g_chartEntries.back().win->SetSymbol(sym);
+        }
+    };
+    e.win->OnOpenOrderBook = [](const std::string& sym) {
+        int newIdx = (int)g_tradingEntries.size();
+        if (newIdx < kMaxMultiWin) {
+            SpawnTradingWindow(newIdx);
+            if (!g_tradingEntries.empty() && g_tradingEntries.back().win)
+                ApplyTradingSymbol(g_tradingEntries.back(), sym);
+        }
+    };
+
+    e.win->AddDefaultsIfEmpty();
+    g_watchlistEntries.push_back(std::move(e));
+}
+
 static void CreateTradingWindows() {
     // Singleton windows
-    delete g_PortfolioWindow; g_PortfolioWindow = new ui::PortfolioWindow();
-    delete g_OrdersWindow;    g_OrdersWindow    = new ui::OrdersWindow();
+    delete g_PortfolioWindow;   g_PortfolioWindow   = new ui::PortfolioWindow();
+    delete g_OrdersWindow;      g_OrdersWindow      = new ui::OrdersWindow();
+    delete g_WshCalendarWindow; g_WshCalendarWindow = new ui::WshCalendarWindow();
+
+    g_WshCalendarWindow->OnReqWshEvents = [](int reqId, long conId) {
+        if (g_IBClient) g_IBClient->ReqWshEventData(reqId, conId);
+    };
+    g_WshCalendarWindow->OnCancelWshEvents = [](int reqId) {
+        if (g_IBClient) g_IBClient->CancelWshEventData(reqId);
+    };
+    g_WshCalendarWindow->OnBroadcastSymbol = [](const std::string& sym) {
+        BroadcastGroupSymbol(1, sym);
+    };
 
     // Spawn first instance of each multi-window type
     SpawnChartWindow(0);
     SpawnTradingWindow(0);
     SpawnScannerWindow(0);
     SpawnNewsWindow(0);
+    SpawnWatchlistWindow(0);
 
     // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
@@ -830,6 +1010,8 @@ static void CreateTradingWindows() {
 }
 
 static void DestroyTradingWindows() {
+    SaveWatchlistsFile();
+
     for (auto& e : g_chartEntries)   { delete e.win; e.win = nullptr; }
     for (auto& e : g_tradingEntries) { delete e.win; e.win = nullptr; }
     for (auto& e : g_scannerEntries) { delete e.win; e.win = nullptr; }
@@ -839,8 +1021,11 @@ static void DestroyTradingWindows() {
 
     for (auto& ne : g_newsEntries) { delete ne.win; ne.win = nullptr; }
     g_newsEntries.clear();
-    delete g_PortfolioWindow; g_PortfolioWindow = nullptr;
-    delete g_OrdersWindow;    g_OrdersWindow    = nullptr;
+    for (auto& we : g_watchlistEntries) { if (we.win) { we.win->CancelAll(); delete we.win; we.win = nullptr; } }
+    g_watchlistEntries.clear();
+    delete g_PortfolioWindow;   g_PortfolioWindow   = nullptr;
+    delete g_OrdersWindow;      g_OrdersWindow      = nullptr;
+    delete g_WshCalendarWindow; g_WshCalendarWindow = nullptr;
 
     g_portfolioSymbols.clear();
     g_liveOrders.clear();
@@ -868,6 +1053,22 @@ static void FinishConnect(bool isReconnect) {
     if (!isReconnect) {
         DestroyTradingWindows();
         CreateTradingWindows();
+
+        // Restore persisted watchlists (overrides Mag 7 defaults if file exists)
+        {
+            auto saved = LoadWatchlistsFromFile();
+            for (int i = 0; i < (int)saved.size(); ++i) {
+                if (saved[i].watchlists.empty()) continue;
+                if (i >= (int)g_watchlistEntries.size()) {
+                    if ((int)g_watchlistEntries.size() >= kMaxMultiWin) break;
+                    SpawnWatchlistWindow((int)g_watchlistEntries.size());
+                }
+                auto& we = g_watchlistEntries[i];
+                if (!we.win) continue;
+                we.win->setGroupId(saved[i].groupId);
+                we.win->LoadWatchlists(saved[i].watchlists);
+            }
+        }
 
         g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
         g_IBClient->ReqPositions();
@@ -933,6 +1134,11 @@ static void FinishConnect(bool isReconnect) {
             for (int i = 0; i < kMktSeedCount; ++i)
                 g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
     }
+
+    // Re-subscribe to TWS display groups if sync was already enabled before (re)connect.
+    if (g_twsGroupSync)
+        for (int g = 1; g <= 4; ++g)
+            g_IBClient->SubscribeToGroupEvents(8060 + g, g);
 }
 
 // ============================================================================
@@ -1033,6 +1239,13 @@ static void WireIBCallbacks() {
             }
         }
 
+        // Watchlist entries (reqIds 7000–7999) — self-routing by reqId
+        if (tickerId >= 7000 && tickerId < 8000) {
+            for (auto& we : g_watchlistEntries)
+                if (we.win) we.win->OnTickSize(tickerId, field, size);
+            return;
+        }
+
         // Scanner entries: avg volume (87) and day volume (8)
         auto symIt = g_tickerSymbols.find(tickerId);
         if (symIt == g_tickerSymbols.end()) return;
@@ -1049,10 +1262,6 @@ static void WireIBCallbacks() {
     };
 
     g_IBClient->onTickPrice = [](int tickerId, int field, double price) {
-        auto it = g_tickerSymbols.find(tickerId);
-        if (it == g_tickerSymbols.end()) return;
-        const std::string& sym = it->second;
-
         // Normalise delayed-data tick fields (paper / reqMarketDataType(3)) to their
         // standard equivalents so the switch below handles both live and paper accounts.
         // DELAYED_BID=66, DELAYED_ASK=67, DELAYED_LAST=68,
@@ -1067,6 +1276,17 @@ static void WireIBCallbacks() {
             case 76: field = 14; break;  // DELAYED_OPEN
             default: break;
         }
+
+        // Watchlist entries (reqIds 7000–7999) — self-routing by reqId
+        if (tickerId >= 7000 && tickerId < 8000) {
+            for (auto& we : g_watchlistEntries)
+                if (we.win) we.win->OnTickPrice(tickerId, field, price);
+            return;
+        }
+
+        auto it = g_tickerSymbols.find(tickerId);
+        if (it == g_tickerSymbols.end()) return;
+        const std::string& sym = it->second;
 
         // Find which scanner entry owns this tickerId (if any)
         ScannerEntry* scanEntry = nullptr;
@@ -1252,6 +1472,9 @@ static void WireIBCallbacks() {
                                 g_portfolioSymbols.end(), pos.symbol);
             if (it == g_portfolioSymbols.end())
                 g_portfolioSymbols.push_back(pos.symbol);
+            // Subscribe WSH events for this position (reqPositions feed).
+            if (pos.conId > 0 && g_WshCalendarWindow)
+                g_WshCalendarWindow->SubscribeConId(static_cast<int>(pos.conId), pos.symbol);
         } else {
             for (auto& se : g_scannerEntries)
                 if (se.win) se.win->SetPortfolioSymbols(g_portfolioSymbols);
@@ -1281,6 +1504,9 @@ static void WireIBCallbacks() {
             g_pnlReqIdToSymbol[rid]        = pos.symbol;
             g_IBClient->ReqPnLSingle(rid, g_selectedAccount, "", static_cast<int>(pos.conId));
         }
+        // Subscribe WSH events for this position in the calendar window.
+        if (pos.conId > 0 && g_WshCalendarWindow)
+            g_WshCalendarWindow->SubscribeConId(static_cast<int>(pos.conId), pos.symbol);
     };
 
     // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
@@ -1338,11 +1564,56 @@ static void WireIBCallbacks() {
         for (auto& te : g_tradingEntries)
             if (te.tickId == reqId && te.win) te.win->OnTickByTick(tick);
     };
+    // ── Smart components / exchange routing ───────────────────────────────
+    // reqId 8040–8049 = chart instances; 8050–8059 = trading instances.
+    g_IBClient->onTickReqParams = [](int tickerId, const std::string& bboExchange) {
+        auto applyToWindow = [&](auto& entries, int reqBase) {
+            for (int i = 0; i < (int)entries.size(); ++i) {
+                auto& e = entries[i];
+                if (e.mktId != tickerId) continue;
+                e.bboExchange = bboExchange;
+                auto it = g_smartComponents.find(bboExchange);
+                if (it != g_smartComponents.end()) {
+                    std::vector<std::string> exch = {"SMART"};
+                    for (const auto& r : it->second) exch.push_back(r.exchange);
+                    if (e.win) e.win->SetExchangeList(exch);
+                } else if (g_IBClient) {
+                    g_IBClient->ReqSmartComponents(reqBase + i, bboExchange);
+                }
+                return true;
+            }
+            return false;
+        };
+        if (!applyToWindow(g_chartEntries,   8040))
+              applyToWindow(g_tradingEntries, 8050);
+    };
+    g_IBClient->onSmartComponents = [](int reqId,
+                                        const std::vector<core::SmartRoute>& routes) {
+        std::vector<std::string> exch = {"SMART"};
+        for (const auto& r : routes) exch.push_back(r.exchange);
+
+        auto apply = [&](auto& entries, int reqBase) {
+            int idx = reqId - reqBase;
+            if (idx < 0 || idx >= (int)entries.size()) return false;
+            auto& e = entries[idx];
+            if (e.win) e.win->SetExchangeList(exch);
+            if (!e.bboExchange.empty())
+                g_smartComponents[e.bboExchange] = routes;
+            return true;
+        };
+        if (!apply(g_chartEntries,   8040))
+              apply(g_tradingEntries, 8050);
+    };
     g_IBClient->onWshEvent = [](int reqId, const std::string& data) {
+        // Chart per-symbol markers (8020–8029)
         WshData::WshEvent ev = WshData::ParseWshEvent(data);
         for (int ci = 0; ci < (int)g_chartEntries.size(); ++ci)
             if (reqId == ChartWshId(ci) && g_chartEntries[ci].win)
                 g_chartEntries[ci].win->OnWshEvent(ev);
+        // Calendar window aggregate view (8070–8199)
+        if (reqId >= ui::WshCalendarWindow::kReqBase &&
+            reqId <= ui::WshCalendarWindow::kReqEnd  && g_WshCalendarWindow)
+            g_WshCalendarWindow->OnWshEvent(reqId, data);
     };
 
     // ── Scanner ───────────────────────────────────────────────────────────
@@ -1399,10 +1670,30 @@ static void WireIBCallbacks() {
     };
 
     // ── News — contract details → historical news chain ───────────────────
-    g_IBClient->onContractConId = [](int reqId, long conId) {
+    g_IBClient->onContractConId = [](int reqId, long conId,
+                                      const std::string& description,
+                                      const std::string& secType,
+                                      const std::string& primaryExch,
+                                      const std::string& currency) {
         if (!g_IBClient) return;
         // IB may call contractDetails multiple times (one per exchange match).
         // Only use the first conId per reqId so we don't issue duplicate requests.
+
+        // Cache symbol → conId for display-group outbound sync.
+        for (const auto& ce : g_chartEntries)
+            if (reqId == ce.wshId && ce.win)
+                g_symbolConIds[ce.win->getSymbol()] = conId;
+
+        // Watchlist contract details (reqIds 6900–6909, one per instance)
+        for (int wi = 0; wi < (int)g_watchlistEntries.size(); ++wi) {
+            if (reqId == WatchlistCdId(wi)) {
+                auto& we = g_watchlistEntries[wi];
+                if (we.win)
+                    we.win->SetContractDetails(reqId, conId, description,
+                                               secType, primaryExch, currency);
+                return;
+            }
+        }
 
         // Chart WSH event markers (reqIds 8020–8029)
         for (int ci = 0; ci < (int)g_chartEntries.size(); ++ci) {
@@ -1411,6 +1702,10 @@ static void WireIBCallbacks() {
                 if (ce.wshConIdFired) return;
                 ce.wshConIdFired = true;
                 g_IBClient->ReqWshEventData(reqId, (int)conId);
+                // Also subscribe this symbol in the calendar aggregate view.
+                if (g_WshCalendarWindow && ce.win)
+                    g_WshCalendarWindow->SubscribeConId(
+                        static_cast<int>(conId), ce.win->getSymbol());
                 return;
             }
         }
@@ -1547,6 +1842,23 @@ static void WireIBCallbacks() {
             if (reqId == te.depthId && (code == 354 || code == 10090 || code == 10092 || code == 322))
                 te.win->OnDepthError(code);
         }
+    };
+
+    // ── IB TWS Display Group sync ─────────────────────────────────────────
+    g_IBClient->onDisplayGroupList = [](int /*reqId*/, const std::string& groups) {
+        printf("[IB] Display groups available: %s\n", groups.c_str());
+    };
+    g_IBClient->onDisplayGroupUpdated = [](int reqId, const std::string& contractInfo) {
+        // reqId 8061–8064 maps to G1–G4
+        int groupId = reqId - 8060;  // 8061→1, 8062→2, ...
+        if (groupId < 1 || groupId > 4) return;
+        // Parse "symbol:secType:exchange:conId" — extract first colon-delimited field
+        auto colon = contractInfo.find(':');
+        std::string sym = (colon != std::string::npos)
+                          ? contractInfo.substr(0, colon)
+                          : contractInfo;
+        if (!sym.empty())
+            BroadcastGroupSymbol(groupId, sym);
     };
 
     // ── Next valid order id ───────────────────────────────────────────────
@@ -2234,9 +2546,22 @@ static void RenderCustomTitleBar() {
 // ============================================================================
 // Settings window
 // ============================================================================
+// Subscribe / unsubscribe from IB TWS display groups G1–G4 (reqIds 8061–8064).
+static void SetTwsGroupSync(bool enable) {
+    g_twsGroupSync = enable;
+    if (!g_IBClient || !g_IBClient->IsConnected()) return;
+    if (enable) {
+        for (int g = 1; g <= 4; ++g)
+            g_IBClient->SubscribeToGroupEvents(8060 + g, g);
+    } else {
+        for (int g = 1; g <= 4; ++g)
+            g_IBClient->UnsubscribeFromGroupEvents(8060 + g);
+    }
+}
+
 static void RenderSettingsWindow() {
     if (!g_settingsOpen) return;
-    ImGui::SetNextWindowSize(ImVec2(300, 140), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 180), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
                             ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
     if (!ImGui::Begin("Settings", &g_settingsOpen,
@@ -2258,6 +2583,19 @@ static void RenderSettingsWindow() {
             ImGui::GetStyle().ScaleAllSizes(kFontScales[i]);
         }
     }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("TWS Integration");
+    ImGui::Spacing();
+
+    bool syncVal = g_twsGroupSync;
+    if (ImGui::Checkbox("Sync with TWS Display Groups", &syncVal))
+        SetTwsGroupSync(syncVal);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "When ON: this app's G1–G4 groups stay in sync with\n"
+            "TWS linked-window groups 1–4 (bidirectional).\n"
+            "Requires IB Gateway / TWS with API access enabled.");
 
     ImGui::End();
 }
@@ -2361,9 +2699,26 @@ static void RenderTradingUI() {
                             SpawnNewsWindow((int)g_newsEntries.size());
                     }
                     ImGui::Separator();
+                    // Per-instance watchlist windows
+                    for (auto& we : g_watchlistEntries) {
+                        if (!we.win) continue;
+                        char lbl[64];
+                        const int gid = we.win->groupId();
+                        std::snprintf(lbl, sizeof(lbl), "Watchlist %d %s###wl_menu_%d",
+                            we.win->instanceId(),
+                            gid > 0 ? ("G" + std::to_string(gid)).c_str() : "G-",
+                            we.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &we.win->open());
+                    }
+                    if ((int)g_watchlistEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New Watchlist"))
+                            SpawnWatchlistWindow((int)g_watchlistEntries.size());
+                    }
+                    ImGui::Separator();
                     // Singleton windows
-                    if (g_OrdersWindow)    ImGui::MenuItem("Orders",    nullptr, &g_OrdersWindow->open());
-                    if (g_PortfolioWindow) ImGui::MenuItem("Portfolio", nullptr, &g_PortfolioWindow->open());
+                    if (g_OrdersWindow)       ImGui::MenuItem("Orders",        nullptr, &g_OrdersWindow->open());
+                    if (g_PortfolioWindow)    ImGui::MenuItem("Portfolio",     nullptr, &g_PortfolioWindow->open());
+                    if (g_WshCalendarWindow)  ImGui::MenuItem("WSH Calendar",  nullptr, &g_WshCalendarWindow->open());
                     ImGui::PopItemFlag();
                     ImGui::EndMenu();
                 }
@@ -2472,8 +2827,10 @@ static void RenderTradingUI() {
     for (auto& te : g_tradingEntries) if (te.win) te.win->Render();
     for (auto& se : g_scannerEntries) if (se.win) se.win->Render();
     for (auto& ne : g_newsEntries)    if (ne.win) ne.win->Render();
-    if (g_PortfolioWindow) g_PortfolioWindow->Render();
-    if (g_OrdersWindow)    g_OrdersWindow->Render();
+    for (auto& we : g_watchlistEntries) if (we.win) we.win->Render();
+    if (g_PortfolioWindow)   g_PortfolioWindow->Render();
+    if (g_OrdersWindow)      g_OrdersWindow->Render();
+    if (g_WshCalendarWindow) g_WshCalendarWindow->Render();
     RenderSettingsWindow();
 }
 

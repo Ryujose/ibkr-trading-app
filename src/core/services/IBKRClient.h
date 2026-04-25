@@ -24,6 +24,7 @@
 #include "core/models/OrderData.h"
 #include "core/models/ScannerData.h"
 #include "core/models/PortfolioData.h"
+#include "core/models/SmartRouting.h"
 
 // Forward-declare IB API types we use only in the .cpp
 struct Bar;
@@ -62,7 +63,8 @@ struct MsgError       { int reqId; int code; std::string msg; };
 struct MsgNextOrderId { int orderId; };
 struct MsgOpenOrder      { ::core::Order order; };
 struct MsgOpenOrderEnd   {};
-struct MsgContractConId  { int reqId; long conId; };
+struct MsgContractConId  { int reqId; long conId;
+                           std::string description, secType, primaryExch, currency; };
 struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
                            std::string articleId; std::string headline; };
 struct MsgHistoricalNewsEnd { int reqId; };
@@ -100,6 +102,25 @@ struct MsgTickByTick {
     bool        isNeutral = false;
 };
 
+// Tick request params — fires once per reqMktData subscription, delivers bboExchange.
+struct MsgTickReqParams {
+    int         tickerId;
+    std::string bboExchange;
+};
+
+// Smart components: exchange routing destinations for a given bboExchange code.
+// reqId range 8050–8059 (one per TradingWindow instance).
+struct MsgSmartComponents {
+    int                          reqId;
+    std::vector<core::SmartRoute> routes;
+};
+
+// IB TWS Display Group sync (linked windows in TWS).
+// queryDisplayGroups reqId: 8060; subscriptions G1–G4: 8061–8064.
+struct MsgDisplayGroupList    { int reqId; std::string groups; };
+// contractInfo format returned by IB: "symbol:secType:exchange:conId"
+struct MsgDisplayGroupUpdated { int reqId; std::string contractInfo; };
+
 using IBMessage = std::variant<
     MsgConnection, MsgBar, MsgTickPrice, MsgTickSize,
     MsgAccountVal, MsgPosition, MsgPortfolio, MsgOrderStatus,
@@ -109,7 +130,9 @@ using IBMessage = std::variant<
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
     MsgAcctSummary, MsgPnL, MsgPnLSingle, MsgSymbolSamples,
     MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti,
-    MsgTickByTick, MsgWshEvent
+    MsgTickByTick, MsgWshEvent,
+    MsgTickReqParams, MsgSmartComponents,
+    MsgDisplayGroupList, MsgDisplayGroupUpdated
 >;
 
 // ============================================================================
@@ -242,6 +265,18 @@ public:
                        const std::string& side = "",
                        const std::string& dateFrom = "");
 
+    // Smart components: exchange routing destinations for a bboExchange code.
+    // bboExchange arrives via onTickReqParams after ReqMarketData.
+    // reqId range 8050–8059 (one per TradingWindow instance).
+    void ReqSmartComponents(int reqId, const std::string& bboExchange);
+
+    // IB TWS Display Group sync (linked windows in TWS).
+    // queryDisplayGroups reqId: 8060; subscriptions G1–G4: reqId 8061–8064.
+    void QueryDisplayGroups(int reqId);
+    void SubscribeToGroupEvents(int reqId, int groupId);
+    void UpdateDisplayGroup(int reqId, const std::string& contractInfo);
+    void UnsubscribeFromGroupEvents(int reqId);
+
     // ── UI-thread pump ────────────────────────────────────────────────────
     // Call once per frame from the render loop.
     void ProcessMessages();
@@ -285,8 +320,10 @@ public:
     std::function<void(const ::core::Order&)>                               onOpenOrder;
     std::function<void()>                                                   onOpenOrderEnd;
 
-    // Contract details (fired once per request, carries the IB conId needed for news)
-    std::function<void(int reqId, long conId)>                              onContractConId;
+    // Contract details (fired once per request; carries conId plus description/secType/exchange)
+    std::function<void(int reqId, long conId, const std::string& description,
+                       const std::string& secType, const std::string& primaryExch,
+                       const std::string& currency)>                       onContractConId;
 
     // Historical news headlines
     std::function<void(int reqId, std::time_t ts, const std::string& provider,
@@ -308,6 +345,19 @@ public:
     // Symbol autocomplete results (from reqMatchingSymbols)
     std::function<void(int reqId,
                        const std::vector<ContractDesc>&)>                   onSymbolSamples;
+
+    // Tick request params — fires once per reqMktData subscription.
+    // Delivers bboExchange code used to call ReqSmartComponents.
+    std::function<void(int tickerId, const std::string& bboExchange)>        onTickReqParams;
+
+    // Smart components: exchange routing destinations (reqId 8050–8059).
+    std::function<void(int reqId,
+                       const std::vector<core::SmartRoute>&)>                onSmartComponents;
+
+    // IB TWS Display Group sync.
+    std::function<void(int reqId, const std::string& groups)>                onDisplayGroupList;
+    // contractInfo: "symbol:secType:exchange:conId" (parse first field for symbol).
+    std::function<void(int reqId, const std::string& contractInfo)>          onDisplayGroupUpdated;
 
     // Managed accounts list (fires early during connection for FA / multi-account setups)
     std::function<void(const std::vector<std::string>& accounts)>           onManagedAccounts;
@@ -455,6 +505,13 @@ private:
                            Decimal size, const TickAttribLast& attrib,
                            const std::string& exchange,
                            const std::string& specialConditions) override;
+
+    void tickReqParams(int tickerId, double minTick,
+                       const std::string& bboExchange,
+                       int snapshotPermissions) override;
+    void smartComponents(int reqId, const SmartComponentsMap& theMap) override;
+    void displayGroupList(int reqId, const std::string& groups) override;
+    void displayGroupUpdated(int reqId, const std::string& contractInfo) override;
 
     void wshMetaData(int reqId, const std::string& dataJson) override;
     void wshEventData(int reqId, const std::string& dataJson) override;

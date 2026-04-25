@@ -60,6 +60,10 @@ public:
     // Fired when the user types a new symbol and presses Enter in Order Entry.
     std::function<void(const std::string& symbol)> OnSymbolChanged;
 
+    // Replace the exchange combo list with fresh smart-component data.
+    // Always leads with "SMART"; resets selected index to 0.
+    void SetExchangeList(const std::vector<std::string>& exchanges);
+
 private:
     bool m_open       = true;
     int  m_groupId    = 0;
@@ -119,6 +123,8 @@ private:
     int  m_sideIdx          = 0;
     int  m_typeIdx          = 0;
     int  m_tifIdx           = 0;
+    int  m_exchangeIdx      = 0;
+    std::vector<std::string> m_exchangeList = {"SMART"};
     char m_qtyBuf[32]       = "100";
     char m_lmtBuf[32]       = "";    // limit price / lmt offset (TRAIL LIMIT) / price cap (MIDPRICE/REL)
     char m_stpBuf[32]       = "";    // stop price / trigger price (MIT/LIT) / trail stop cap

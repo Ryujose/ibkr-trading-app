@@ -339,6 +339,11 @@ void ChartWindow::OnDayTick(int field, double price) {
     ComputeIndicators();
 }
 
+void ChartWindow::SetExchangeList(const std::vector<std::string>& exchanges) {
+    m_exchangeList = exchanges;
+    m_exchangeIdx  = 0;
+}
+
 void ChartWindow::SetPendingOrders(const std::vector<PendingOrderLine>& orders) {
     m_pendingOrders = orders;
 }
@@ -751,6 +756,26 @@ void ChartWindow::DrawTradePanel() {
     }
     if (tifLocked) ImGui::EndDisabled();
 
+    // ── Exchange routing ─────────────────────────────────────────────────
+    {
+        const char* exchPreview = (m_exchangeIdx < (int)m_exchangeList.size())
+                                  ? m_exchangeList[m_exchangeIdx].c_str() : "SMART";
+        row.item(em(90), 6);
+        ImGui::SetNextItemWidth(em(90));
+        if (ImGui::BeginCombo("##exch", exchPreview)) {
+            for (int i = 0; i < (int)m_exchangeList.size(); ++i) {
+                bool sel = (i == m_exchangeIdx);
+                if (ImGui::Selectable(m_exchangeList[i].c_str(), sel))
+                    m_exchangeIdx = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("SMART = IB smart routing.\n"
+                              "Specific exchange = direct route.");
+    }
+
     // ── BUY / SELL buttons ────────────────────────────────────────────────
     row.item(kBtnW, 14);
     ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.08f, 0.52f, 0.08f, 1.f));
@@ -808,6 +833,8 @@ void ChartWindow::DrawTradePanel() {
         o.quantity   = static_cast<double>(m_orderQty);
         o.tif        = ot.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
         o.outsideRth = !ot.noRth && (m_sessionIdx != 0);
+        o.exchange   = (m_exchangeIdx < (int)m_exchangeList.size())
+                       ? m_exchangeList[m_exchangeIdx] : "SMART";
         switch (ot.coreType) {
             case core::OrderType::Trail:
                 if (m_trailByPct) o.trailingPercent = m_trailPercent;
@@ -964,8 +991,10 @@ void ChartWindow::DrawConfirmPopup() {
 
     ImGui::Spacing();
 
-    // TIF + outside RTH
+    // TIF + outside RTH + exchange
     ImGui::Text("TIF:        %s", core::TIFStr(o.tif));
+    if (!o.exchange.empty() && o.exchange != "SMART")
+        ImGui::Text("Exchange:   %s", o.exchange.c_str());
     if (o.outsideRth) {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.20f, 1.0f));
         ImGui::TextUnformatted("Outside RTH: YES");

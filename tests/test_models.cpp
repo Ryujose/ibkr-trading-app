@@ -73,6 +73,7 @@ TEST_CASE("Order struct has sane defaults", "[order][defaults]") {
     REQUIRE(o.updatedAt    == 0);
     REQUIRE(o.symbol.empty());
     REQUIRE(o.rejectReason.empty());
+    REQUIRE(o.exchange.empty());
 }
 
 // ── Fill struct defaults ──────────────────────────────────────────────────────

@@ -353,6 +353,9 @@ void IBKRClient::PlaceOrder(const ::core::Order& o) {
         if (!o.account.empty())
             ibOrder.account = o.account;
 
+        if (!o.exchange.empty())
+            c.exchange = o.exchange;
+
         m_client->placeOrder(o.orderId, c, ibOrder);
     });
 }
@@ -497,7 +500,9 @@ void IBKRClient::ProcessMessages() {
                 if (onOpenOrderEnd) onOpenOrderEnd();
 
             } else if constexpr (std::is_same_v<T, MsgContractConId>) {
-                if (onContractConId) onContractConId(m.reqId, m.conId);
+                if (onContractConId) onContractConId(m.reqId, m.conId,
+                                                     m.description, m.secType,
+                                                     m.primaryExch, m.currency);
 
             } else if constexpr (std::is_same_v<T, MsgHistoricalNews>) {
                 if (onHistoricalNews)
@@ -548,6 +553,18 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgWshEvent>) {
                 if (onWshEvent) onWshEvent(m.reqId, m.data);
+
+            } else if constexpr (std::is_same_v<T, MsgTickReqParams>) {
+                if (onTickReqParams) onTickReqParams(m.tickerId, m.bboExchange);
+
+            } else if constexpr (std::is_same_v<T, MsgSmartComponents>) {
+                if (onSmartComponents) onSmartComponents(m.reqId, m.routes);
+
+            } else if constexpr (std::is_same_v<T, MsgDisplayGroupList>) {
+                if (onDisplayGroupList) onDisplayGroupList(m.reqId, m.groups);
+
+            } else if constexpr (std::is_same_v<T, MsgDisplayGroupUpdated>) {
+                if (onDisplayGroupUpdated) onDisplayGroupUpdated(m.reqId, m.contractInfo);
             }
         }, msg);
 
@@ -928,7 +945,11 @@ void IBKRClient::openOrderEnd() {
 // ── Contract details ────────────────────────────────────────────────────────
 
 void IBKRClient::contractDetails(int reqId, const ContractDetails& cd) {
-    Push(MsgContractConId{reqId, cd.contract.conId});
+    Push(MsgContractConId{reqId, cd.contract.conId,
+                          cd.longName,
+                          cd.contract.secType,
+                          cd.contract.primaryExchange,
+                          cd.contract.currency});
 }
 
 void IBKRClient::contractDetailsEnd(int /*reqId*/) {
@@ -1030,6 +1051,50 @@ void IBKRClient::tickByTickAllLast(int reqId, int /*tickType*/, time_t time,
         msg.isUptick  = (price >= it->second);
     }
     m_lastTickPrice[reqId] = price;
+    Push(std::move(msg));
+}
+
+void IBKRClient::ReqSmartComponents(int reqId, const std::string& bboExchange) {
+    PostSend([=, this]() {
+        m_client->reqSmartComponents(reqId, bboExchange);
+    });
+}
+
+void IBKRClient::QueryDisplayGroups(int reqId) {
+    PostSend([=, this]() { m_client->queryDisplayGroups(reqId); });
+}
+void IBKRClient::SubscribeToGroupEvents(int reqId, int groupId) {
+    PostSend([=, this]() { m_client->subscribeToGroupEvents(reqId, groupId); });
+}
+void IBKRClient::UpdateDisplayGroup(int reqId, const std::string& contractInfo) {
+    PostSend([ci = contractInfo, reqId, this]() {
+        m_client->updateDisplayGroup(reqId, ci);
+    });
+}
+void IBKRClient::UnsubscribeFromGroupEvents(int reqId) {
+    PostSend([=, this]() { m_client->unsubscribeFromGroupEvents(reqId); });
+}
+
+void IBKRClient::displayGroupList(int reqId, const std::string& groups) {
+    Push(MsgDisplayGroupList{reqId, groups});
+}
+void IBKRClient::displayGroupUpdated(int reqId, const std::string& contractInfo) {
+    Push(MsgDisplayGroupUpdated{reqId, contractInfo});
+}
+
+void IBKRClient::tickReqParams(int tickerId, double /*minTick*/,
+                                const std::string& bboExchange,
+                                int /*snapshotPermissions*/) {
+    if (!bboExchange.empty())
+        Push(MsgTickReqParams{tickerId, bboExchange});
+}
+
+void IBKRClient::smartComponents(int reqId, const SmartComponentsMap& theMap) {
+    MsgSmartComponents msg;
+    msg.reqId = reqId;
+    msg.routes.reserve(theMap.size());
+    for (const auto& [bit, tup] : theMap)
+        msg.routes.push_back({bit, std::get<0>(tup), std::get<1>(tup)});
     Push(std::move(msg));
 }
 
