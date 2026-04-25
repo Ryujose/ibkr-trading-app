@@ -244,6 +244,8 @@ set(APPLICATION_SOURCES
     src/ui/windows/ScannerWindow.cpp
     src/ui/windows/PortfolioWindow.cpp
     src/ui/windows/OrdersWindow.cpp
+    src/ui/windows/WatchlistWindow.cpp
+    src/ui/windows/WshCalendarWindow.cpp
 )
 
 set(APPLICATION_LIBS

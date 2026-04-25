@@ -111,6 +111,10 @@ public:
     void OnWshEvent(const WshData::WshEvent& event);
     void ClearWshEvents() { m_wshEvents.clear(); }
 
+    // Replace the exchange combo list with fresh smart-component data.
+    // Always leads with "SMART"; resets selected index to 0.
+    void SetExchangeList(const std::vector<std::string>& exchanges);
+
 private:
     // ---- Indicator settings -------------------------------------------------
     struct IndicatorSettings {
@@ -198,6 +202,8 @@ private:
     int         m_orderTypeIdx = 0;       // index into kOrderTypes[]
     int         m_sessionIdx   = 0;       // 0=Regular,1=Pre-Market,2=After Hours,3=Overnight
     int         m_tifIdx       = 0;       // 0=DAY,1=GTC,2=GTD
+    int         m_exchangeIdx  = 0;
+    std::vector<std::string> m_exchangeList = {"SMART"};
     int         m_orderQty     = 100;
     double      m_trailAmount    = 0.50;   // trail $ amount for TRAIL / TRAIL LIMIT
     double      m_trailPercent   = 1.0;   // trail % amount for TRAIL / TRAIL LIMIT

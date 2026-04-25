@@ -57,6 +57,7 @@ struct Order {
     double      lmtPriceOffset = 0.0;   // limit offset from trail stop for TRAIL LIMIT
     bool        outsideRth     = false; // allow pre/after-hours fills
     std::string account;               // IB account code (required for multi-account / FA)
+    std::string exchange;              // routing exchange; empty / "SMART" = IB smart routing
     double      filledQty      = 0.0;
     double      avgFillPrice = 0.0;
     double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)

@@ -1193,6 +1193,24 @@ void TradingWindow::DrawOrderEntry() {
             ImGui::SetTooltip("On-Close orders must use DAY TIF.");
     }
 
+    // ---- Exchange routing ---------------------------------------------------
+    ImGui::Text("Exchange");
+    ImGui::SameLine(labelCol);
+    ImGui::SetNextItemWidth(em(120));
+    const char* exchPreview = m_exchangeIdx < (int)m_exchangeList.size()
+                              ? m_exchangeList[m_exchangeIdx].c_str() : "SMART";
+    if (ImGui::BeginCombo("##exch", exchPreview)) {
+        for (int i = 0; i < (int)m_exchangeList.size(); ++i) {
+            bool sel = (i == m_exchangeIdx);
+            if (ImGui::Selectable(m_exchangeList[i].c_str(), sel))
+                m_exchangeIdx = i;
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("SMART = IB smart routing.\nSpecific exchange = direct route (bypasses smart routing).");
+
     // ---- Outside RTH --------------------------------------------------------
     // Close orders (MOC/LOC) can't be outside RTH — disable the checkbox.
     bool rthLocked = (m_typeIdx == 6 || m_typeIdx == 7);
@@ -1399,6 +1417,8 @@ void TradingWindow::DrawConfirmationPopup() {
             if (lmt > 0) ImGui::Text("Cap:       $%.2f", lmt);
         }
         ImGui::Text("TIF:       %s",           tifs[m_tifIdx]);
+        if (m_exchangeIdx > 0 && m_exchangeIdx < (int)m_exchangeList.size())
+            ImGui::Text("Exchange:  %s", m_exchangeList[m_exchangeIdx].c_str());
         if (m_outsideRth) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.2f, 1.0f));
             ImGui::TextUnformatted("Outside RTH: YES");
@@ -1531,6 +1551,8 @@ void TradingWindow::SubmitOrder() {
     o.tif         = static_cast<core::TimeInForce>(m_tifIdx);
     o.quantity    = std::atof(m_qtyBuf);
     o.outsideRth  = m_outsideRth;
+    o.exchange    = (m_exchangeIdx < (int)m_exchangeList.size())
+                    ? m_exchangeList[m_exchangeIdx] : "SMART";
     o.status      = core::OrderStatus::Working;
     o.submittedAt = std::time(nullptr);
     o.updatedAt   = o.submittedAt;
@@ -1632,6 +1654,11 @@ void TradingWindow::CancelOrder(int orderId) {
 
 void TradingWindow::SetNextOrderId(int id) {
     m_nextOrderId = id;
+}
+
+void TradingWindow::SetExchangeList(const std::vector<std::string>& exchanges) {
+    m_exchangeList = exchanges;
+    m_exchangeIdx  = 0;
 }
 
 void TradingWindow::SetPosition(double qty, double avgCost) {

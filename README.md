@@ -19,9 +19,11 @@ The “Interactive Brokers API Usage Notice” section must be reviewed prior to
 - **Orders Blotter** — Live open orders and full execution history with commissions and realized P&L; order history restored automatically after reconnect
 - **Symbol Autocomplete** — IB-validated symbol search with 300 ms debounce across all windows; invalid symbols automatically revert to the last confirmed ticker
 - **WSH Corporate Event Markers** — Upcoming earnings, dividends, and splits shown as colour-coded vertical markers on the price chart (yellow = Earnings, cyan = Dividend, purple = Split) with hover tooltips; sourced live from Wall Street Horizon via the IB API
+- **WSH Calendar** — Cross-symbol aggregate view of all upcoming corporate events for held positions and open chart symbols; filterable by symbol, date range, type, and importance; sortable table with colour-coded event types
 - **Multi-Account Support** — On live sessions with multiple accounts, a selector modal appears at connect time; active account shown in the menu bar and stamped on every order
 - **Paper & Live accounts** — Toggle between paper and live trading from the login screen
-- **Multi-Instance Windows** — Open up to 10 simultaneous Chart, Order Book, Scanner, and News windows to monitor multiple assets at once
+- **Watchlist** — Multi-tab symbol watchlist with 22 configurable columns (show/hide via Columns button); Mag 7 default preset; live bid/ask/last/size/52W/spread ticks; saved presets; layout and symbols persisted to `~/.config/ibkr-trading-app/watchlists.cfg` and restored automatically on reconnect
+- **Multi-Instance Windows** — Open up to 10 simultaneous Chart, Order Book, Scanner, News, and Watchlist windows to monitor multiple assets at once
 - **Window Groups** — Link any windows into a color-coded group (G1–G4); changing the asset in one window instantly syncs all others in the same group
 - **Layout Presets** — One-click workspace layouts: Trading Focus, Research, Full Desk
 - **Responsive UI** — All toolbars and info bars wrap gracefully when windows are resized small; font size adjustable (Small / Medium / Large) via the Settings menu
