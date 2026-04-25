@@ -11,8 +11,7 @@
 #include <fstream>
 #include <numeric>
 #include <sstream>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <filesystem>
 
 namespace ui {
 
@@ -33,11 +32,11 @@ static std::string presetsFilePath() {
 
 static void ensureConfigDir() {
     const char* home = std::getenv("HOME");
+#ifdef _WIN32
+    if (!home || !*home) home = std::getenv("USERPROFILE");
+#endif
     if (!home || !*home) return;
-    std::string d1 = std::string(home) + "/.config";
-    std::string d2 = d1 + "/ibkr-trading-app";
-    mkdir(d1.c_str(), 0755);
-    mkdir(d2.c_str(), 0755);
+    std::filesystem::create_directories(std::string(home) + "/.config/ibkr-trading-app");
 }
 
 // ============================================================================
