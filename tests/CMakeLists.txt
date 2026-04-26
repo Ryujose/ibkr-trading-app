@@ -27,6 +27,7 @@ add_executable(tests-core
     test_market_data.cpp
     test_models.cpp
     test_ibkr_utils.cpp
+    test_chart_analysis.cpp
 )
 
 target_include_directories(tests-core PRIVATE

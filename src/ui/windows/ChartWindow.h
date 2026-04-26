@@ -2,6 +2,7 @@
 
 #include "core/models/MarketData.h"
 #include "core/models/OrderData.h"
+#include "core/services/ChartAnalysis.h"
 #include "ui/WshData.h"
 #include <string>
 #include <vector>
@@ -134,6 +135,35 @@ private:
         int   rsiPeriod  = 14;
     };
 
+    // ---- Auto technical-analysis settings -----------------------------------
+    struct AutoAnalysisSettings {
+        bool supports     = true;
+        bool resistances  = true;
+        bool trend        = true;
+        bool donchian     = false;
+        bool keltner      = false;
+        bool autoFib      = false;
+        bool pivotPoints  = false;
+        bool breakouts    = false;
+        bool zones        = false;   // supply/demand zones + imminent breakout signal
+
+        int  swingK         = 3;     // pivot left/right window
+        int  trendLookback  = 50;
+        int  donchianLen    = 20;
+        int  maxLevels      = 3;     // top-N supports / resistances
+        int  minTouches     = 2;
+        int  scanCap        = 1000;  // cap swing scan to last N bars (0 = unlimited)
+        bool trendChannel   = false; // ±2σ regression bands
+    };
+
+    enum class BreakoutDirection { None, LongSetup, ShortSetup };
+
+    using AutoLevel    = core::services::Level;
+    using AutoTrend    = core::services::TrendFit;
+    using AutoFibSpan  = core::services::AutoFibSpan;
+    using DailyPivot   = core::services::DailyPivot;
+    using BreakoutMark = core::services::BreakoutMark;
+
     // ---- State --------------------------------------------------------------
     int               m_groupId         = 0;
     int               m_instanceId      = 1;
@@ -155,8 +185,9 @@ private:
     double            m_priceMax        = 0.0;
     bool              m_viewInitialized = false;
 
-    IndicatorSettings  m_ind;
-    core::BarSeries    m_series;
+    IndicatorSettings    m_ind;
+    AutoAnalysisSettings m_auto;
+    core::BarSeries      m_series;
 
     // Flat arrays for ImPlot
     // m_xs     = actual UNIX timestamps (used for labels, VWAP, session detect)
@@ -178,6 +209,27 @@ private:
     std::vector<double> m_bbLower;
     std::vector<double> m_rsi;
     std::vector<double> m_vwap;
+
+    // Auto-detected structure (populated by DetectStructure)
+    std::vector<double>    m_atr14;
+    std::vector<AutoLevel> m_autoSupports;
+    std::vector<AutoLevel> m_autoResistances;
+    AutoTrend              m_autoTrend;
+    std::vector<double>    m_donchHi;        // Donchian upper band (size = bars; 0 before period)
+    std::vector<double>    m_donchLo;        // Donchian lower band
+    std::vector<double>    m_keltUpper;      // EMA20 + 2·ATR14
+    std::vector<double>    m_keltLower;      // EMA20 - 2·ATR14
+    AutoFibSpan            m_autoFib;        // most-recent largest swing span
+    DailyPivot             m_pivots;         // classic pivots from prior trading day
+    int                    m_pivotsTodayStart = -1;  // bar idx of today's first bar (intraday only)
+    int                    m_pivotsTodayEnd   = -1;  // bar idx of today's last bar
+    std::vector<BreakoutMark> m_breakouts;   // ▲/▼ marks on bars that closed through S/R
+
+    // Imminent-breakout signal (populated by ComputeBreakoutSignal)
+    BreakoutDirection      m_breakoutSignal     = BreakoutDirection::None;
+    double                 m_breakoutZoneTop    = 0.0;
+    double                 m_breakoutZoneBot    = 0.0;
+    bool                   m_breakoutFromSupply = false; // true = supply zone, false = demand
 
     int   m_hoverIdx          = -1;
     float m_chartHeightRatio  = 0.60f;
@@ -247,6 +299,7 @@ private:
     void RefreshData();
     void RebuildFlatArrays();
     void ComputeIndicators();
+    void DetectStructure();
     void InitViewRange();
     void DrawSessionBands();
 
@@ -270,6 +323,19 @@ private:
 
     // Called inside BeginPlot/EndPlot — renders drawings + limit line, handles clicks
     void DrawOverlays(double step);
+
+    // Auto-analysis rendering (subset called from DrawOverlays / DrawCandleChart)
+    void DrawAutoSupportResistance();
+    void DrawAutoTrend();
+    void DrawAutoZones();
+    void DrawAutoFib();
+    void DrawAutoPivots();
+    void DrawDonchian();
+    void DrawKeltner();
+    void DrawBreakoutMarks();
+    void DrawAutoSettingsPopup();
+    void ComputeBreakoutSignal();
+    void ComputeDailyPivots();    // walks m_xs to find prev day's OHLC; intraday only
 
     // Helpers
     static void DrawDashedHLine(ImDrawList* dl,
