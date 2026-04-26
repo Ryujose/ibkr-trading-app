@@ -251,7 +251,7 @@ TEST_CASE("LinearRegression: lookback < n fits the trailing window", "[analysis]
     REQUIRE(r.sigma     == Catch::Approx(0.0).margin(1e-9));
 }
 
-TEST_CASE("LinearRegression: flat line yields slope ≈ 0", "[analysis][trend]") {
+TEST_CASE("LinearRegression: flat line yields slope approximately 0", "[analysis][trend]") {
     std::vector<double> c(40, 100.0);
     auto r = LinearRegression(c, 40);
     REQUIRE(r.valid);
@@ -413,7 +413,7 @@ TEST_CASE("LargestSwingSpan: window=1 only considers the most recent swing of ea
     REQUIRE(s.loIdx   ==  25);
 }
 
-TEST_CASE("LargestSwingSpan: empty list → invalid", "[analysis][autofib]") {
+TEST_CASE("LargestSwingSpan: empty list returns invalid", "[analysis][autofib]") {
     REQUIRE_FALSE(LargestSwingSpan({},               {{0, 100.0}}, 5).valid);
     REQUIRE_FALSE(LargestSwingSpan({{0, 100.0}},     {},           5).valid);
     REQUIRE_FALSE(LargestSwingSpan({},               {},           5).valid);
@@ -454,7 +454,7 @@ TEST_CASE("ClassicPivots: invariants S3 < S2 < S1 < P < R1 < R2 < R3",
     REQUIRE(p.r2 < p.r3);
 }
 
-TEST_CASE("ClassicPivots: invalid input → valid=false", "[analysis][pivots]") {
+TEST_CASE("ClassicPivots: invalid input returns valid=false", "[analysis][pivots]") {
     REQUIRE_FALSE(ClassicPivots(  0.0,   0.0,   0.0).valid);
     REQUIRE_FALSE(ClassicPivots(-10.0, 100.0, 100.0).valid);
     REQUIRE_FALSE(ClassicPivots(100.0,  -1.0, 100.0).valid);
