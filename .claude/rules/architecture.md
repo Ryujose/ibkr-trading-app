@@ -5,7 +5,7 @@
 ```
 ├── src/
 │   ├── core/
-│   │   ├── services/         # IB Gateway integration (IBKRClient.h/.cpp, IBKRUtils.h)
+│   │   ├── services/         # IB Gateway integration (IBKRClient.h/.cpp, IBKRUtils.h, ChartAnalysis.h)
 │   │   └── models/           # Data models: MarketData.h, NewsData.h, ScannerData.h,
 │   │                         #   PortfolioData.h, OrderData.h, WindowGroup.h
 │   ├── ui/
@@ -18,6 +18,7 @@
 │   ├── test_market_data.cpp  # Timeframe helpers, IsUSDST, BarSession
 │   ├── test_models.cpp       # Enum string helpers, struct defaults
 │   ├── test_ibkr_utils.cpp   # ParseStatus, ParseIBTime
+│   ├── test_chart_analysis.cpp # FindSwings, ATR, ClusterLevels, KeepTopN
 │   └── test_ibkr_queue.cpp   # IBKRClient message dispatch (component tests)
 ├── twsapi_macunix.1037.02/   # IB TWS API sources (in-tree)
 ├── CMakeLists.txt
@@ -129,6 +130,33 @@ The `###` triple-hash gives ImGui a stable identity while the display label chan
 `src/core/services/IBKRUtils.h` — standalone header with no IB API dependency:
 - `ParseStatus(const std::string&) → core::OrderStatus` — maps IB order-status strings to enum; `"PendingCancel"` → `OrderStatus::PendingCancel`
 - `ParseIBTime(const std::string&) → std::time_t` — parses IB date/timestamp formats (YYYYMMDD, Unix string, formatted datetime)
+
+## ChartAnalysis
+
+`src/core/services/ChartAnalysis.h` — standalone header (no IB API / ImGui / ImPlot deps) for the auto technical-analysis layer in `ChartWindow`. Inline free functions in `core::services`:
+- `FindSwings(highs, lows, k, scanCap=0) → SwingResult` — pivot detection with left/right window `k`. Strict `>` on the left and `>=` on the right (mirror for lows) so flat tops/bottoms register as a single swing. `scanCap` limits the scan to the last N bars.
+- `ATR(highs, lows, closes, period) → vector<double>` — Wilder's true-range smoothing.
+- `ClusterLevels(swings, tol) → vector<Level>` — sweeps swings sorted by price, merging consecutive ones within `tol` into a single `Level{price, touches, firstIdx, lastIdx, minPrice, maxPrice}`. Cluster price = mean of constituents; `minPrice`/`maxPrice` track the lowest/highest constituent so ChartWindow can render thickness-aware supply/demand zones.
+- `KeepTopN(clusters, currentPrice, side, minTouches, maxLevels) → vector<Level>` — filters by side (`Above`/`Below`), min touches, then ranks by `(touches desc, lastIdx desc)` and caps at `maxLevels` (`maxLevels=0` = no cap).
+- `LinearRegression(closes, lookback) → TrendFit{valid, slope, intercept, sigma, firstIdx, lastIdx}` — closed-form OLS using bar idx as x over the trailing `lookback` closes. `sigma` is population residual stdev (used by the optional ±2σ channel). Returns `valid=false` on too-small input or zero-variance x.
+- `DonchianBands(highs, lows, N) → DonchianResult{hi, lo}` — rolling N-bar max/min envelope. Vectors are sized to `highs.size()` with `0.0` for indices `< N-1` (matching the convention used by `CalcSMA`/`CalcEMA`/`CalcBollingerBands`).
+- `LargestSwingSpan(swingHighs, swingLows, window) → AutoFibSpan{valid, hiIdx, hiPrice, loIdx, loPrice}` — picks the (high, low) pair with the largest absolute price difference among the last `window` swings of each list. Used to anchor the auto-Fibonacci overlay. `valid=false` on empty input or zero-span.
+- `ClassicPivots(prevH, prevL, prevC) → DailyPivot{valid, p, r1-r3, s1-s3}` — pure formula for classic pivot points (`P=(H+L+C)/3`, `R1=2P-L`, `R2=P+(H-L)`, `R3=H+2(P-L)`, mirror for S). Caller is responsible for picking the previous trading day's OHLC (ChartWindow does this in `ComputeDailyPivots()` by walking `m_xs` backwards using `localtime`). Returns `valid=false` on non-positive prices or `H<L`.
+- `FindBreakouts(resistances, supports, highs, lows, closes, atr, lookback, minTouches) → vector<BreakoutMark{idx, y, up}>` — walks the last `lookback` bars and emits a mark whenever `close[i-1] <= R.price < close[i]` (up) or the support mirror (down). Uses `cluster.firstIdx` as a causality guard so a level cannot mark bars before it was established. `minTouches` filters trivially-weak clusters. Mark `y` = `highs[i] + 0.5·atr[i]` (up) or `lows[i] - 0.5·atr[i]` (down). Caller passes the raw cluster output (not `KeepTopN`-filtered) so already-broken levels still produce historical marks.
+
+`ChartWindow.h` re-exports `Level` as `ChartWindow::AutoLevel` and `TrendFit` as `ChartWindow::AutoTrend`. Auto-detection results live in `m_autoSupports`/`m_autoResistances`/`m_atr14`/`m_autoTrend` and are populated by `DetectStructure()`, which runs at the tail of `ComputeIndicators()` so every existing recompute trigger refreshes auto-analysis. Toolbar toggles in `DrawAnalysisToolbar()` call `DetectStructure()` directly. Rendering: `DrawAutoSupportResistance()` is invoked from `DrawOverlays()` between the current-price line and the user drawings — red dashed h-lines for resistance, green for support, alpha proportional to touch count, left-edge price tag formatted ` R 187.42 (3×) `.
+
+**Auto trend line** (`AutoAnalysisSettings::trend`, default ON; `trendLookback` default 50): `m_autoTrend` is populated whenever `trend` is on (using `min(trendLookback, n)` so short series still fit). `DrawAutoTrend()` is invoked from `DrawOverlays()` after S/R rendering: solid segment from `(firstIdx, y(firstIdx))` to `(lastIdx, y(lastIdx))` plus a faded (60% alpha) `L/4`-bar forward projection. Colour reflects slope direction (green if `slope > +ε`, red if `< −ε`, grey otherwise) with `ε = 0.05·sigma/L`. When `m_auto.trendChannel` is on, ±2σ parallel lines render on both segments at 50% alpha (fainter on the projection). A right-edge ` trend +0.123/bar ` label tags the projection endpoint.
+
+**Supply/demand zones + imminent-breakout signal** (`AutoAnalysisSettings::zones`, default OFF): `ComputeBreakoutSignal()` runs at the tail of `DetectStructure()` when `zones` is on. It walks supply zones first then demand zones, finds the one whose `[minPrice − 0.5·ATR, maxPrice + 0.5·ATR]` interval contains the latest close, and only emits a `LongSetup`/`ShortSetup` (`m_breakoutSignal`) when (a) `bbWidth[n-1] < 0.7 × avg(bbWidth[n-50..n-1])` (BB compression, ≥20 valid samples required) and (b) `closes[n-1] − mean(closes[n-6..n-2])` exceeds ±0.1·ATR. `DrawAutoZones()` is invoked from `DrawOverlays()` immediately before `DrawAutoSupportResistance()` so the dashed S/R lines render on top of the rectangles: translucent red fill + thin red border for supply, translucent green for demand. When a signal is active, the right edge of the active zone gets a coloured triangle (▲ green / ▼ red) at the zone midpoint with a ` LONG SETUP ` / ` SHORT SETUP ` label tag to its left. `DetectStructure()` now populates the S/R clusters whenever `zones` is on, even if the individual `supports`/`resistances` toggles are off, since zones reuse the same cluster output.
+
+**Donchian + Keltner channels** (`AutoAnalysisSettings::donchian`/`keltner`, default OFF): Donchian uses `core::services::DonchianBands(m_highs, m_lows, donchianLen)` (default `donchianLen=20`); Keltner reuses `m_ema` (always computed in `ComputeIndicators`, regardless of the EMA20 indicator toggle) and `m_atr14` to build `m_keltUpper = m_ema + 2·m_atr14` / `m_keltLower = m_ema - 2·m_atr14`. Both render via `ImPlot::PlotLine` from `DrawCandleChart()` (faded yellow for `Donch Hi`/`Donch Lo`, faded cyan for `Kelt Hi`/`Kelt Lo`) so they participate in the legend alongside SMA/BB/EMA.
+
+**Auto-Fibonacci** (`AutoAnalysisSettings::autoFib`, default OFF): `m_autoFib = LargestSwingSpan(sw.highs, sw.lows, /*window=*/30)` picks the largest-span pair among the last 30 swings of each list. `DrawAutoFib()` (called from `DrawOverlays()` after S/R/trend) renders six dashed h-lines at `kFibLevels[]` between `loPrice` and `hiPrice`, in faded `kFibColors` with **left-edge** ` F 38.2% 187.42 ` labels (manual fibs use right-edge labels — staying on opposite edges avoids collisions). Anchor markers (small filled circles) at the swing-high (orange) and swing-low (blue) make the source pair visible.
+
+**Daily pivot points** (`AutoAnalysisSettings::pivotPoints`, default OFF; intraday only): `ComputeDailyPivots()` walks `m_xs` backwards (using `localtime` to match how intraday timestamps are interpreted elsewhere) to identify the previous trading day's first/last bar and the current day's first bar. Computes `m_pivots = ClassicPivots(prevH, prevL, prevC)` and pins `m_pivotsTodayStart`/`m_pivotsTodayEnd`. `DrawAutoPivots()` (called from `DrawOverlays()` when `pivotPoints && IsIntraday(m_timeframe)`) renders 7 dashed h-lines (S3/S2/S1 in greens, P in light grey, R1/R2/R3 in reds) spanning `[todayFirstIdx, todayLastIdx]` only, with right-aligned label tags inside today's range. Toolbar checkbox is `BeginDisabled()`-wrapped on D1/W1/MN with an `AllowWhenDisabled` tooltip explaining "Intraday only".
+
+**Breakout markers** (`AutoAnalysisSettings::breakouts`, default OFF): `m_breakouts = FindBreakouts(highClusters, lowClusters, m_highs, m_lows, m_closes, m_atr14, /*lookback=*/50, m_auto.minTouches)` is computed in `DetectStructure()` after clustering. The unfiltered cluster output is passed (not `KeepTopN`-filtered) so already-broken levels still produce historical marks. `DrawBreakoutMarks()` (called from `DrawCandleChart()` after candlesticks/overlays) emits two `ImPlot::PlotScatter` calls — `Breakout Up` with `ImPlotMarker_Up` (green) and `Breakout Dn` with `ImPlotMarker_Down` (red).
 
 ## Symbol Search
 

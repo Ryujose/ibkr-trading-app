@@ -628,6 +628,501 @@ void ChartWindow::DrawAnalysisToolbar() {
         row.item(FlexRow::textW("(click second point...)"), 16);
         ImGui::TextColored(ImVec4(1.f, 0.8f, 0.2f, 1.f), "(click second point...)");
     }
+
+    // ── Auto-detection toggles ────────────────────────────────────────────────
+    row.item(FlexRow::textW("Auto:"), 16);
+    ImGui::TextDisabled("Auto:");
+
+    row.item(FlexRow::checkboxW("Sup"), 4);
+    if (ImGui::Checkbox("Sup", &m_auto.supports)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Auto-detected support levels (clustered swing lows)");
+
+    row.item(FlexRow::checkboxW("Res"), 4);
+    if (ImGui::Checkbox("Res", &m_auto.resistances)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Auto-detected resistance levels (clustered swing highs)");
+
+    row.item(FlexRow::checkboxW("AutoTrend"), 4);
+    if (ImGui::Checkbox("AutoTrend", &m_auto.trend)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Linear-regression trend line over the last %d closes "
+                          "(green=up / red=down / grey=flat); ±2σ channel via "
+                          "Auto... popup", m_auto.trendLookback);
+
+    row.item(FlexRow::checkboxW("Zones"), 4);
+    if (ImGui::Checkbox("Zones", &m_auto.zones)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Supply/demand zone rectangles + imminent breakout signal "
+                          "(price inside a zone with BB compression and momentum)");
+
+    row.item(FlexRow::checkboxW("Donch"), 4);
+    if (ImGui::Checkbox("Donch", &m_auto.donchian)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Donchian channels — rolling %d-bar high/low envelope.",
+                          m_auto.donchianLen);
+
+    row.item(FlexRow::checkboxW("Kelt"), 4);
+    if (ImGui::Checkbox("Kelt", &m_auto.keltner)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Keltner channels — EMA20 ± 2·ATR(14).");
+
+    row.item(FlexRow::checkboxW("AutoFib"), 4);
+    if (ImGui::Checkbox("AutoFib", &m_auto.autoFib)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Auto Fibonacci levels anchored to the most recent "
+                          "max-span swing pair.");
+
+    {
+        bool pivotsAvailable = IsIntraday(m_timeframe);
+        row.item(FlexRow::checkboxW("Pivots"), 4);
+        if (!pivotsAvailable) ImGui::BeginDisabled();
+        if (ImGui::Checkbox("Pivots", &m_auto.pivotPoints)) DetectStructure();
+        if (!pivotsAvailable) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (pivotsAvailable)
+                ImGui::SetTooltip("Classic pivot points (P, R1-R3, S1-S3) "
+                                  "from prior trading day's OHLC.");
+            else
+                ImGui::SetTooltip("Intraday only — pivots use the prior day's OHLC.");
+        }
+    }
+
+    row.item(FlexRow::checkboxW("Breakouts"), 4);
+    if (ImGui::Checkbox("Breakouts", &m_auto.breakouts)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Triangle markers on bars that closed through a "
+                          "detected support or resistance.");
+
+    row.item(FlexRow::buttonW("Auto..."), 4);
+    if (ImGui::SmallButton("Auto...")) ImGui::OpenPopup("##auto_settings");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Tune swing window, touch threshold, etc.");
+    DrawAutoSettingsPopup();
+}
+
+// ============================================================================
+// Auto settings popup — exposes the AutoAnalysisSettings parameters.
+// ============================================================================
+void ChartWindow::DrawAutoSettingsPopup() {
+    if (!ImGui::BeginPopup("##auto_settings")) return;
+
+    ImGui::TextDisabled("Auto-Analysis Settings");
+    ImGui::Separator();
+
+    bool changed = false;
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Swing window (k)", &m_auto.swingK)) {
+        if (m_auto.swingK < 1)  m_auto.swingK = 1;
+        if (m_auto.swingK > 20) m_auto.swingK = 20;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Bars on each side of a pivot. 3 for intraday, 5 for daily.");
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Min touches", &m_auto.minTouches)) {
+        if (m_auto.minTouches < 1) m_auto.minTouches = 1;
+        if (m_auto.minTouches > 10) m_auto.minTouches = 10;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Minimum swings required for a level to qualify.");
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Max levels", &m_auto.maxLevels)) {
+        if (m_auto.maxLevels < 1) m_auto.maxLevels = 1;
+        if (m_auto.maxLevels > 10) m_auto.maxLevels = 10;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Top-N supports / resistances kept after filtering.");
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Scan cap (bars)", &m_auto.scanCap)) {
+        if (m_auto.scanCap < 0) m_auto.scanCap = 0;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Limit swing scan to last N bars (0 = unlimited).");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Trend");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Trend lookback", &m_auto.trendLookback)) {
+        if (m_auto.trendLookback < 5)   m_auto.trendLookback = 5;
+        if (m_auto.trendLookback > 500) m_auto.trendLookback = 500;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Number of recent closes used for the linear-regression trend.");
+
+    if (ImGui::Checkbox("Show ±2σ channel", &m_auto.trendChannel))
+        changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Draw two parallel lines at ±2 standard deviations "
+                          "from the regression line.");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Donchian");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(em(80));
+    if (ImGui::InputInt("Donchian length", &m_auto.donchianLen)) {
+        if (m_auto.donchianLen < 2)   m_auto.donchianLen = 2;
+        if (m_auto.donchianLen > 200) m_auto.donchianLen = 200;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Lookback window for the Donchian channel high/low.");
+
+    if (changed) DetectStructure();
+
+    ImGui::EndPopup();
+}
+
+// ============================================================================
+// DrawAutoSupportResistance — called inside DrawOverlays.
+// Renders detected supports (green) and resistances (red) as dashed h-lines
+// with a left-edge price tag. Alpha scales with touch count.
+// ============================================================================
+void ChartWindow::DrawAutoSupportResistance() {
+    if (m_xMin >= m_xMax || m_closes.empty()) return;
+    if (m_autoSupports.empty() && m_autoResistances.empty()) return;
+
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+
+    auto draw = [&](double price, int touches, ImU32 col, ImU32 bg, char prefix) {
+        ImVec2 p0 = ImPlot::PlotToPixels(m_xMin, price);
+        ImVec2 p1 = ImPlot::PlotToPixels(m_xMax, price);
+        DrawDashedHLine(dl, p0.x, p1.x, p0.y, col, 1.2f, 5.f, 4.f);
+
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), " %c %.2f (%d\xC3\x97) ",
+                      prefix, price, touches);
+        ImVec2 sz   = ImGui::CalcTextSize(buf);
+        float  tagX = p0.x + 2.f;
+        dl->AddRectFilled(ImVec2(tagX - 2,        p0.y - 9),
+                          ImVec2(tagX + sz.x + 2, p0.y + 9), bg, 2.f);
+        dl->AddText(ImVec2(tagX, p0.y - 7), col, buf);
+    };
+
+    if (m_auto.resistances) {
+        for (const auto& r : m_autoResistances) {
+            int   alpha = std::min(255, 140 + r.touches * 25);
+            ImU32 col   = IM_COL32(230,  90,  90, alpha);
+            ImU32 bg    = IM_COL32( 70,  20,  20, 230);
+            draw(r.price, r.touches, col, bg, 'R');
+        }
+    }
+    if (m_auto.supports) {
+        for (const auto& s : m_autoSupports) {
+            int   alpha = std::min(255, 140 + s.touches * 25);
+            ImU32 col   = IM_COL32( 90, 210, 110, alpha);
+            ImU32 bg    = IM_COL32( 15,  60,  25, 230);
+            draw(s.price, s.touches, col, bg, 'S');
+        }
+    }
+}
+
+// ============================================================================
+// DrawAutoTrend — linear-regression trend line over the last L closes plus an
+// L/4-bar forward projection (faded). Optional ±2σ parallel channel.
+// Line colour reflects slope direction; ε = 0.05·sigma/L decides the dead-band.
+// ============================================================================
+void ChartWindow::DrawAutoTrend() {
+    if (!m_autoTrend.valid) return;
+    if (m_xMin >= m_xMax || m_closes.empty()) return;
+
+    const auto& t = m_autoTrend;
+    int L = t.lastIdx - t.firstIdx + 1;
+    if (L <= 1) return;
+
+    int    projBars = std::max(1, L / 4);
+    double xStart   = static_cast<double>(t.firstIdx);
+    double xEnd     = static_cast<double>(t.lastIdx);
+    double xProj    = xEnd + projBars;
+
+    auto y = [&](double x) { return t.slope * x + t.intercept; };
+
+    double y0 = y(xStart), y1 = y(xEnd), y2 = y(xProj);
+
+    // Slope deadband: ε = 0.05·sigma/L (per plan §4d).
+    double eps = 0.05 * t.sigma / static_cast<double>(L);
+    ImU32 mainCol;
+    if (t.slope >  eps)      mainCol = IM_COL32( 80, 220, 110, 230); // up — green
+    else if (t.slope < -eps) mainCol = IM_COL32(230,  90,  90, 230); // down — red
+    else                     mainCol = IM_COL32(190, 190, 190, 230); // flat — grey
+
+    ImU32 projCol  = (mainCol & 0x00FFFFFFu) | (140u << 24);   // 60% alpha
+    ImU32 chanMain = (mainCol & 0x00FFFFFFu) | (130u << 24);   // 50% alpha
+    ImU32 chanProj = (mainCol & 0x00FFFFFFu) | ( 70u << 24);   // even fainter
+
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+
+    auto plotSeg = [&](double xa, double ya, double xb, double yb,
+                       ImU32 col, float thick) {
+        ImVec2 a = ImPlot::PlotToPixels(xa, ya);
+        ImVec2 b = ImPlot::PlotToPixels(xb, yb);
+        dl->AddLine(a, b, col, thick);
+    };
+
+    // Main fit (solid)
+    plotSeg(xStart, y0, xEnd, y1, mainCol, 1.8f);
+    // Forward projection (faded)
+    plotSeg(xEnd,   y1, xProj, y2, projCol, 1.8f);
+
+    if (m_auto.trendChannel && t.sigma > 0.0) {
+        double off = 2.0 * t.sigma;
+        // Upper band
+        plotSeg(xStart, y0 + off, xEnd,  y1 + off, chanMain, 1.2f);
+        plotSeg(xEnd,   y1 + off, xProj, y2 + off, chanProj, 1.2f);
+        // Lower band
+        plotSeg(xStart, y0 - off, xEnd,  y1 - off, chanMain, 1.2f);
+        plotSeg(xEnd,   y1 - off, xProj, y2 - off, chanProj, 1.2f);
+    }
+
+    // Slope label tag at the right end of the line (pixel-space).
+    ImVec2 anchor = ImPlot::PlotToPixels(xProj, y2);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), " trend %+.3f/bar ", t.slope);
+    ImVec2 sz = ImGui::CalcTextSize(buf);
+    ImU32  bg = IM_COL32(35, 35, 35, 230);
+    dl->AddRectFilled(ImVec2(anchor.x - sz.x - 4, anchor.y - sz.y * 0.5f - 2),
+                      ImVec2(anchor.x,            anchor.y + sz.y * 0.5f + 2), bg, 2.f);
+    dl->AddText(ImVec2(anchor.x - sz.x - 2, anchor.y - sz.y * 0.5f), mainCol, buf);
+}
+
+// ============================================================================
+// DrawAutoZones — supply/demand zone rectangles + imminent-breakout signal.
+// Called inside DrawOverlays when m_auto.zones is true. Zones reuse the
+// resistance (supply) and support (demand) clusters; rectangle vertical bounds
+// are [minPrice - 0.5*ATR, maxPrice + 0.5*ATR].
+// ============================================================================
+void ChartWindow::DrawAutoZones() {
+    if (m_xMin >= m_xMax || m_closes.empty()) return;
+    if (m_autoSupports.empty() && m_autoResistances.empty()) return;
+
+    int n = static_cast<int>(m_closes.size());
+    double atr    = (n > 14 && (int)m_atr14.size() == n) ? m_atr14[n - 1] : 0.0;
+    double buffer = 0.5 * atr;
+
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+    ImVec2 pMin = ImPlot::GetPlotPos();
+    ImVec2 pMax = ImVec2(pMin.x + ImPlot::GetPlotSize().x,
+                         pMin.y + ImPlot::GetPlotSize().y);
+
+    auto drawZone = [&](double minP, double maxP, ImU32 fill, ImU32 border) {
+        double bot = minP - buffer;
+        double top = maxP + buffer;
+        ImVec2 a = ImPlot::PlotToPixels(m_xMin, top);
+        ImVec2 b = ImPlot::PlotToPixels(m_xMax, bot);
+        a.x = pMin.x; b.x = pMax.x;
+        dl->AddRectFilled(a, b, fill);
+        dl->AddRect(a, b, border, 0.0f, 0, 1.0f);
+    };
+
+    for (const auto& r : m_autoResistances) {
+        // Supply zone — translucent red with a slightly stronger border.
+        drawZone(r.minPrice, r.maxPrice,
+                 IM_COL32(220,  70,  70,  35),
+                 IM_COL32(220,  90,  90, 110));
+    }
+    for (const auto& s : m_autoSupports) {
+        // Demand zone — translucent green.
+        drawZone(s.minPrice, s.maxPrice,
+                 IM_COL32( 70, 200, 100,  35),
+                 IM_COL32( 90, 210, 110, 110));
+    }
+
+    // ── Imminent-breakout signal ─────────────────────────────────────────────
+    if (m_breakoutSignal == BreakoutDirection::None) return;
+    if (m_breakoutZoneTop <= m_breakoutZoneBot)      return;
+
+    bool   isLong = (m_breakoutSignal == BreakoutDirection::LongSetup);
+    double mid    = 0.5 * (m_breakoutZoneTop + m_breakoutZoneBot);
+    ImVec2 anchor = ImPlot::PlotToPixels(m_xMax, mid);
+
+    ImU32 col   = isLong ? IM_COL32( 80, 230, 120, 255)
+                         : IM_COL32(240,  90,  90, 255);
+    ImU32 bg    = isLong ? IM_COL32( 20,  60,  30, 240)
+                         : IM_COL32( 70,  20,  20, 240);
+    const char* label = isLong ? " LONG SETUP " : " SHORT SETUP ";
+
+    // Triangle on the right edge inside the plot rect.
+    float tri  = 9.f;
+    float triX = pMax.x - tri - 4.f;
+    float triY = anchor.y;
+    if (isLong) {
+        dl->AddTriangleFilled(ImVec2(triX,         triY + tri),
+                              ImVec2(triX + tri,   triY + tri),
+                              ImVec2(triX + tri/2, triY - tri),
+                              col);
+    } else {
+        dl->AddTriangleFilled(ImVec2(triX,         triY - tri),
+                              ImVec2(triX + tri,   triY - tri),
+                              ImVec2(triX + tri/2, triY + tri),
+                              col);
+    }
+
+    // Label tag to the left of the triangle.
+    ImVec2 labelSz = ImGui::CalcTextSize(label);
+    float  labelX  = triX - labelSz.x - 4.f;
+    dl->AddRectFilled(ImVec2(labelX - 2,             triY - labelSz.y * 0.5f - 2),
+                      ImVec2(labelX + labelSz.x + 2, triY + labelSz.y * 0.5f + 2),
+                      bg, 2.f);
+    dl->AddText(ImVec2(labelX, triY - labelSz.y * 0.5f), col, label);
+}
+
+// ============================================================================
+// DrawAutoFib — auto-Fibonacci levels anchored to the largest recent swing
+// span. Faded fib colours and left-edge labels distinguish from manual fibs.
+// ============================================================================
+void ChartWindow::DrawAutoFib() {
+    if (!m_autoFib.valid) return;
+    if (m_xMin >= m_xMax || m_closes.empty()) return;
+
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+    double lo = std::min(m_autoFib.hiPrice, m_autoFib.loPrice);
+    double hi = std::max(m_autoFib.hiPrice, m_autoFib.loPrice);
+    if (hi <= lo) return;
+
+    for (int fi = 0; fi < 6; ++fi) {
+        double price = lo + kFibLevels[fi] * (hi - lo);
+        ImVec2 p0    = ImPlot::PlotToPixels(m_xMin, price);
+        ImVec2 p1    = ImPlot::PlotToPixels(m_xMax, price);
+        ImU32  col   = (kFibColors[fi] & 0x00FFFFFFu) | (140u << 24);   // ~55% alpha
+        DrawDashedHLine(dl, p0.x, p1.x, p0.y, col, 1.0f, 4.f, 3.f);
+
+        char buf[40];
+        std::snprintf(buf, sizeof(buf), " F %.1f%% %.2f ",
+                      kFibLevels[fi] * 100.0, price);
+        ImVec2 sz = ImGui::CalcTextSize(buf);
+        ImU32  bg = IM_COL32(35, 35, 35, 220);
+        float  tx = p0.x + 4.f;
+        dl->AddRectFilled(ImVec2(tx - 2,        p0.y - sz.y * 0.5f - 2),
+                          ImVec2(tx + sz.x + 2, p0.y + sz.y * 0.5f + 2), bg, 2.f);
+        dl->AddText(ImVec2(tx, p0.y - sz.y * 0.5f), col, buf);
+    }
+
+    // Anchor markers — small filled circles at the swing-high and swing-low.
+    ImVec2 ph = ImPlot::PlotToPixels(static_cast<double>(m_autoFib.hiIdx),
+                                     m_autoFib.hiPrice);
+    ImVec2 pl = ImPlot::PlotToPixels(static_cast<double>(m_autoFib.loIdx),
+                                     m_autoFib.loPrice);
+    dl->AddCircleFilled(ph, 4.f, IM_COL32(255, 200, 100, 230));
+    dl->AddCircleFilled(pl, 4.f, IM_COL32(120, 200, 255, 230));
+}
+
+// ============================================================================
+// DrawAutoPivots — classic pivot levels (P, R1-R3, S1-S3) for today's bars.
+// Rendered as 7 dashed h-lines spanning [todayFirstIdx, todayLastIdx] with a
+// label tag at the right end of today's range.
+// ============================================================================
+void ChartWindow::DrawAutoPivots() {
+    if (!m_pivots.valid) return;
+    if (m_pivotsTodayStart < 0 || m_pivotsTodayEnd < m_pivotsTodayStart) return;
+
+    ImDrawList* dl = ImPlot::GetPlotDrawList();
+    double xL = static_cast<double>(m_pivotsTodayStart);
+    double xR = static_cast<double>(m_pivotsTodayEnd);
+
+    struct PivotLine { double price; const char* label; ImU32 color; };
+    PivotLine lines[7] = {
+        { m_pivots.s3, "S3", IM_COL32( 40, 180,  90, 200) },
+        { m_pivots.s2, "S2", IM_COL32( 70, 210, 110, 210) },
+        { m_pivots.s1, "S1", IM_COL32(100, 230, 140, 230) },
+        { m_pivots.p,  "P",  IM_COL32(220, 220, 220, 235) },
+        { m_pivots.r1, "R1", IM_COL32(240, 140,  90, 230) },
+        { m_pivots.r2, "R2", IM_COL32(220, 110,  70, 210) },
+        { m_pivots.r3, "R3", IM_COL32(200,  90,  50, 200) },
+    };
+
+    for (auto& ln : lines) {
+        ImVec2 a = ImPlot::PlotToPixels(xL, ln.price);
+        ImVec2 b = ImPlot::PlotToPixels(xR, ln.price);
+        DrawDashedHLine(dl, a.x, b.x, a.y, ln.color, 1.0f, 5.f, 4.f);
+
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), " %s %.2f ", ln.label, ln.price);
+        ImVec2 sz = ImGui::CalcTextSize(buf);
+        ImU32  bg = IM_COL32(35, 35, 35, 220);
+        float  tx = b.x - sz.x - 2.f;
+        dl->AddRectFilled(ImVec2(tx - 2,        a.y - sz.y * 0.5f - 2),
+                          ImVec2(tx + sz.x + 2, a.y + sz.y * 0.5f + 2), bg, 2.f);
+        dl->AddText(ImVec2(tx, a.y - sz.y * 0.5f), ln.color, buf);
+    }
+}
+
+// ============================================================================
+// DrawDonchian — rolling N-bar high/low envelope. Plotted via ImPlot lines so
+// it participates in the legend alongside SMA/BB/EMA.
+// ============================================================================
+void ChartWindow::DrawDonchian() {
+    int n = static_cast<int>(m_idxs.size());
+    if (n == 0) return;
+    if (static_cast<int>(m_donchHi.size()) != n ||
+        static_cast<int>(m_donchLo.size()) != n) return;
+
+    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.95f, 0.30f, 0.65f), 1.0f);
+    ImPlot::PlotLine("Donch Hi", m_idxs.data(), m_donchHi.data(), n);
+    ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.95f, 0.30f, 0.65f), 1.0f);
+    ImPlot::PlotLine("Donch Lo", m_idxs.data(), m_donchLo.data(), n);
+}
+
+// ============================================================================
+// DrawKeltner — EMA20 ± 2·ATR(14). Plotted via ImPlot lines.
+// ============================================================================
+void ChartWindow::DrawKeltner() {
+    int n = static_cast<int>(m_idxs.size());
+    if (n == 0) return;
+    if (static_cast<int>(m_keltUpper.size()) != n ||
+        static_cast<int>(m_keltLower.size()) != n) return;
+
+    ImPlot::SetNextLineStyle(ImVec4(0.30f, 0.95f, 0.95f, 0.65f), 1.0f);
+    ImPlot::PlotLine("Kelt Hi", m_idxs.data(), m_keltUpper.data(), n);
+    ImPlot::SetNextLineStyle(ImVec4(0.30f, 0.95f, 0.95f, 0.65f), 1.0f);
+    ImPlot::PlotLine("Kelt Lo", m_idxs.data(), m_keltLower.data(), n);
+}
+
+// ============================================================================
+// DrawBreakoutMarks — ▲/▼ markers on bars that closed through detected S/R.
+// Two PlotScatter calls: green up-triangles above resistance breakouts,
+// red down-triangles below support breakdowns.
+// ============================================================================
+void ChartWindow::DrawBreakoutMarks() {
+    if (m_breakouts.empty()) return;
+
+    std::vector<double> upXs, upYs, dnXs, dnYs;
+    upXs.reserve(m_breakouts.size());
+    dnXs.reserve(m_breakouts.size());
+    for (const auto& b : m_breakouts) {
+        if (b.up) {
+            upXs.push_back(static_cast<double>(b.idx));
+            upYs.push_back(b.y);
+        } else {
+            dnXs.push_back(static_cast<double>(b.idx));
+            dnYs.push_back(b.y);
+        }
+    }
+
+    if (!upXs.empty()) {
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Up, 7.f,
+                                   ImVec4(0.30f, 0.95f, 0.40f, 1.f), 1.f,
+                                   ImVec4(0.10f, 0.55f, 0.20f, 1.f));
+        ImPlot::PlotScatter("Breakout Up", upXs.data(), upYs.data(),
+                            static_cast<int>(upXs.size()));
+    }
+    if (!dnXs.empty()) {
+        ImPlot::SetNextMarkerStyle(ImPlotMarker_Down, 7.f,
+                                   ImVec4(0.95f, 0.40f, 0.40f, 1.f), 1.f,
+                                   ImVec4(0.55f, 0.15f, 0.15f, 1.f));
+        ImPlot::PlotScatter("Breakout Dn", dnXs.data(), dnYs.data(),
+                            static_cast<int>(dnXs.size()));
+    }
 }
 
 // ============================================================================
@@ -1266,6 +1761,21 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                           ImVec2(tagX + curSz.x + 2, lineY + 9), kCurBg, 2.f);
         dl->AddText(ImVec2(tagX, lineY - 7), kCurCol, curBuf);
     }
+
+    // ── Auto supply/demand zones (drawn underneath S/R lines) ─────────────────
+    if (m_auto.zones) DrawAutoZones();
+
+    // ── Auto-detected supports / resistances ──────────────────────────────────
+    DrawAutoSupportResistance();
+
+    // ── Auto trend line ───────────────────────────────────────────────────────
+    if (m_auto.trend) DrawAutoTrend();
+
+    // ── Auto Fibonacci levels ─────────────────────────────────────────────────
+    if (m_auto.autoFib) DrawAutoFib();
+
+    // ── Daily pivot points (intraday only — guard duplicated in toolbar) ──────
+    if (m_auto.pivotPoints && IsIntraday(m_timeframe)) DrawAutoPivots();
 
     // ── Render stored drawings ─────────────────────────────────────────────
     for (const auto& dr : m_drawings) {
@@ -1909,8 +2419,12 @@ void ChartWindow::DrawCandleChart() {
         ImPlot::PlotLine("VWAP", m_idxs.data(), m_vwap.data(), n);
     }
 
+    if (m_auto.donchian) DrawDonchian();
+    if (m_auto.keltner)  DrawKeltner();
+
     DrawCandlesticks(halfBarW);
     DrawOverlays(1.0);
+    if (m_auto.breakouts) DrawBreakoutMarks();
     DrawHoverTooltip();
     DrawWshMarkers();
 
@@ -2340,6 +2854,231 @@ void ChartWindow::ComputeIndicators() {
     m_rsi  = CalcRSI(m_closes, m_ind.rsiPeriod);
     m_vwap = CalcVWAP(m_highs, m_lows, m_closes, m_volumes, m_xs,
                       IsIntraday(m_timeframe));
+    DetectStructure();
+}
+
+// ============================================================================
+// DetectStructure — populates m_atr14 + auto S/R from m_highs/m_lows/m_closes.
+// Called from every ComputeIndicators site (lives at the end of that method).
+// ============================================================================
+void ChartWindow::DetectStructure() {
+    m_autoSupports.clear();
+    m_autoResistances.clear();
+    m_atr14.clear();
+    m_autoTrend          = AutoTrend{};
+    m_donchHi.clear();
+    m_donchLo.clear();
+    m_keltUpper.clear();
+    m_keltLower.clear();
+    m_autoFib            = AutoFibSpan{};
+    m_pivots             = DailyPivot{};
+    m_pivotsTodayStart   = -1;
+    m_pivotsTodayEnd     = -1;
+    m_breakouts.clear();
+    m_breakoutSignal     = BreakoutDirection::None;
+    m_breakoutZoneTop    = 0.0;
+    m_breakoutZoneBot    = 0.0;
+    m_breakoutFromSupply = false;
+
+    int n = static_cast<int>(m_closes.size());
+    if (n < 30) return;
+
+    using namespace core::services;
+
+    m_atr14 = ATR(m_highs, m_lows, m_closes, 14);
+
+    if (m_auto.trend) {
+        int L = std::min(m_auto.trendLookback, n);
+        m_autoTrend = LinearRegression(m_closes, L);
+    }
+
+    if (m_auto.donchian) {
+        auto d    = DonchianBands(m_highs, m_lows, m_auto.donchianLen);
+        m_donchHi = std::move(d.hi);
+        m_donchLo = std::move(d.lo);
+    }
+
+    if (m_auto.keltner) {
+        m_keltUpper.assign(n, 0.0);
+        m_keltLower.assign(n, 0.0);
+        if (static_cast<int>(m_ema.size())   == n &&
+            static_cast<int>(m_atr14.size()) == n) {
+            for (int i = 0; i < n; ++i) {
+                if (m_ema[i] > 0.0 && m_atr14[i] > 0.0) {
+                    m_keltUpper[i] = m_ema[i] + 2.0 * m_atr14[i];
+                    m_keltLower[i] = m_ema[i] - 2.0 * m_atr14[i];
+                }
+            }
+        }
+    }
+
+    if (m_auto.pivotPoints && IsIntraday(m_timeframe)) {
+        ComputeDailyPivots();
+    }
+
+    bool needsSwings = m_auto.supports || m_auto.resistances || m_auto.zones ||
+                       m_auto.autoFib  || m_auto.breakouts;
+    if (!needsSwings) return;
+
+    auto sw = FindSwings(m_highs, m_lows, m_auto.swingK, m_auto.scanCap);
+    if (sw.highs.empty() && sw.lows.empty()) return;
+
+    double lastClose = m_closes.back();
+    double atr       = (n > 14) ? m_atr14[n - 1] : 0.0;
+    double tol       = std::max(lastClose * 0.003, 0.5 * atr);
+    if (tol <= 0.0) tol = std::max(lastClose * 0.005, 1e-6);
+
+    bool needsClusters = m_auto.supports || m_auto.resistances ||
+                         m_auto.zones    || m_auto.breakouts;
+    std::vector<AutoLevel> highClusters, lowClusters;
+    if (needsClusters) {
+        highClusters = ClusterLevels(sw.highs, tol);
+        lowClusters  = ClusterLevels(sw.lows,  tol);
+    }
+
+    if (m_auto.resistances || m_auto.zones) {
+        m_autoResistances = KeepTopN(highClusters, lastClose,
+                                     LevelSide::Above,
+                                     m_auto.minTouches, m_auto.maxLevels);
+    }
+    if (m_auto.supports || m_auto.zones) {
+        m_autoSupports = KeepTopN(lowClusters, lastClose,
+                                  LevelSide::Below,
+                                  m_auto.minTouches, m_auto.maxLevels);
+    }
+
+    if (m_auto.zones) ComputeBreakoutSignal();
+
+    if (m_auto.autoFib) {
+        m_autoFib = LargestSwingSpan(sw.highs, sw.lows, /*window=*/30);
+    }
+
+    if (m_auto.breakouts) {
+        m_breakouts = FindBreakouts(highClusters, lowClusters,
+                                    m_highs, m_lows, m_closes, m_atr14,
+                                    /*lookback=*/50, m_auto.minTouches);
+    }
+}
+
+// ============================================================================
+// ComputeDailyPivots — walks m_xs backwards to identify the previous trading
+// day's OHLC, computes classic pivot levels, and pins today's idx range used
+// by the renderer. Skipped for non-intraday timeframes (caller checks).
+// ============================================================================
+void ChartWindow::ComputeDailyPivots() {
+    int n = static_cast<int>(m_xs.size());
+    if (n == 0) return;
+
+    auto dayKey = [](double ts) {
+        std::time_t t  = static_cast<std::time_t>(ts);
+        struct tm   tm = *std::localtime(&t);
+        return std::pair<int, int>{tm.tm_year, tm.tm_yday};
+    };
+
+    auto today = dayKey(m_xs[n - 1]);
+
+    int todayStart = -1;
+    int prevEnd    = -1;
+    int prevStart  = -1;
+    std::pair<int, int> prevKey{-1, -1};
+    bool prevFound = false;
+
+    for (int i = n - 1; i >= 0; --i) {
+        auto k = dayKey(m_xs[i]);
+        if (k == today) {
+            todayStart = i;
+            continue;
+        }
+        if (!prevFound) {
+            prevEnd   = i;
+            prevStart = i;
+            prevKey   = k;
+            prevFound = true;
+            continue;
+        }
+        if (k == prevKey) {
+            prevStart = i;
+        } else {
+            break;
+        }
+    }
+
+    if (todayStart < 0 || !prevFound) return;
+
+    double prevH = m_highs[prevStart];
+    double prevL = m_lows[prevStart];
+    double prevC = m_closes[prevEnd];
+    for (int i = prevStart; i <= prevEnd; ++i) {
+        if (m_highs[i] > prevH) prevH = m_highs[i];
+        if (m_lows[i]  < prevL) prevL = m_lows[i];
+    }
+
+    m_pivots           = core::services::ClassicPivots(prevH, prevL, prevC);
+    m_pivotsTodayStart = todayStart;
+    m_pivotsTodayEnd   = n - 1;
+}
+
+// ============================================================================
+// ComputeBreakoutSignal — sets m_breakoutSignal when price is inside a zone
+// AND Bollinger bands are compressed AND directional momentum is present.
+// Walks supply zones first, then demand zones (mirrors the algorithm in §4k).
+// ============================================================================
+void ChartWindow::ComputeBreakoutSignal() {
+    int n = static_cast<int>(m_closes.size());
+    if (n < 50) return;
+
+    double atr = (n > 14) ? m_atr14[n - 1] : 0.0;
+    if (atr <= 0.0) return;
+
+    double last   = m_closes[n - 1];
+    double buffer = 0.5 * atr;
+
+    auto findContaining = [&](const std::vector<AutoLevel>& levels, bool isSupply) {
+        for (const auto& lvl : levels) {
+            double bot = lvl.minPrice - buffer;
+            double top = lvl.maxPrice + buffer;
+            if (last >= bot && last <= top) {
+                m_breakoutZoneTop    = top;
+                m_breakoutZoneBot    = bot;
+                m_breakoutFromSupply = isSupply;
+                return true;
+            }
+        }
+        return false;
+    };
+    bool inZone = findContaining(m_autoResistances, true);
+    if (!inZone) inZone = findContaining(m_autoSupports, false);
+    if (!inZone) return;
+
+    // Bollinger-Band compression — bbWidth[n-1] < 0.7 * avg(bbWidth[n-50..n-1]).
+    if ((int)m_bbUpper.size() != n || (int)m_bbLower.size() != n) return;
+    double bbWidthLast = m_bbUpper[n - 1] - m_bbLower[n - 1];
+    if (bbWidthLast <= 0.0) return;
+
+    double sumWidth = 0.0;
+    int    cnt      = 0;
+    for (int i = n - 50; i < n; ++i) {
+        double w = m_bbUpper[i] - m_bbLower[i];
+        if (w > 0.0) { sumWidth += w; ++cnt; }
+    }
+    if (cnt < 20) return; // need enough valid samples to trust the average
+    double avgWidth = sumWidth / cnt;
+    if (bbWidthLast >= 0.7 * avgWidth) return;
+
+    // Directional momentum — last close vs mean of the prior 5 closes.
+    double recent5 = 0.0;
+    for (int i = n - 6; i <= n - 2; ++i) recent5 += m_closes[i];
+    recent5 /= 5.0;
+    double diff = last - recent5;
+
+    bool bullish = (diff >  0.1 * atr);
+    bool bearish = (diff < -0.1 * atr);
+
+    double midZone = 0.5 * (m_breakoutZoneTop + m_breakoutZoneBot);
+    if (last > midZone && bullish)
+        m_breakoutSignal = BreakoutDirection::LongSetup;
+    else if (last < midZone && bearish)
+        m_breakoutSignal = BreakoutDirection::ShortSetup;
 }
 
 // ============================================================================
