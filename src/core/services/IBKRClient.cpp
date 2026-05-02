@@ -131,12 +131,31 @@ Contract IBKRClient::MakeStockContract(const std::string& symbol) const {
     return c;
 }
 
+Contract IBKRClient::MakeFuturesContract(const std::string& symbol) const {
+    // Strip leading '/' if present — both "ES" and "/ES" resolve to front-month.
+    const std::string& sym = (!symbol.empty() && symbol[0] == '/')
+                             ? symbol.substr(1) : symbol;
+    Contract c;
+    c.symbol   = sym;
+    c.secType  = "FUT";
+    c.currency = "USD";
+    c.exchange = "CME";
+    return c;
+}
+
+// Returns true when the symbol represents a futures contract
+// (e.g. "/ES", "/NQ", "ES", "NQ" after slash-stripping).
+static bool IsFuturesSymbol(const std::string& sym) {
+    return !sym.empty() && (sym[0] == '/' || sym == "ES" || sym == "NQ");
+}
+
 void IBKRClient::ReqHistoricalData(int reqId, const std::string& symbol,
                                     const std::string& duration,
                                     const std::string& barSize,
                                     bool useRTH,
                                     const std::string& endDateTime) {
-    Contract c = MakeStockContract(symbol);
+    Contract c = IsFuturesSymbol(symbol) ? MakeFuturesContract(symbol)
+                                         : MakeStockContract(symbol);
     TagValueListSPtr empty;
     // formatDate=2 → IB always returns Unix timestamps.
     // keepUpToDate only for intraday bars — IB doesn't support it for daily/weekly/monthly
@@ -193,9 +212,16 @@ void IBKRClient::ReqMarketDataType(int type) {
 
 void IBKRClient::ReqMarketData(int reqId, const std::string& symbol,
                                 const std::string& genericTickList) {
-    Contract c = MakeStockContract(symbol);
+    Contract c = IsFuturesSymbol(symbol) ? MakeFuturesContract(symbol)
+                                         : MakeStockContract(symbol);
     TagValueListSPtr empty;
     m_client->reqMktData(reqId, c, genericTickList, false, false, empty);
+}
+
+void IBKRClient::ReqFuturesMarketData(int reqId, const std::string& symbol) {
+    Contract c = MakeFuturesContract(symbol);
+    TagValueListSPtr empty;
+    m_client->reqMktData(reqId, c, "", false, false, empty);
 }
 
 void IBKRClient::CancelMarketData(int reqId) {
@@ -476,7 +502,8 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgDepth>) {
                 if (onDepthUpdate)
-                    onDepthUpdate(m.id, m.isBid, m.pos, m.op, m.price, m.size);
+                    onDepthUpdate(m.id, m.isBid, m.pos, m.op, m.price, m.size,
+                                  m.exchange, m.isSmartDepth);
 
             } else if constexpr (std::is_same_v<T, MsgScanItem>) {
                 if (onScanItem) onScanItem(m.reqId, m.result);
@@ -659,18 +686,22 @@ void IBKRClient::updateMktDepth(TickerId id, int position, int operation,
                   side == 1,  // 1=bid, 0=ask
                   position, operation,
                   price,
-                  DecimalFunctions::decimalToDouble(size)});
+                  DecimalFunctions::decimalToDouble(size),
+                  "",    // exchange (empty = SMART aggregated)
+                  true}); // isSmartDepth
 }
 
 void IBKRClient::updateMktDepthL2(TickerId id, int position,
-                                   const std::string& /*marketMaker*/,
+                                   const std::string& marketMaker,
                                    int operation, int side, double price,
-                                   Decimal size, bool /*isSmartDepth*/) {
+                                   Decimal size, bool isSmartDepth) {
     Push(MsgDepth{static_cast<int>(id),
                   side == 1,
                   position, operation,
                   price,
-                  DecimalFunctions::decimalToDouble(size)});
+                  DecimalFunctions::decimalToDouble(size),
+                  marketMaker,
+                  isSmartDepth});
 }
 
 // ── Historical data ────────────────────────────────────────────────────────

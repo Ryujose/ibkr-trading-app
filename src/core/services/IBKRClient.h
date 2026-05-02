@@ -54,7 +54,8 @@ struct MsgOrderStatus { int orderId; ::core::OrderStatus status;
                         double filled; double avgPrice; };
 struct MsgFill        { ::core::Fill fill; bool fromQuery = false; };
 struct MsgDepth       { int id; bool isBid; int pos; int op;
-                        double price; double size; };
+                        double price; double size;
+                        std::string exchange; bool isSmartDepth = false; };
 struct MsgScanItem    { int reqId; ::core::ScanResult result; };
 struct MsgScanEnd     { int reqId; };
 struct MsgNews        { std::time_t ts; std::string provider;
@@ -200,6 +201,10 @@ public:
     void ReqMktDepth(int reqId, const std::string& symbol, int numRows = 10);
     void CancelMktDepth(int reqId);
 
+    // Futures market data for index health indicators (/ES, /NQ, etc.)
+    void ReqFuturesMarketData(int reqId, const std::string& symbol);
+    void CancelFuturesMarketData(int reqId) { CancelMarketData(reqId); }
+
     void ReqAccountUpdates(bool subscribe, const std::string& acctCode = "");
     void ReqPositions();
 
@@ -303,7 +308,9 @@ public:
     // WSH corporate event (one raw JSON blob per event; parse with WshData::ParseWshEvent)
     std::function<void(int reqId, const std::string& data)>                 onWshEvent;
     std::function<void(int id, bool isBid, int pos, int op,
-                       double price, double size)>                          onDepthUpdate;
+                       double price, double size,
+                       const std::string& exchange,
+                       bool isSmartDepth)>                                      onDepthUpdate;
     std::function<void(int reqId, const ::core::ScanResult&)>              onScanItem;
     std::function<void(int reqId)>                                          onScanEnd;
     std::function<void(std::time_t, const std::string& provider,
@@ -417,6 +424,7 @@ private:
 
     // ── Helpers ───────────────────────────────────────────────────────────
     Contract MakeStockContract(const std::string& symbol) const;
+    Contract MakeFuturesContract(const std::string& symbol) const;
 
     // ── EWrapper overrides (only non-trivial ones) ────────────────────────
     void connectAck() override;

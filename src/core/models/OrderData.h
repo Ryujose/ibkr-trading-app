@@ -22,10 +22,11 @@ enum class OrderStatus { Pending, Working, PartialFill, Filled,
 // ---- Market depth -----------------------------------------------------------
 
 struct DepthLevel {
-    double price    = 0.0;
-    double size     = 0.0;
-    int    numOrders = 1;
-    float  flashAge = 0.0f;  // seconds since last price change (for highlight)
+    double      price    = 0.0;
+    double      size     = 0.0;
+    int         numOrders = 1;
+    float       flashAge = 0.0f;  // seconds since last price change (for highlight)
+    std::string exchange;         // exchange name (empty for L1 SMART depth)
 };
 
 // ---- Tick (time & sales) ----------------------------------------------------

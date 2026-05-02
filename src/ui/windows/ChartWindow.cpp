@@ -483,6 +483,29 @@ void ChartWindow::OnWshEvent(const WshData::WshEvent& event) {
     m_wshEvents.push_back(event);
 }
 
+void ChartWindow::OnFuturesTick(int reqId, int field, double price) {
+    if (price <= 0.0) return;
+    double* pricePtr     = nullptr;
+    double* prevClosePtr = nullptr;
+    bool*   hasData      = nullptr;
+    if (reqId == 140) {
+        pricePtr     = &m_esPrice;
+        prevClosePtr = &m_esPrevClose;
+        hasData      = &m_esHasData;
+    } else if (reqId == 141) {
+        pricePtr     = &m_nqPrice;
+        prevClosePtr = &m_nqPrevClose;
+        hasData      = &m_nqHasData;
+    } else return;
+
+    if (field == 4 || field == 1 || field == 2) {  // LAST, BID, ASK
+        *pricePtr = price;
+        *hasData  = true;
+    } else if (field == 9) {  // PREV CLOSE
+        *prevClosePtr = price;
+    }
+}
+
 void ChartWindow::RequestNewData() {
     m_series = core::BarSeries{};
     m_xs.clear(); m_opens.clear(); m_highs.clear();
@@ -613,7 +636,7 @@ void ChartWindow::DrawToolbar() {
     }
 
     // Quick symbol buttons
-    static constexpr const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY"};
+    static constexpr const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY", "/ES", "/NQ"};
     for (const char* s : kQuickSyms) {
         row.item(FlexRow::buttonW(s), 4);
         bool active = (std::strcmp(m_symbol, s) == 0);
@@ -2102,6 +2125,28 @@ void ChartWindow::DrawInfoBar() {
         row.item(FlexRow::textW(commBuf), 6);
         ImGui::TextDisabled("%s", commBuf);
     }
+
+    // ── Futures market health (/ES, /NQ) ──────────────────────────────────
+    auto DrawFuturesItem = [&](const char* label, double price,
+                                double prevClose, bool hasData) {
+        row.item(em(130), 12);
+        if (!hasData || price <= 0.0) {
+            ImGui::TextDisabled("%s  ---", label);
+            return;
+        }
+        double chg    = price - prevClose;
+        double chgPct = (prevClose > 0.0) ? (chg / prevClose) * 100.0 : 0.0;
+        bool   bull   = (chg >= 0.0);
+        ImVec4 col    = bull ? ImVec4(0.2f, 0.9f, 0.4f, 1.f)
+                             : ImVec4(0.9f, 0.3f, 0.3f, 1.f);
+        char buf[56];
+        std::snprintf(buf, sizeof(buf), "%s %.2f  %+.2f (%+.2f%%)",
+                      label, price, chg, chgPct);
+        ImGui::TextColored(col, "%s", buf);
+    };
+
+    DrawFuturesItem("/ES", m_esPrice, m_esPrevClose, m_esHasData);
+    DrawFuturesItem("/NQ", m_nqPrice, m_nqPrevClose, m_nqHasData);
 }
 
 // ============================================================================

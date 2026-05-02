@@ -117,6 +117,10 @@ public:
     // Synthesises today's bar automatically when the first tick arrives.
     void OnDayTick(int field, double price);
 
+    // Futures market health tick (reqIds 140/141 for /ES, /NQ).
+    // field 4=LAST, 1=BID, 2=ASK → update last price; field 9=CLOSE → prev close.
+    void OnFuturesTick(int reqId, int field, double price);
+
     // Push current pending orders for this symbol; replaces the previous list.
     void SetPendingOrders(const std::vector<PendingOrderLine>& orders);
 
@@ -395,6 +399,14 @@ private:
     // ---- Symbol history -----------------------------------------------------
     static constexpr int kMaxHistory = 10;
     std::deque<std::string> m_symbolHistory;
+
+    // ---- Futures market health (/ES, /NQ) -----------------------------------
+    double m_esPrice     = 0.0;
+    double m_esPrevClose = 0.0;
+    double m_nqPrice     = 0.0;
+    double m_nqPrevClose = 0.0;
+    bool   m_esHasData   = false;
+    bool   m_nqHasData   = false;
 
     // ---- Private helpers ----------------------------------------------------
     // Creates today's partial bar if it doesn't exist yet (D1/W1/MN only).

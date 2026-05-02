@@ -39,7 +39,9 @@ public:
     // ── IB Gateway callbacks ─────────────────────────────────────────────────
     // op: 0=insert, 1=update, 2=delete
     void OnDepthUpdate(int reqId, bool isBid, int pos, int op,
-                       double price, double size);
+                       double price, double size,
+                       const std::string& exchange = "",
+                       bool isSmartDepth = false);
     void OnOrderStatus(int orderId, core::OrderStatus status,
                        double filled, double avgPrice);
     void OnFill(const core::Fill& fill);
@@ -117,6 +119,15 @@ private:
     std::vector<core::DepthLevel> m_asks;
     std::vector<core::DepthLevel> m_bids;
     double m_maxDepthSize = 1.0;
+
+    // Per-exchange L2 mode (toggle in DOM header)
+    bool m_useL2             = false;
+    int  m_exchangeFilterIdx = 0;   // index into m_exchangeList for L2 filtering
+    // Buckets keyed by exchange name, one full level list per side
+    std::unordered_map<std::string, std::vector<core::DepthLevel>> m_askBuckets;
+    std::unordered_map<std::string, std::vector<core::DepthLevel>> m_bidBuckets;
+    void RefreshExchangeFilterList();
+    void RebuildDepthView();
 
     // ── Volume profile (accumulates traded size per price level) ─────────────
     // key = round(price / 0.01) as int, value = cumulative traded size
