@@ -1,6 +1,7 @@
 #include "ui/UiScale.h"
 #include "ui/windows/TradingWindow.h"
 #include "ui/SymbolSearch.h"
+#include "core/services/ChartAnalysis.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
 
@@ -295,6 +296,7 @@ bool TradingWindow::Render() {
     ImGui::SameLine();
     ImGui::BeginChild("##entry_panel", ImVec2(entryW, topH), ImGuiChildFlags_Borders,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    DrawUnguardedStrip();   // yellow protective-stop warning when applicable
     DrawOrderEntry();
     ImGui::EndChild();
 
@@ -657,11 +659,27 @@ void TradingWindow::DrawOrderBook() {
         }
     };
 
+    // ── S/R proximity helper ──────────────────────────────────────────────────
+    // Uses the same tolerance as ChartWindow::DetectStructure: max(0.3% × price,
+    // 0.5 × ATR14).  When ATR hasn't been computed yet (m_atrForSR ≤ 0), falls
+    // back to 0.3% × price alone.
+    auto srTag = [&](double price) -> const char* {
+        if (m_supportPrices.empty() && m_resistancePrices.empty()) return nullptr;
+        double tol = (m_atrForSR > 0.0) ? std::max(0.003 * price, 0.5 * m_atrForSR)
+                                        : 0.003 * price;
+        for (double s : m_supportPrices)
+            if (std::abs(price - s) <= tol) return "S";
+        for (double r : m_resistancePrices)
+            if (std::abs(price - r) <= tol) return "R";
+        return nullptr;
+    };
+
     // ── DOM table ─────────────────────────────────────────────────────────────
     ImGuiTableFlags tflags =
         ImGuiTableFlags_BordersInnerV |
         ImGuiTableFlags_ScrollY       |
-        ImGuiTableFlags_SizingFixedFit;
+        ImGuiTableFlags_SizingFixedFit |
+        ImGuiTableFlags_Resizable;
 
     float availH = ImGui::GetContentRegionAvail().y;
     if (availH < 10.f) return;   // guard: don't create a degenerate scroll table
@@ -693,9 +711,21 @@ void TradingWindow::DrawOrderBook() {
         RowOverlay(lvl.price, true);  // Col 0: empty on ask side; use for overlay
 
         ImGui::TableSetColumnIndex(2);
-        ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
-        ImGui::Text("%.2f", lvl.price);
-        ImGui::PopStyleColor();
+        {
+            const char* sr = srTag(lvl.price);
+            if (sr) {
+                bool isResistance = (sr[0] == 'R');
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    isResistance ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                                 : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                ImGui::Text("%s", sr);
+                ImGui::PopStyleColor();
+                ImGui::SameLine(0.f, 2.f);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+            ImGui::Text("%.2f", lvl.price);
+            ImGui::PopStyleColor();
+        }
 
         ImGui::TableSetColumnIndex(3);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.72f, 0.38f, 0.38f, 1.f));
@@ -734,9 +764,21 @@ void TradingWindow::DrawOrderBook() {
                     ImGui::TableSetColumnIndex(0);
                     RowOverlay(price, m_sideIdx == 0);
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
-                    ImGui::Text("%.2f", price);
-                    ImGui::PopStyleColor();
+                    {
+                        const char* sr = srTag(price);
+                        if (sr) {
+                            bool isRes = (sr[0] == 'R');
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                isRes ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                                      : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                            ImGui::Text("%s", sr);
+                            ImGui::PopStyleColor();
+                            ImGui::SameLine(0.f, 2.f);
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                        ImGui::Text("%.2f", price);
+                        ImGui::PopStyleColor();
+                    }
                     ImGui::TableSetColumnIndex(5);
                     if (m_positionQty != 0.0 || m_midPrice > 0.0) {
                         ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
@@ -838,9 +880,21 @@ void TradingWindow::DrawOrderBook() {
                     ImGui::TableSetColumnIndex(0);
                     RowOverlay(price, m_sideIdx == 0);
                     ImGui::TableSetColumnIndex(2);
-                    ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
-                    ImGui::Text("%.2f", price);
-                    ImGui::PopStyleColor();
+                    {
+                        const char* sr = srTag(price);
+                        if (sr) {
+                            bool isRes = (sr[0] == 'R');
+                            ImGui::PushStyleColor(ImGuiCol_Text,
+                                isRes ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                                      : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                            ImGui::Text("%s", sr);
+                            ImGui::PopStyleColor();
+                            ImGui::SameLine(0.f, 2.f);
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
+                        ImGui::Text("%.2f", price);
+                        ImGui::PopStyleColor();
+                    }
                     ImGui::TableSetColumnIndex(5);
                     if (m_positionQty != 0.0 || m_midPrice > 0.0) {
                         ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
@@ -883,9 +937,21 @@ void TradingWindow::DrawOrderBook() {
             ImGui::Text("%.0f", m_nbboBidSz);
             ImGui::PopStyleColor();
             ImGui::TableSetColumnIndex(2);
-            ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
-            ImGui::Text("%.2f *", m_nbboBid);
-            ImGui::PopStyleColor();
+            {
+                const char* sr = srTag(m_nbboBid);
+                if (sr) {
+                    bool isRes = (sr[0] == 'R');
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        isRes ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                              : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                    ImGui::Text("%s", sr);
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.f, 2.f);
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
+                ImGui::Text("%.2f *", m_nbboBid);
+                ImGui::PopStyleColor();
+            }
             ImGui::TableSetColumnIndex(5);
             if (m_midPrice > 0.0) {
                 ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
@@ -905,9 +971,21 @@ void TradingWindow::DrawOrderBook() {
             ImGui::TableSetColumnIndex(0);
             RowOverlay(price, false);
             ImGui::TableSetColumnIndex(2);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.55f, 0.38f, 1.f));
-            ImGui::Text("%.2f", price);
-            ImGui::PopStyleColor();
+            {
+                const char* sr = srTag(price);
+                if (sr) {
+                    bool isRes = (sr[0] == 'R');
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        isRes ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                              : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                    ImGui::Text("%s", sr);
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine(0.f, 2.f);
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.35f, 0.55f, 0.38f, 1.f));
+                ImGui::Text("%.2f", price);
+                ImGui::PopStyleColor();
+            }
             ImGui::TableSetColumnIndex(5);
             if (m_midPrice > 0.0) {
                 ImGui::PushStyleColor(ImGuiCol_Text, pnl >= 0.0 ? kBuyGreen : kSellRed);
@@ -957,9 +1035,21 @@ void TradingWindow::DrawOrderBook() {
         ImGui::PopStyleColor();
 
         ImGui::TableSetColumnIndex(2);
-        ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
-        ImGui::Text("%.2f", lvl.price);
-        ImGui::PopStyleColor();
+        {
+            const char* sr = srTag(lvl.price);
+            if (sr) {
+                bool isResistance = (sr[0] == 'R');
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    isResistance ? ImVec4(0.95f, 0.40f, 0.30f, 1.f)
+                                 : ImVec4(0.25f, 0.85f, 0.35f, 1.f));
+                ImGui::Text("%s", sr);
+                ImGui::PopStyleColor();
+                ImGui::SameLine(0.f, 2.f);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+            ImGui::Text("%.2f", lvl.price);
+            ImGui::PopStyleColor();
+        }
 
         ImGui::TableSetColumnIndex(5);
         if (m_positionQty != 0.0 || m_midPrice > 0.0) {
@@ -1304,6 +1394,9 @@ void TradingWindow::DrawOrderEntry() {
     ImGui::PopStyleColor();
 
     ImGui::Spacing();
+
+    // ---- Order-impact badge -------------------------------------------------
+    DrawOrderImpactBadge();
 
     // ---- Submit button ------------------------------------------------------
     ImVec4 btnCol  = isBuy ? ImVec4(0.12f, 0.60f, 0.28f, 1.0f)
@@ -1666,6 +1759,289 @@ void TradingWindow::SetPosition(double qty, double avgCost) {
     m_avgEntryPrice = (std::abs(qty) > 1e-9) ? avgCost : 0.0;
 }
 
+void TradingWindow::SetAutoLevels(const std::vector<double>& supports,
+                                   const std::vector<double>& resistances,
+                                   double atrLast) {
+    m_supportPrices    = supports;
+    m_resistancePrices = resistances;
+    m_atrForSR         = atrLast;
+}
+
+void TradingWindow::SetUnguardedSuggestion(const UnguardedHint& h) {
+    // A position-quantity change clears the per-symbol dismissal.
+    if (std::abs(h.qty - m_lastWarnedQty) > 1e-9) {
+        m_dismissedUnguarded.erase(h.symbol);
+        m_lastWarnedQty = h.qty;
+    }
+    m_unguarded = h;
+}
+
+// ============================================================================
+// DrawOrderImpactBadge — side-intent + PnL preview below the order-entry form.
+//
+// Reads the current form buffers (side, type, qty, prices) to derive an
+// estimated fill price, then computes and renders what the order would do to
+// the current position. Pure visualisation — no behaviour change.
+// ============================================================================
+void TradingWindow::DrawOrderImpactBadge() {
+    // Parse quantity
+    double qty = std::atof(m_qtyBuf);
+    if (qty <= 0.0) return;
+
+    bool isBuy = (m_sideIdx == 0);
+    double last = m_midPrice;
+    double fillPrice = 0.0;
+
+    // ── Derive fill price from the form buffers ────────────────────────────
+    static constexpr const char* kTypes[] = {
+        "Market", "Limit", "Stop", "Stop Limit",
+        "Trail Stop", "Trail Limit",
+        "Market On Close", "Limit On Close", "Mkt To Limit",
+        "Mkt If Touched", "Lmt If Touched",
+        "Midprice", "Relative"
+    };
+
+    switch (m_typeIdx) {
+        case 0:  // Market
+        case 6:  // MOC
+        case 8:  // MTL
+        case 11: // Midprice
+            if (last <= 0.0) return;
+            fillPrice = last;
+            break;
+        case 1:  // Limit
+        case 7:  // LOC
+        case 10: // LIT — use limit price for fill leg
+            fillPrice = std::atof(m_lmtBuf);
+            break;
+        case 2:  // Stop
+        case 9:  // MIT
+            fillPrice = std::atof(m_stpBuf);
+            break;
+        case 3:  // StopLimit — use stop as best estimate
+            fillPrice = std::atof(m_stpBuf);
+            break;
+        case 4:  // Trail Stop
+        case 5:  // Trail Limit
+            if (last <= 0.0) return;
+            {
+                double trailAmt = std::atof(m_trailAmtBuf);
+                double trailPct = std::atof(m_trailPctBuf);
+                double trail = m_trailByPct ? (last * trailPct / 100.0) : trailAmt;
+                fillPrice = isBuy ? (last - trail) : (last + trail);
+            }
+            break;
+        case 12: // Relative
+            if (last <= 0.0) return;
+            {
+                double peg = std::atof(m_offsetBuf);
+                fillPrice = isBuy ? (last + peg) : (last - peg);
+            }
+            break;
+        default: return;
+    }
+
+    if (fillPrice <= 0.0) return;
+
+    // ── Compute impact ─────────────────────────────────────────────────────
+    double posQty = m_positionQty;
+    double avgCost = m_avgEntryPrice;
+    double commPerShare = 0.0;   // TradingWindow does not track commission
+
+    auto imp = core::services::ComputeOrderImpact(posQty, avgCost, commPerShare,
+                                                   isBuy, qty, fillPrice);
+    if (imp.kind == core::services::OrderImpactKind::Invalid) return;
+
+    // ── Colour palette ─────────────────────────────────────────────────────
+    static constexpr ImVec4 kOpenAddBg   = ImVec4(0.05f, 0.12f, 0.22f, 0.90f);
+    static constexpr ImVec4 kOpenAddBdr  = ImVec4(0.20f, 0.50f, 0.85f, 0.90f);
+    static constexpr ImVec4 kGreenBg     = ImVec4(0.05f, 0.18f, 0.08f, 0.90f);
+    static constexpr ImVec4 kGreenBdr    = ImVec4(0.15f, 0.65f, 0.25f, 0.90f);
+    static constexpr ImVec4 kRedBg       = ImVec4(0.22f, 0.08f, 0.05f, 0.90f);
+    static constexpr ImVec4 kRedBdr      = ImVec4(0.80f, 0.25f, 0.15f, 0.90f);
+    static constexpr ImVec4 kFlipBg      = ImVec4(0.25f, 0.15f, 0.05f, 0.90f);
+    static constexpr ImVec4 kFlipBdr     = ImVec4(0.90f, 0.55f, 0.10f, 0.90f);
+
+    ImVec4 bgCol, bdrCol, textCol;
+    bool isOpenOrAdd = false;
+
+    switch (imp.kind) {
+        case core::services::OrderImpactKind::OpenLong:
+        case core::services::OrderImpactKind::OpenShort:
+        case core::services::OrderImpactKind::AddToLong:
+        case core::services::OrderImpactKind::AddToShort:
+            bgCol = kOpenAddBg;  bdrCol = kOpenAddBdr;
+            textCol = ImVec4(0.40f, 0.70f, 1.00f, 1.f);
+            isOpenOrAdd = true;
+            break;
+        case core::services::OrderImpactKind::ReduceLong:
+        case core::services::OrderImpactKind::ReduceShort:
+        case core::services::OrderImpactKind::CloseLong:
+        case core::services::OrderImpactKind::CloseShort:
+            if (imp.closePnL > 0.0) {
+                bgCol = kGreenBg; bdrCol = kGreenBdr;
+                textCol = ImVec4(0.25f, 0.90f, 0.35f, 1.f);
+            } else {
+                bgCol = kRedBg; bdrCol = kRedBdr;
+                textCol = ImVec4(0.95f, 0.40f, 0.30f, 1.f);
+            }
+            break;
+        case core::services::OrderImpactKind::FlipToShort:
+        case core::services::OrderImpactKind::FlipToLong:
+            bgCol = kFlipBg; bdrCol = kFlipBdr;
+            textCol = ImVec4(1.00f, 0.70f, 0.20f, 1.f);
+            break;
+        default: return;
+    }
+
+    float stripH = ImGui::GetTextLineHeightWithSpacing()
+                 + ImGui::GetStyle().FramePadding.y * 2.0f + 6.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,    bgCol);
+    ImGui::PushStyleColor(ImGuiCol_Border,     bdrCol);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+    ImGui::BeginChild("##orderimpact", ImVec2(-1, stripH),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, textCol);
+
+    char buf[200];
+    const char* kindStr = "";
+    switch (imp.kind) {
+        case core::services::OrderImpactKind::OpenLong:     kindStr = "OPEN LONG";      break;
+        case core::services::OrderImpactKind::OpenShort:    kindStr = "OPEN SHORT";     break;
+        case core::services::OrderImpactKind::AddToLong:    kindStr = "ADD TO LONG";    break;
+        case core::services::OrderImpactKind::AddToShort:   kindStr = "ADD TO SHORT";   break;
+        case core::services::OrderImpactKind::ReduceLong:   kindStr = "REDUCE LONG";    break;
+        case core::services::OrderImpactKind::ReduceShort:  kindStr = "REDUCE SHORT";   break;
+        case core::services::OrderImpactKind::CloseLong:    kindStr = "CLOSE LONG";     break;
+        case core::services::OrderImpactKind::CloseShort:   kindStr = "CLOSE SHORT";    break;
+        case core::services::OrderImpactKind::FlipToShort:  kindStr = "FLIP TO SHORT";  break;
+        case core::services::OrderImpactKind::FlipToLong:   kindStr = "FLIP TO LONG";   break;
+        default: break;
+    }
+
+    if (isOpenOrAdd) {
+        double cost = fillPrice * qty;
+        std::snprintf(buf, sizeof(buf), "  %s  ·  %.0f sh @ $%.2f  ·  cost ~ $%'.0f",
+                      kindStr, qty, fillPrice, cost);
+    } else if (imp.kind == core::services::OrderImpactKind::FlipToShort ||
+               imp.kind == core::services::OrderImpactKind::FlipToLong) {
+        const char* openDir = (imp.kind == core::services::OrderImpactKind::FlipToShort)
+                              ? "short" : "long";
+        std::snprintf(buf, sizeof(buf), "  %s  ·  close %.0f (%+.2f)  ->  open %.0f %s @ $%.2f",
+                      kindStr, imp.closeQty, imp.closePnL,
+                      imp.openQty, openDir, fillPrice);
+    } else {
+        double pctPnL = 0.0;
+        if (imp.closeQty > 0.0 && avgCost > 0.0)
+            pctPnL = (imp.closePnL / (avgCost * imp.closeQty)) * 100.0;
+        std::snprintf(buf, sizeof(buf), "  %s  ·  %.0f sh  ·  est. PnL %+.2f (%+.2f%%)",
+                      kindStr, imp.closeQty, imp.closePnL, pctPnL);
+    }
+    ImGui::TextUnformatted(buf);
+
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+}
+
+// ============================================================================
+// DrawUnguardedStrip — yellow protective-stop warning above the order entry
+// panel. "Place stop" pre-populates the order-entry buffers (StopLimit on the
+// opposite side of the position) and triggers the existing confirmation modal,
+// so the user reviews the order before sending. "Dismiss" hides the warning
+// for this symbol until the position quantity changes.
+// ============================================================================
+void TradingWindow::DrawUnguardedStrip() {
+    if (!m_unguarded.active)               return;
+    if (m_unguarded.symbol != m_symbol)    return;
+    if (m_dismissedUnguarded.count(m_symbol)) return;
+    if (m_unguarded.stopTrig <= 0.0)       return;
+
+    bool   isLong = (m_unguarded.qty > 0.0);
+    double absQty = std::abs(m_unguarded.qty);
+
+    static constexpr ImVec4 kStripBg     = ImVec4(0.30f, 0.24f, 0.05f, 0.90f);
+    static constexpr ImVec4 kStripBorder = ImVec4(1.00f, 0.80f, 0.20f, 0.90f);
+    static constexpr ImVec4 kWarnText    = ImVec4(1.00f, 0.85f, 0.25f, 1.00f);
+
+    float stripH = ImGui::GetTextLineHeightWithSpacing()
+                 + ImGui::GetStyle().FramePadding.y * 2.0f + 6.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, kStripBg);
+    ImGui::PushStyleColor(ImGuiCol_Border,  kStripBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+    ImGui::BeginChild("##trade_unguarded", ImVec2(-1, stripH),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
+
+    FlexRow row;
+
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "WARNING  %s %s %.0f sh @ $%.2f - no protective stop. "
+                  "Suggested $%.2f (-%.2f%%).",
+                  m_symbol,
+                  isLong ? "long" : "short",
+                  absQty,
+                  m_unguarded.avgCost,
+                  m_unguarded.stopTrig,
+                  m_unguarded.pctRisk);
+    row.item(FlexRow::textW(msg), 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarnText);
+    ImGui::TextUnformatted(msg);
+    ImGui::PopStyleColor();
+
+    bool placeClicked   = false;
+    bool dismissClicked = false;
+
+    const float kPlaceW   = em(110);
+    const float kDismissW = em(80);
+
+    row.item(kPlaceW, 12);
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.42f, 0.10f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.60f, 0.18f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.42f, 0.32f, 0.06f, 1.f));
+    placeClicked = ImGui::Button("Place stop", ImVec2(kPlaceW, 0));
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Pre-fill the Order Entry with a Stop-Limit on the "
+                          "opposite side of the position; review before sending.");
+
+    row.item(kDismissW, 4);
+    dismissClicked = ImGui::Button("Dismiss", ImVec2(kDismissW, 0));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hide this warning until the position quantity "
+                          "changes.");
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+
+    if (dismissClicked) {
+        m_dismissedUnguarded.insert(m_symbol);
+        return;
+    }
+
+    if (placeClicked) {
+        // Pre-populate the order-entry fields so the existing
+        // DrawConfirmationPopup() reads the right values, then trigger it.
+        m_sideIdx = isLong ? 1 : 0;     // Sell for long, Buy for short
+        m_typeIdx = 3;                  // StopLimit
+        m_tifIdx  = 0;                  // DAY
+        m_outsideRth = false;
+        std::snprintf(m_qtyBuf, sizeof(m_qtyBuf), "%.0f", absQty);
+        std::snprintf(m_stpBuf, sizeof(m_stpBuf), "%.2f", m_unguarded.stopTrig);
+        std::snprintf(m_lmtBuf, sizeof(m_lmtBuf), "%.2f", m_unguarded.stopLmt);
+        m_showConfirm = true;
+    }
+}
+
 // ============================================================================
 // Prune old terminal orders so the list doesn't grow unbounded
 // ============================================================================
@@ -1709,7 +2085,8 @@ void TradingWindow::DrawOpenOrders() {
     ImGuiTableFlags tblFlags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
-        ImGuiTableFlags_SizingFixedFit;
+        ImGuiTableFlags_SizingFixedFit |
+        ImGuiTableFlags_Resizable;
 
     if (!ImGui::BeginTable("##orders", 14, tblFlags)) return;
 
@@ -1914,7 +2291,8 @@ void TradingWindow::DrawExecutionLog() {
 
     ImGuiTableFlags tblFlags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp |
+        ImGuiTableFlags_Resizable;
 
     if (!ImGui::BeginTable("##fills", 7, tblFlags)) return;
 
@@ -1965,7 +2343,8 @@ void TradingWindow::DrawTimeSales() {
 
     static ImGuiTableFlags flags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit;
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit |
+        ImGuiTableFlags_Resizable;
 
     if (!ImGui::BeginTable("##ts", 5, flags, ImVec2(-1, -1))) return;
 

@@ -52,6 +52,11 @@ public:
     void OnPnL(double daily, double unrealized, double realized);
     void OnPnLSingle(int reqId, const std::string& symbol, double daily);
 
+    // Read-only accessor — main.cpp's GetSelectedAccountEquity() bridges the
+    // value out to ChartWindow's setup-suggestion sizing. Returns 0 before the
+    // first accountSummary() callback fires.
+    [[nodiscard]] double netLiquidation() const { return m_account.netLiquidation; }
+
 private:
     // ---- Window state -------------------------------------------------------
     bool m_open = true;

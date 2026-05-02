@@ -17,6 +17,7 @@
 #include <cmath>
 #include <unordered_map>
 #include <filesystem>
+#include <deque>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
@@ -235,6 +236,235 @@ static void UpdateChartPosition(ui::ChartWindow* win) {
 static void UpdateAllChartPositions() {
     for (auto& e : g_chartEntries) UpdateChartPosition(e.win);
 }
+
+// External linkage: ChartWindow.cpp forward-declares this and calls it from
+// ComputeSetupPlan() to size the suggested entry. Returns 0.0 before the first
+// accountSummary() callback fires (or when no portfolio window is alive); the
+// share-count helper treats 0 as "size unknown" and skips the share field.
+double GetSelectedAccountEquity() {
+    if (!g_PortfolioWindow) return 0.0;
+    return g_PortfolioWindow->netLiquidation();
+}
+
+// ----------------------------------------------------------------------------
+// Unguarded-position guard — Task C
+//
+// An "unguarded position" is one with non-zero quantity that has NO active
+// protective Stop / StopLimit / Trail / TrailLimit order on the same symbol
+// covering the position quantity. When any such position is detected the
+// matching ChartWindow + TradingWindow show a yellow warning strip with a
+// one-click "Place stop" button.
+//
+// `g_unguarded` is recomputed on every position/order callback (cheap O(N×M)
+// walk, no IB calls). The actual stop *price* is filled in once per frame by
+// PushUnguardedHintsToWindows() because it depends on the chart instance's
+// auto-detected S/R levels.
+// ----------------------------------------------------------------------------
+struct UnguardedPosition {
+    std::string symbol;
+    long        conId   = 0;
+    double      qty     = 0.0;       // signed
+    double      avgCost = 0.0;
+};
+static std::vector<UnguardedPosition> g_unguarded;
+
+// Push the current unguarded list to all chart/trading windows, computing each
+// chart's protective-stop suggestion from its own auto-detected S/R. Called
+// once per frame from RenderTradingUI() right before window Render() calls.
+//
+// For each ChartWindow / TradingWindow, exactly one matching unguarded symbol
+// produces an `active=true` hint; everything else gets `active=false` so
+// stale strips clear automatically. If a chart instance hasn't run
+// auto-analysis yet (no S/R, no ATR) we still send `active=true` with stop=0,
+// but the strip self-suppresses on `stopTrig <= 0`.
+static void PushUnguardedHintsToWindows();
+
+static void RecomputeUnguardedPositions() {
+    g_unguarded.clear();
+
+    auto isProtectiveType = [](core::OrderType t) {
+        return t == core::OrderType::Stop       ||
+               t == core::OrderType::StopLimit  ||
+               t == core::OrderType::Trail      ||
+               t == core::OrderType::TrailLimit;
+    };
+    auto isLiveStatus = [](core::OrderStatus s) {
+        return s == core::OrderStatus::Pending       ||
+               s == core::OrderStatus::Working       ||
+               s == core::OrderStatus::PartialFill   ||
+               s == core::OrderStatus::PendingCancel;
+    };
+
+    for (const auto& [sym, pos] : g_positions) {
+        if (std::abs(pos.quantity) < 1e-9) continue;          // flat
+        bool isLong   = (pos.quantity > 0.0);
+        core::OrderSide needSide = isLong ? core::OrderSide::Sell
+                                          : core::OrderSide::Buy;
+        bool hasStop = false;
+        for (const auto& [oid, ord] : g_liveOrders) {
+            if (ord.symbol != sym)            continue;
+            if (ord.side   != needSide)       continue;
+            if (!isLiveStatus(ord.status))    continue;
+            if (!isProtectiveType(ord.type))  continue;
+            if (ord.quantity <= 1e-9)         continue;
+            hasStop = true;
+            break;
+        }
+        if (!hasStop) {
+            g_unguarded.push_back({ sym, pos.conId, pos.quantity, pos.avgCost });
+        }
+    }
+}
+
+static void PushUnguardedHintsToWindows() {
+    // Read the global setup-suggestion knobs straight from any live ChartWindow
+    // — they're per-instance settings, but for the protective-stop sizing all
+    // we need is the (atrPad, roundPad, stopOffset) tuple. The plan defaults
+    // are the right starting point for v1; users tune per-chart and the chart
+    // picks its own levels anyway.
+    constexpr double kAtrPad     = 0.5;
+    constexpr double kRoundPad   = 0.07;
+    constexpr double kStopOffset = 0.10;
+
+    auto buildHintFromChart = [&](ui::ChartWindow* ch, const std::string& sym,
+                                  double qty, double avgCost) -> ui::ChartWindow::UnguardedHint {
+        ui::ChartWindow::UnguardedHint h;
+        h.symbol  = sym;
+        h.qty     = qty;
+        h.avgCost = avgCost;
+
+        if (!ch) return h;
+        auto snap = ch->getAutoLevels();
+        if (snap.atrLast <= 0.0) return h;
+
+        bool isLong = qty > 0.0;
+        const auto& levels = isLong ? snap.supports : snap.resistances;
+        auto stop = core::services::SuggestStopForPosition(
+            isLong, avgCost, levels, snap.atrLast,
+            kAtrPad, kRoundPad, kStopOffset);
+        if (!stop.valid) return h;
+
+        h.active   = true;
+        h.stopTrig = stop.stop;
+        h.stopLmt  = stop.stopLmt;
+        h.pctRisk  = stop.pctRisk;
+        return h;
+    };
+
+    // Map: symbol -> first ChartWindow with that symbol (used to source S/R for
+    // TradingWindows on the same symbol).
+    std::unordered_map<std::string, ui::ChartWindow*> symToChart;
+    for (auto& ce : g_chartEntries) {
+        if (!ce.win) continue;
+        const std::string s = ce.win->getSymbol();
+        if (!s.empty() && symToChart.find(s) == symToChart.end())
+            symToChart[s] = ce.win;
+    }
+
+    auto findUnguarded = [&](const std::string& sym) -> const UnguardedPosition* {
+        for (const auto& u : g_unguarded)
+            if (u.symbol == sym) return &u;
+        return nullptr;
+    };
+
+    // Push to each chart window — uses its own getAutoLevels().
+    for (auto& ce : g_chartEntries) {
+        if (!ce.win) continue;
+        const std::string sym = ce.win->getSymbol();
+        const UnguardedPosition* up = findUnguarded(sym);
+        if (!up) {
+            ui::ChartWindow::UnguardedHint cleared;
+            cleared.symbol = sym;
+            ce.win->SetUnguardedSuggestion(cleared);
+            continue;
+        }
+        ce.win->SetUnguardedSuggestion(
+            buildHintFromChart(ce.win, sym, up->qty, up->avgCost));
+    }
+
+    // Push to each trading window — borrow S/R from the matching chart, if any.
+    for (auto& te : g_tradingEntries) {
+        if (!te.win) continue;
+        const std::string sym = te.win->getSymbol();
+        const UnguardedPosition* up = findUnguarded(sym);
+        if (!up) {
+            ui::TradingWindow::UnguardedHint cleared;
+            cleared.symbol = sym;
+            te.win->SetUnguardedSuggestion(cleared);
+            continue;
+        }
+        ui::ChartWindow* sourceChart = nullptr;
+        auto it = symToChart.find(sym);
+        if (it != symToChart.end()) sourceChart = it->second;
+        ui::ChartWindow::UnguardedHint ch = buildHintFromChart(
+            sourceChart, sym, up->qty, up->avgCost);
+        // Plan §3f: if no chart S/R is available, suppress the warning (v1).
+        ui::TradingWindow::UnguardedHint th;
+        th.symbol   = ch.symbol;
+        th.active   = ch.active;
+        th.qty      = ch.qty;
+        th.avgCost  = ch.avgCost;
+        th.stopTrig = ch.stopTrig;
+        th.stopLmt  = ch.stopLmt;
+        th.pctRisk  = ch.pctRisk;
+        te.win->SetUnguardedSuggestion(th);
+    }
+
+    // Push S/R levels to each trading window from the matching chart (if any).
+    // Uses the same symToChart map built above. When no chart is open for the
+    // symbol, clears the levels so stale markers from a previous symbol don't
+    // linger.
+    for (auto& te : g_tradingEntries) {
+        if (!te.win) continue;
+        const std::string sym = te.win->getSymbol();
+        if (sym.empty()) continue;
+        auto it = symToChart.find(sym);
+        if (it != symToChart.end() && it->second) {
+            auto snap = it->second->getAutoLevels();
+            std::vector<double> sPrices, rPrices;
+            sPrices.reserve(snap.supports.size());
+            rPrices.reserve(snap.resistances.size());
+            for (const auto& L : snap.supports)    sPrices.push_back(L.price);
+            for (const auto& L : snap.resistances) rPrices.push_back(L.price);
+            te.win->SetAutoLevels(sPrices, rPrices, snap.atrLast);
+        } else {
+            te.win->SetAutoLevels({}, {}, 0.0);
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Trading-style mode-switch queue — Phase 13
+//
+// Switching a chart's TradingStyle re-issues its historical-data subscription
+// with the new (timeframe + duration). When many charts switch at once
+// (e.g. user opens 10 charts and bulk-picks a mode), we throttle to one
+// IB request per second to stay well under IB's
+// 60-requests-per-10-min-per-contract pacing limit.
+//
+// Latest-wins: enqueueing a switch for a chart drops any prior pending entry
+// for the same chartIdx, so spamming the combo settles on the last pick
+// rather than hopping through every intermediate mode.
+//
+// The symbol + useRTH are read at drain time (not enqueue time) so a symbol
+// change between enqueue and drain doesn't strand the wrong contract.
+// ----------------------------------------------------------------------------
+struct PendingStyleSwitch {
+    int                          chartIdx;
+    core::services::TradingStyle style;
+    std::string                  historyDuration;
+    bool                         useRTH;
+};
+static std::deque<PendingStyleSwitch> g_pendingStyleSwitches;
+static double                         g_nextStyleSwitchAllowed = 0.0;
+static constexpr double               kStyleSwitchThrottleSec  = 1.0;
+
+// Persistence flag — set by OnStyleChange (declared below in SpawnChartWindow),
+// flushed once per second from RenderTradingUI(). Defined here so the lambda
+// can capture it without forward-declaration tricks.
+static bool   g_chartModesDirty    = false;
+static double g_lastChartModesSave = 0.0;
+
 static int g_newsItemId    = 10000;  // unique IDs for real-time market news items
 static int g_histNewsId    = 20000;  // unique IDs for historical news items
 static std::vector<std::string> g_portfolioSymbols;  // known held symbols
@@ -601,16 +831,23 @@ static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
 // ============================================================================
 
 // Issue / re-issue a historical + market-data subscription for a chart instance.
+// `durationOverride` is empty for the default-per-timeframe path; the
+// trading-style queue passes the preset's `historyDuration` (e.g. "2 D" / "5 Y")
+// so the prefetch covers the right horizon for the chosen mode.
 static void ReqChartData(int histId, int mktId,
                          const std::string& sym, core::Timeframe tf, bool useRTH,
-                         core::BarSeries& pendingBars) {
+                         core::BarSeries& pendingBars,
+                         const std::string& durationOverride = "") {
     if (!g_IBClient) return;
     g_IBClient->CancelHistoricalData(histId);
     pendingBars         = core::BarSeries{};
     pendingBars.symbol  = sym;
     pendingBars.timeframe = tf;
+    const char* duration = durationOverride.empty()
+                               ? core::TimeframeIBDuration(tf)
+                               : durationOverride.c_str();
     g_IBClient->ReqHistoricalData(histId, sym,
-                                  core::TimeframeIBDuration(tf),
+                                  duration,
                                   core::TimeframeIBBarSize(tf),
                                   useRTH);
     if (g_tickerSymbols[mktId] != sym) {
@@ -621,6 +858,45 @@ static void ReqChartData(int histId, int mktId,
         for (auto& ce : g_chartEntries)
             if (ce.mktId == mktId) { ce.bboExchange.clear(); if (ce.win) ce.win->SetExchangeList({"SMART"}); }
     }
+}
+
+// Pop one pending style switch per `kStyleSwitchThrottleSec`. Called from
+// RenderTradingUI() each frame; cheap empty-list early-out keeps idle cost
+// flat. Cancels any in-flight extend-history request on the same chart so
+// older bars from the previous timeframe can't land into the new series.
+static void DrainStyleSwitchQueue() {
+    if (g_pendingStyleSwitches.empty() || !g_IBClient) return;
+    double now = glfwGetTime();
+    if (now < g_nextStyleSwitchAllowed) return;
+
+    auto p = g_pendingStyleSwitches.front();
+    g_pendingStyleSwitches.pop_front();
+
+    if (p.chartIdx < 0 || p.chartIdx >= (int)g_chartEntries.size()) return;
+    auto& ce = g_chartEntries[p.chartIdx];
+    if (!ce.win) return;
+
+    // Cancel any in-flight extend-history request — older bars from the
+    // previous TF could otherwise land into the new series.
+    g_IBClient->CancelHistoricalData(ce.extId);
+    ce.pendingExtBars = core::BarSeries{};
+
+    // Read symbol + useRTH at drain time, not enqueue time, so a symbol change
+    // between the user's combo click and this frame doesn't strand the wrong
+    // contract. For Free mode, also recompute duration from the chart's
+    // current TF so a TF change between two enqueues + a drain in between
+    // never produces a TF/duration mismatch.
+    const std::string sym = ce.win->getSymbol();
+    if (sym.empty()) return;
+
+    std::string duration = p.historyDuration;
+    if (p.style == core::services::TradingStyle::Free)
+        duration = core::TimeframeIBDuration(ce.win->getTimeframe());
+
+    ReqChartData(ce.histId, ce.mktId, sym, ce.win->getTimeframe(),
+                 p.useRTH, ce.pendingBars, duration);
+
+    g_nextStyleSwitchAllowed = now + kStyleSwitchThrottleSec;
 }
 
 static void SpawnChartWindow(int idx) {
@@ -661,6 +937,22 @@ static void SpawnChartWindow(int idx) {
                                       core::TimeframeIBDuration(tf),
                                       core::TimeframeIBBarSize(tf),
                                       useRTH, endDT);
+    };
+
+    // Trading-style mode switch — push to the throttled queue so we don't
+    // exceed IB's pacing limit when many charts switch at once. Drop any
+    // previously-queued switch for this chart so spamming the combo settles
+    // on the latest pick rather than walking through every intermediate mode.
+    e.win->OnStyleChange = [idx](core::services::TradingStyle s,
+                                 const std::string& historyDuration,
+                                 bool useRTH) {
+        for (auto it = g_pendingStyleSwitches.begin();
+             it != g_pendingStyleSwitches.end(); ) {
+            if (it->chartIdx == idx) it = g_pendingStyleSwitches.erase(it);
+            else                     ++it;
+        }
+        g_pendingStyleSwitches.push_back({ idx, s, historyDuration, useRTH });
+        g_chartModesDirty = true;
     };
 
     e.win->OnOrderSubmit = [](const core::Order& o) {
@@ -889,6 +1181,89 @@ struct WatchlistSaveBlock {
     std::vector<core::Watchlist> watchlists;
 };
 
+// ============================================================================
+// Chart-mode persistence (Phase 13 — Trading-Style Modes)
+//
+// Stores per-chart `(instanceIdx, symbol, TradingStyle [+ TF for Free])` so a
+// kill-and-restart returns each chart to its last-set mode. Symbol is part of
+// the key so a saved "AAPL = Scalping" doesn't reapply when the user has since
+// changed that chart's symbol — we fall back to the default Swing in that case.
+//
+// Format:
+//   INSTANCE:0
+//   SYMBOL:AAPL
+//   STYLE:2          (integer enum value; 0=Scalping, 1=DayTrading, 2=Swing, 3=Investment, 4=Free)
+//   TF:6             (optional; only written when STYLE==Free. Integer Timeframe enum value.)
+// ============================================================================
+static std::string ChartModesFilePath() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    return std::string(home) + "/.config/ibkr-trading-app/chart-modes.cfg";
+}
+
+struct ChartModeBlock {
+    int         instanceIdx = 0;   // 0-based index, matches g_chartEntries position
+    std::string symbol;
+    int         style       = (int)core::services::TradingStyle::Swing;
+    int         timeframe   = -1;  // -1 = use preset's TF; non-negative = override (Free mode)
+};
+
+static void SaveChartModesFile() {
+    if (g_chartEntries.empty()) return;
+    EnsureWatchlistConfigDir();   // same ~/.config/ibkr-trading-app/ root
+    std::string path = ChartModesFilePath();
+    std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp);
+        if (!f.is_open()) return;
+        for (int i = 0; i < (int)g_chartEntries.size(); ++i) {
+            const auto& ce = g_chartEntries[i];
+            if (!ce.win) continue;
+            std::string sym = ce.win->getSymbol();
+            if (sym.empty()) continue;
+            f << "INSTANCE:" << i << "\n";
+            f << "SYMBOL:"   << sym << "\n";
+            auto style = ce.win->tradingStyle();
+            f << "STYLE:"    << (int)style << "\n";
+            // Free mode: also persist the user-picked TF so a restart
+            // restores the chart to the same bar size.
+            if (style == core::services::TradingStyle::Free)
+                f << "TF:"   << (int)ce.win->getTimeframe() << "\n";
+        }
+    }
+    std::rename(tmp.c_str(), path.c_str());
+}
+
+static std::vector<ChartModeBlock> LoadChartModesFromFile() {
+    std::vector<ChartModeBlock> result;
+    std::ifstream f(ChartModesFilePath());
+    if (!f.is_open()) return result;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() >= 9 && line.substr(0, 9) == "INSTANCE:") {
+            ChartModeBlock b;
+            try { b.instanceIdx = std::stoi(line.substr(9)); } catch (...) {}
+            result.push_back(std::move(b));
+        } else if (!result.empty() && line.size() >= 7 && line.substr(0, 7) == "SYMBOL:") {
+            result.back().symbol = line.substr(7);
+        } else if (!result.empty() && line.size() >= 6 && line.substr(0, 6) == "STYLE:") {
+            try {
+                int v = std::stoi(line.substr(6));
+                if (v >= 0 && v <= (int)core::services::TradingStyle::Free)
+                    result.back().style = v;
+            } catch (...) {}
+        } else if (!result.empty() && line.size() >= 3 && line.substr(0, 3) == "TF:") {
+            try {
+                int v = std::stoi(line.substr(3));
+                if (v >= (int)core::Timeframe::M1 && v <= (int)core::Timeframe::MN)
+                    result.back().timeframe = v;
+            } catch (...) {}
+        }
+    }
+    return result;
+}
+
 static std::vector<WatchlistSaveBlock> LoadWatchlistsFromFile() {
     std::vector<WatchlistSaveBlock> result;
     std::ifstream f(WatchlistsFilePath());
@@ -1011,6 +1386,13 @@ static void CreateTradingWindows() {
 
 static void DestroyTradingWindows() {
     SaveWatchlistsFile();
+    // Synchronous flush of any unsaved chart-mode changes before the windows
+    // are torn down. Only writes if something has changed since the last
+    // once-per-second flush (or never saved at all this session).
+    if (g_chartModesDirty) {
+        SaveChartModesFile();
+        g_chartModesDirty = false;
+    }
 
     for (auto& e : g_chartEntries)   { delete e.win; e.win = nullptr; }
     for (auto& e : g_tradingEntries) { delete e.win; e.win = nullptr; }
@@ -1070,6 +1452,67 @@ static void FinishConnect(bool isReconnect) {
             }
         }
 
+        // Restore persisted chart-mode selection (Phase 13). For each saved
+        // block: stamp the chart's symbol, apply the style silently (sets
+        // timeframe + auto/setup defaults, clears buffers), then issue the
+        // historical+market-data subscription with the preset's history
+        // horizon. Skips the regular AAPL seed below for any chart that was
+        // restored from disk (tracked via `restoredCharts`).
+        std::vector<bool> restoredCharts(g_chartEntries.size(), false);
+        {
+            auto savedModes = LoadChartModesFromFile();
+            for (const auto& b : savedModes) {
+                if (b.instanceIdx < 0 ||
+                    b.instanceIdx >= (int)g_chartEntries.size()) continue;
+                auto& ce = g_chartEntries[b.instanceIdx];
+                if (!ce.win || b.symbol.empty()) continue;
+
+                auto style  = static_cast<core::services::TradingStyle>(b.style);
+                auto preset = core::services::GetPreset(style);
+
+                // Apply style silently first — updates m_timeframe + settings
+                // and clears every derived buffer, so the prefetch lands into
+                // a clean slate. Note: setTradingStyle(Free) preserves the
+                // chart's current m_timeframe; for restore we want the saved
+                // TF if available, so we apply that after via setTimeframeFree.
+                ce.win->setTradingStyle(style, /*silent=*/true);
+
+                // Determine the effective TF + duration. Free mode honours the
+                // saved per-chart TF (when present); other modes are bound to
+                // the preset's TF.
+                core::Timeframe tf       = preset.timeframe;
+                std::string     duration = preset.historyDuration;
+                if (style == core::services::TradingStyle::Free && b.timeframe >= 0) {
+                    tf = static_cast<core::Timeframe>(b.timeframe);
+                    ce.win->setTimeframeFree(tf, /*silent=*/true);
+                    duration = core::TimeframeIBDuration(tf);
+                } else if (style == core::services::TradingStyle::Free) {
+                    // No saved TF: use whatever setTradingStyle preserved
+                    // (the construction-default D1) and its dynamic duration.
+                    tf       = ce.win->getTimeframe();
+                    duration = core::TimeframeIBDuration(tf);
+                }
+
+                // Stamp the symbol. SetSymbol fires OnDataRequest with the
+                // *default* duration; the ReqChartData call below cancels
+                // that in-flight request and re-issues with the preset
+                // horizon, so the only on-wire request uses the right span.
+                ce.win->SetSymbol(b.symbol);
+                // Daily / Weekly / Monthly bars: useRTH=true (no extended-
+                // hours concept on those frames). Intraday: useRTH=false (the
+                // m_useRTH default for a freshly created chart).
+                bool isIntra = (tf != core::Timeframe::D1 &&
+                                tf != core::Timeframe::W1 &&
+                                tf != core::Timeframe::MN);
+                ReqChartData(ce.histId, ce.mktId, b.symbol, tf,
+                             /*useRTH=*/!isIntra,
+                             ce.pendingBars, duration);
+                restoredCharts[b.instanceIdx] = true;
+            }
+            // Loading from disk is not a user-initiated change.
+            g_chartModesDirty = false;
+        }
+
         g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
         g_IBClient->ReqPositions();
         g_IBClient->ReqAccountSummary(ACCT_SUMMARY_REQID, ACCT_SUMMARY_TAGS);
@@ -1080,7 +1523,7 @@ static void FinishConnect(bool isReconnect) {
             g_IBClient->CancelScannerData(se.activeScanId);
 
         const std::string sym = "AAPL";
-        if (!g_chartEntries.empty()) {
+        if (!g_chartEntries.empty() && !restoredCharts[0]) {
             auto& ce = g_chartEntries[0];
             ce.pendingBars.symbol    = sym;
             ce.pendingBars.timeframe = core::Timeframe::D1;
@@ -1466,6 +1909,18 @@ static void WireIBCallbacks() {
             else
                 g_PortfolioWindow->OnAccountEnd();
         }
+        // Mirror to g_positions so RecomputeUnguardedPositions sees this side
+        // of the feed too. onPortfolioUpdate populates g_positions for held
+        // symbols, but onPositionData is the canonical truth for quantity.
+        if (!done && std::abs(pos.quantity) > 1e-9) {
+            auto pit = g_positions.find(pos.symbol);
+            double savedDailyPnL = (pit != g_positions.end()) ? pit->second.dailyPnL : 0.0;
+            g_positions[pos.symbol] = pos;
+            g_positions[pos.symbol].dailyPnL = savedDailyPnL;
+        } else if (!done && std::abs(pos.quantity) < 1e-9) {
+            // Flat — drop from the cache so the warning clears.
+            g_positions.erase(pos.symbol);
+        }
         // Accumulate symbols; on done push to scanner and news window
         if (!done) {
             auto it = std::find(g_portfolioSymbols.begin(),
@@ -1481,6 +1936,7 @@ static void WireIBCallbacks() {
             for (auto& ne : g_newsEntries)
                 if (ne.win) ne.win->SetPortfolioSymbols(g_portfolioSymbols);
         }
+        RecomputeUnguardedPositions();
     };
 
     // ── Portfolio updates (P&L etc.) ──────────────────────────────────────
@@ -1507,6 +1963,7 @@ static void WireIBCallbacks() {
         // Subscribe WSH events for this position in the calendar window.
         if (pos.conId > 0 && g_WshCalendarWindow)
             g_WshCalendarWindow->SubscribeConId(static_cast<int>(pos.conId), pos.symbol);
+        RecomputeUnguardedPositions();
     };
 
     // ── Open orders (full detail on submit / reqOpenOrders) ───────────────
@@ -1514,6 +1971,7 @@ static void WireIBCallbacks() {
         g_liveOrders[order.orderId] = order;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
         UpdateAllChartPendingOrders();
+        RecomputeUnguardedPositions();
     };
     g_IBClient->onOpenOrderEnd = []() {
         // nothing extra needed — data already pushed via onOpenOrder
@@ -1534,6 +1992,7 @@ static void WireIBCallbacks() {
             it->second.avgFillPrice = avgPrice;
         }
         UpdateAllChartPendingOrders();
+        RecomputeUnguardedPositions();
     };
 
     // ── Fills ─────────────────────────────────────────────────────────────
@@ -2277,9 +2736,30 @@ static void ApplyPreset(const core::WindowPreset& p) {
 // Window resize (borderless window — manual edge/corner drag)
 // ============================================================================
 static void HandleWindowResize() {
+    // Drag/resize state needs to be visible early so we can let an in-progress
+    // resize continue when the cursor crosses out of the main window.
+    static bool  s_resizing = false;
+    static int   s_edge     = 0;
+    static float s_startMX  = 0, s_startMY = 0;
+    static int   s_startWX  = 0, s_startWY = 0, s_startWW = 0, s_startWH = 0;
+
     // No resize while the title bar is being dragged, or when maximized
     if (g_tbDragging) return;
     if (glfwGetWindowAttrib(g_AppWindow, GLFW_MAXIMIZED)) return;
+
+    // ImGuiConfigFlags_ViewportsEnable lets ImGui detach windows into separate
+    // OS-level GLFW windows. glfwGetCursorPos still returns coordinates
+    // relative to the main window, so the edge math below would mis-fire when
+    // a floating viewport sits over (or past) the main window's border —
+    // dragging the floating window would resize the main window instead.
+    // GLFW_HOVERED is false whenever another window is between the cursor
+    // and the main window's content. Skip in that case, but let an
+    // already-running resize finish even if the cursor leaves the window.
+    const bool mainHovered = glfwGetWindowAttrib(g_AppWindow, GLFW_HOVERED) == GLFW_TRUE;
+    if (!mainHovered && !s_resizing) {
+        glfwSetCursor(g_AppWindow, nullptr); // clear any leftover resize cursor
+        return;
+    }
 
     constexpr int kEdge   = 5;  // px — edge-only detection zone
     constexpr int kCorner = 16; // px — corner detection zone (must be > kEdge)
@@ -2333,7 +2813,6 @@ static void HandleWindowResize() {
 #endif
 
     // Update cursor shape when not already dragging
-    static bool s_resizing = false;
     if (!s_resizing) {
         GLFWcursor* cur = nullptr;
         switch (edge) {
@@ -2346,11 +2825,7 @@ static void HandleWindowResize() {
         glfwSetCursor(g_AppWindow, cur);
     }
 
-    // Track drag state using global mouse coords (io.MousePos = screen space)
-    static int  s_edge = 0;
-    static float s_startMX = 0, s_startMY = 0;
-    static int   s_startWX = 0, s_startWY = 0, s_startWW = 0, s_startWH = 0;
-
+    // Resize math uses global mouse coords (io.MousePos = screen space).
     const ImGuiIO& io = ImGui::GetIO();
     const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left);
 
@@ -2821,6 +3296,24 @@ static void RenderTradingUI() {
     }
     ImGui::PopStyleColor(); // MenuBarBg
     ImGui::End();
+
+    // Drain at most one trading-style switch per second so a bulk-mode-change
+    // doesn't blow past IB's per-contract pacing limit.
+    DrainStyleSwitchQueue();
+
+    // Once-per-second flush of chart-modes.cfg if any switch happened.
+    if (g_chartModesDirty) {
+        double now = glfwGetTime();
+        if (now - g_lastChartModesSave > 1.0) {
+            SaveChartModesFile();
+            g_lastChartModesSave = now;
+            g_chartModesDirty    = false;
+        }
+    }
+
+    // Push the unguarded-position warning hints once per frame using each
+    // chart's freshly-detected S/R. Cheap (positions × charts is small).
+    PushUnguardedHintsToWindows();
 
     // Render all window instances
     for (auto& ce : g_chartEntries)   if (ce.win) ce.win->Render();

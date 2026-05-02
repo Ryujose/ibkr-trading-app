@@ -170,7 +170,7 @@ bool PortfolioWindow::Render()
                              ImGuiWindowFlags_NoScrollWithMouse |
                              ImGuiWindowFlags_NoFocusOnAppearing;
 
-    if (!ImGui::Begin("Portfolio & Account", &m_open, flags)) {
+    if (!ImGui::Begin("Portfolio && Account###Portfolio", &m_open, flags)) {
         ImGui::End();
         return m_open;
     }
@@ -497,6 +497,12 @@ void PortfolioWindow::DrawPositionsTable()
 
 void PortfolioWindow::DrawColumnChooserPopup()
 {
+    // Centre over this window's viewport so the popup is visible
+    // when the portfolio window is undocked on an external monitor.
+    // BeginPopup() calls ClearFlags() when the popup is closed, so
+    // SetNextWindowPos cannot leak to other Begin* calls.
+    ImVec2 center = ImGui::GetWindowViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopup("##PosColChooser")) return;
     ImGui::TextUnformatted("Visible Columns");
     ImGui::Separator();

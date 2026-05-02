@@ -690,6 +690,16 @@ void WatchlistWindow::DrawToolbar() {
         ImGui::OpenPopup("Save Preset##wlsavepop");
         m_savePopupOpen = false;
     }
+
+    // Centre over this window's viewport, not the main viewport.  When the
+    // watchlist is undocked into a separate OS window (ImGuiConfigFlags_Viewports
+    // Enable), GetMainViewport() would render the modal in the primary GLFW
+    // window — invisible to the user, while still blocking all ImGui input so
+    // every window appears frozen.
+    ImVec2 center = ImGui::GetWindowViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(em(260), 0), ImGuiCond_Always);
+
     if (ImGui::BeginPopupModal("Save Preset##wlsavepop", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted("Preset name:");

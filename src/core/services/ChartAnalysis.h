@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 
 namespace core::services {
@@ -355,6 +356,448 @@ inline std::vector<BreakoutMark> FindBreakouts(
         }
     }
     return out;
+}
+
+// ─── Round to tick increment ────────────────────────────────────────────────
+// IB rejects prices finer than the contract's `minTick` with error 110
+// ("price does not conform to the minimum price variation"). Most US stocks
+// above $1 use $0.01; below $1 they use $0.0001; options are typically $0.05.
+// All arithmetic in `AvoidRoundNumber` and `SuggestSetup` / `SuggestStopForPosition`
+// involves non-representable fractions like 0.07 / 0.10 that leak ULP-level
+// drift, so the public-facing prices must be snapped back to the tick grid
+// before they go anywhere near `placeOrder()`.
+//
+// `tick = 0.0` is treated as a no-op so callers can opt out (e.g. in tests).
+inline double RoundToTick(double price, double tick = 0.01) {
+    if (tick <= 0.0) return price;
+    return std::round(price / tick) * tick;
+}
+
+// ─── Round-number avoidance (SL-hunter defense) ─────────────────────────────
+// Stops cluster at .00 / .25 / .50 / .75 marks because retail stops do too.
+// Adjust `price` so it is at least `pad` dollars away from the nearest mark.
+//   pushDown = true  → push *further down* if too close (use for stops below)
+//   pushDown = false → push *further up*   if too close (use for stops above)
+// Returns the input unchanged when already safe, when pad ≤ 0, or when the
+// price is too small to safely apply the padding (price ≤ pad).
+inline double AvoidRoundNumber(double price, double pad, bool pushDown) {
+    if (pad <= 0.0 || price <= pad) return price;
+    static constexpr double kMarks[] = { 0.00, 0.25, 0.50, 0.75, 1.00 };
+    double base    = std::floor(price);
+    double frac    = price - base;
+    double nearest = 0.0;
+    double bestD   = std::numeric_limits<double>::infinity();
+    for (double r : kMarks) {
+        double d = std::abs(frac - r);
+        if (d < bestD) { bestD = d; nearest = r; }
+    }
+    if (bestD >= pad) return price;
+    return pushDown ? base + (nearest - pad)
+                    : base + (nearest + pad);
+}
+
+// ─── Position sizing ────────────────────────────────────────────────────────
+// Risk-based share count: floor((riskPct/100 × equity) / |entry - stop|).
+// Returns 0 on degenerate input — caller treats 0 as "size unknown".
+inline int PositionSizeShares(double equity, double riskPct,
+                              double entry, double stop) {
+    if (equity <= 0.0 || riskPct <= 0.0) return 0;
+    double dist = std::abs(entry - stop);
+    if (dist <= 0.0) return 0;
+    double riskDollars = (riskPct / 100.0) * equity;
+    return static_cast<int>(std::floor(riskDollars / dist));
+}
+
+// ─── Setup suggestion (long or short) ───────────────────────────────────────
+// Reference-only trade plan derived from the active supply/demand signal.
+// Caller picks the active zone and the nearest opposing level via the existing
+// KeepTopN result; this helper just assembles entry / stop / target.
+//
+//   side             1 = long, 0 = short (other values → invalid)
+//   zoneTop/zoneBot  buffered zone bounds (m_breakoutZoneTop / m_breakoutZoneBot)
+//   anchor           Level.minPrice of the demand zone (long) or
+//                    Level.maxPrice of the supply zone (short) — the longest-wick
+//                    edge, used as the structural anchor for the SL
+//   opposingLevel    nearest resistance above (long) or support below (short);
+//                    becomes the take-profit target
+//   atr              ATR(14) at the latest bar
+//   last             latest close
+//   atrPad           SL padding multiplier (k × ATR)
+//   roundPad         round-number avoidance pad in dollars
+//   stopOffset       stop-limit offset from stop trigger (subtracted for long,
+//                    added for short)
+//   rrMin            minimum (target - entry)/(entry - stop) magnitude
+//   equity           NetLiquidation in dollars; 0 = skip share calc
+//   riskPct          % of equity per trade
+struct SetupPlan {
+    bool   valid   = false;
+    int    side    = 0;        // 1 = long, 0 = short
+    double entry   = 0.0;
+    double stop    = 0.0;
+    double stopLmt = 0.0;
+    double target  = 0.0;
+    double rr      = 0.0;
+    int    shares  = 0;
+};
+
+inline SetupPlan SuggestSetup(int side,
+                              double zoneTop, double zoneBot,
+                              double anchor,
+                              double opposingLevel,
+                              double atr, double last,
+                              double atrPad,
+                              double roundPad,
+                              double stopOffset,
+                              double rrMin,
+                              double equity, double riskPct) {
+    SetupPlan p;
+    if (atr <= 0.0 || zoneTop <= zoneBot) return p;
+    if (side != 0 && side != 1)            return p;
+
+    double mid = 0.5 * (zoneTop + zoneBot);
+
+    if (side == 1) {
+        double entry  = (last >= zoneTop) ? last : mid;
+        double rawSt  = anchor - atrPad * atr;
+        double stop   = AvoidRoundNumber(rawSt, roundPad, /*pushDown=*/true);
+        double target = opposingLevel;
+
+        double risk   = entry  - stop;
+        double reward = target - entry;
+        if (risk <= 0.0 || reward <= 0.0) return p;
+        double rr = reward / risk;
+        if (rr < rrMin) return p;
+
+        p.valid   = true;
+        p.side    = 1;
+        p.entry   = RoundToTick(entry);
+        p.stop    = RoundToTick(stop);
+        p.stopLmt = RoundToTick(stop - stopOffset);
+        p.target  = RoundToTick(target);
+        p.rr      = rr;
+        p.shares  = PositionSizeShares(equity, riskPct, p.entry, p.stop);
+    } else {
+        double entry  = (last <= zoneBot) ? last : mid;
+        double rawSt  = anchor + atrPad * atr;
+        double stop   = AvoidRoundNumber(rawSt, roundPad, /*pushDown=*/false);
+        double target = opposingLevel;
+
+        double risk   = stop  - entry;
+        double reward = entry - target;
+        if (risk <= 0.0 || reward <= 0.0) return p;
+        double rr = reward / risk;
+        if (rr < rrMin) return p;
+
+        p.valid   = true;
+        p.side    = 0;
+        p.entry   = RoundToTick(entry);
+        p.stop    = RoundToTick(stop);
+        p.stopLmt = RoundToTick(stop + stopOffset);
+        p.target  = RoundToTick(target);
+        p.rr      = rr;
+        p.shares  = PositionSizeShares(equity, riskPct, p.entry, p.stop);
+    }
+    return p;
+}
+
+// ─── Protective stop for an existing position ───────────────────────────────
+// Builds a stop suggestion based on auto-detected S/R levels.
+//   isLong = true:  pick the closest support cluster BELOW entry (touches ≥ 2),
+//                   stop = support.minPrice − atrPad × atr, push DOWN of round
+//   isLong = false: pick the closest resistance cluster ABOVE entry (touches ≥ 2),
+//                   stop = resistance.maxPrice + atrPad × atr, push UP of round
+// `levels` is normally m_autoSupports (long) or m_autoResistances (short) — the
+// already-filtered KeepTopN output.
+struct PositionStop {
+    bool   valid   = false;
+    double stop    = 0.0;
+    double stopLmt = 0.0;
+    double pctRisk = 0.0;     // |entry - stop| / entry × 100
+};
+
+inline PositionStop SuggestStopForPosition(bool isLong,
+                                           double entry,
+                                           const std::vector<Level>& levels,
+                                           double atr,
+                                           double atrPad,
+                                           double roundPad,
+                                           double stopOffset) {
+    PositionStop r;
+    if (entry <= 0.0 || atr <= 0.0 || levels.empty()) return r;
+
+    const Level* best = nullptr;
+    if (isLong) {
+        for (const auto& L : levels) {
+            if (L.touches < 2)    continue;
+            if (L.price >= entry) continue;
+            if (!best || L.price > best->price) best = &L;
+        }
+    } else {
+        for (const auto& L : levels) {
+            if (L.touches < 2)    continue;
+            if (L.price <= entry) continue;
+            if (!best || L.price < best->price) best = &L;
+        }
+    }
+    if (!best) return r;
+
+    if (isLong) {
+        double rawSt = best->minPrice - atrPad * atr;
+        double stop  = AvoidRoundNumber(rawSt, roundPad, /*pushDown=*/true);
+        r.valid   = true;
+        r.stop    = RoundToTick(stop);
+        r.stopLmt = RoundToTick(stop - stopOffset);
+        r.pctRisk = (entry - r.stop) / entry * 100.0;
+    } else {
+        double rawSt = best->maxPrice + atrPad * atr;
+        double stop  = AvoidRoundNumber(rawSt, roundPad, /*pushDown=*/false);
+        r.valid   = true;
+        r.stop    = RoundToTick(stop);
+        r.stopLmt = RoundToTick(stop + stopOffset);
+        r.pctRisk = (r.stop - entry) / entry * 100.0;
+    }
+    return r;
+}
+
+// ─── Session-anchored VWAP + volume-weighted ±σ bands ──────────────────────
+// Volume-weighted average price with optional intraday session resets.
+// `sessionStarts` lists bar indices where the running cumulator resets (typically
+// derived from ET-day boundaries by ChartWindow); pass an empty vector for a
+// single cumulative run from index 0 (matches non-intraday behaviour).
+//
+// Bands use volume-weighted variance: var = E[X²] − E[X]² on the
+// running distribution, single-pass O(n). The clamp `var < 0 → 0` guards the
+// degenerate "all bars identical" cancellation case.
+//
+// Zero-volume bars carry the previous values forward (no NaN, no flicker).
+// First bar with zero volume falls back to its close so the output isn't 0.
+struct VwapResult {
+    std::vector<double> vwap;
+    std::vector<double> sd1Up;
+    std::vector<double> sd1Dn;
+    std::vector<double> sd2Up;
+    std::vector<double> sd2Dn;
+};
+
+inline VwapResult SessionVwap(const std::vector<double>& highs,
+                              const std::vector<double>& lows,
+                              const std::vector<double>& closes,
+                              const std::vector<double>& volumes,
+                              const std::vector<int>&    sessionStarts) {
+    VwapResult r;
+    int n = static_cast<int>(closes.size());
+    r.vwap.assign(n, 0.0);
+    r.sd1Up.assign(n, 0.0);
+    r.sd1Dn.assign(n, 0.0);
+    r.sd2Up.assign(n, 0.0);
+    r.sd2Dn.assign(n, 0.0);
+    if (n == 0 ||
+        static_cast<int>(highs.size())   != n ||
+        static_cast<int>(lows.size())    != n ||
+        static_cast<int>(volumes.size()) != n) return r;
+
+    std::size_t nextStart = 0;
+    double cumTPV  = 0.0;
+    double cumVol  = 0.0;
+    double cumTPV2 = 0.0;     // Σ vol × typical²
+
+    for (int i = 0; i < n; ++i) {
+        bool reset = (i == 0);
+        while (nextStart < sessionStarts.size() && sessionStarts[nextStart] <= i) {
+            if (sessionStarts[nextStart] == i) reset = true;
+            ++nextStart;
+        }
+        if (reset) {
+            cumTPV  = 0.0;
+            cumVol  = 0.0;
+            cumTPV2 = 0.0;
+        }
+
+        double typ = (highs[i] + lows[i] + closes[i]) / 3.0;
+        double vol = volumes[i];
+
+        if (vol > 0.0) {
+            cumTPV  += typ * vol;
+            cumVol  += vol;
+            cumTPV2 += typ * typ * vol;
+        }
+
+        if (cumVol > 0.0) {
+            double vwap   = cumTPV / cumVol;
+            double meanSq = cumTPV2 / cumVol;
+            double varVw  = meanSq - vwap * vwap;
+            if (varVw < 0.0) varVw = 0.0;
+            double sd     = std::sqrt(varVw);
+            r.vwap[i]  = vwap;
+            r.sd1Up[i] = vwap + sd;
+            r.sd1Dn[i] = vwap - sd;
+            r.sd2Up[i] = vwap + 2.0 * sd;
+            r.sd2Dn[i] = vwap - 2.0 * sd;
+        } else if (i > 0 && !reset) {
+            r.vwap[i]  = r.vwap[i - 1];
+            r.sd1Up[i] = r.sd1Up[i - 1];
+            r.sd1Dn[i] = r.sd1Dn[i - 1];
+            r.sd2Up[i] = r.sd2Up[i - 1];
+            r.sd2Dn[i] = r.sd2Dn[i - 1];
+        } else {
+            r.vwap[i]  = closes[i];
+            r.sd1Up[i] = closes[i];
+            r.sd1Dn[i] = closes[i];
+            r.sd2Up[i] = closes[i];
+            r.sd2Dn[i] = closes[i];
+        }
+    }
+    return r;
+}
+
+// ─── Order impact — side-intent badge + P&amp;L preview ──────────────────────────
+// Pure helpers that compute what an order would do to an existing position
+// before it is submitted. Used by both ChartWindow and TradingWindow to render
+// the side-intent badge (OPEN LONG / ADD TO LONG / REDUCE / CLOSE / FLIP) and
+// the projected P&amp;L at the prices currently entered in the order form.
+//
+// Caller derives `fillPrice` from the staged order type:
+//   MKT / MOC / MTL       → last (current price)
+//   LMT / LOC             → limitPrice
+//   STP                   → stopPrice
+//   STP LMT               → stopPrice for the stop leg, limitPrice for the fill leg
+//   TRAIL / TRAIL LIMIT   → last ± trailAmount
+//   MIT                   → auxPrice (trigger)
+//   LIT                   → auxPrice (trigger), limitPrice (fill)
+//   MIDPRICE              → last
+//   REL                   → last ± pegOffset
+
+enum class OrderImpactKind {
+    OpenLong,            // no position → BUY
+    OpenShort,           // no position → SELL
+    AddToLong,           // long pos    → BUY
+    AddToShort,          // short pos   → SELL
+    ReduceLong,          // long pos    → SELL (partial close)
+    ReduceShort,         // short pos   → BUY  (partial close)
+    CloseLong,           // long pos    → SELL (exact close)
+    CloseShort,          // short pos   → BUY  (exact close)
+    FlipToShort,         // long pos    → SELL (qty > posQty)
+    FlipToLong,          // short pos   → BUY  (qty > |posQty|)
+    Invalid,             // qty ≤ 0, side unset, etc.
+};
+
+struct OrderImpact {
+    OrderImpactKind kind          = OrderImpactKind::Invalid;
+    double          closeQty      = 0.0;   // units that hit avgCost basis
+    double          openQty       = 0.0;   // units left over (flip case only)
+    double          closePnL      = 0.0;   // realised P&amp;L on the closing leg, net of commission
+    double          newAvgCost    = 0.0;   // post-fill avg cost (Open / AddTo paths)
+    double          newPosQty     = 0.0;   // signed position after fill
+    bool            isClosingPath = false; // true for Reduce / Close / Flip — closePnL is meaningful
+};
+
+// posQty: signed (+ long, - short, 0 flat).  avgCost: always ≥ 0.
+// commissionPerShare: per-share commission attributable to this position.
+// orderQty: always positive (absolute shares in the order form).
+inline OrderImpact ComputeOrderImpact(double posQty, double avgCost,
+                                      double commissionPerShare,
+                                      bool   isBuy, double orderQty,
+                                      double fillPrice) {
+    OrderImpact r;
+    if (orderQty <= 0.0 || fillPrice <= 0.0) return r;   // Invalid
+
+    double absPos = std::abs(posQty);
+
+    if (absPos <= 0.0) {
+        // ── No existing position ──────────────────────────────────────────
+        if (isBuy) {
+            r.kind      = OrderImpactKind::OpenLong;
+            r.newAvgCost = fillPrice;
+            r.newPosQty  = orderQty;
+        } else {
+            r.kind      = OrderImpactKind::OpenShort;
+            r.newAvgCost = fillPrice;
+            r.newPosQty  = -orderQty;
+        }
+        r.openQty = orderQty;
+        return r;
+    }
+
+    if (posQty > 0.0) {
+        // ── Existing long position ────────────────────────────────────────
+        if (isBuy) {
+            r.kind       = OrderImpactKind::AddToLong;
+            r.newPosQty  = posQty + orderQty;
+            r.newAvgCost = (posQty * avgCost + orderQty * fillPrice) / r.newPosQty;
+            r.openQty    = orderQty;
+        } else {
+            double closeQty = std::min(orderQty, absPos);
+            r.closeQty      = closeQty;
+            r.isClosingPath = true;
+            r.closePnL      = (fillPrice - avgCost) * closeQty
+                              - commissionPerShare * closeQty;
+            r.newPosQty     = posQty - closeQty;
+            r.openQty       = orderQty - closeQty;
+
+            if (closeQty < absPos) {
+                r.kind = OrderImpactKind::ReduceLong;
+            } else if (orderQty == absPos) {
+                r.kind = OrderImpactKind::CloseLong;
+            } else {
+                r.kind       = OrderImpactKind::FlipToShort;
+                r.newAvgCost = fillPrice;
+                r.newPosQty  = -r.openQty;
+            }
+        }
+        return r;
+    }
+
+    // ── Existing short position (posQty < 0) ─────────────────────────────
+    if (!isBuy) {
+        r.kind       = OrderImpactKind::AddToShort;
+        r.newPosQty  = posQty - orderQty;
+        r.newAvgCost = (absPos * avgCost + orderQty * fillPrice) / (absPos + orderQty);
+        r.openQty    = orderQty;
+    } else {
+        double closeQty = std::min(orderQty, absPos);
+        r.closeQty      = closeQty;
+        r.isClosingPath = true;
+        r.closePnL      = (avgCost - fillPrice) * closeQty
+                          - commissionPerShare * closeQty;
+        r.newPosQty     = posQty + closeQty;
+        r.openQty       = orderQty - closeQty;
+
+        if (closeQty < absPos) {
+            r.kind = OrderImpactKind::ReduceShort;
+        } else if (orderQty == absPos) {
+            r.kind = OrderImpactKind::CloseShort;
+        } else {
+            r.kind       = OrderImpactKind::FlipToLong;
+            r.newAvgCost = fillPrice;
+            r.newPosQty  = r.openQty;
+        }
+    }
+    return r;
+}
+
+// ─── Risk preview for paired Stop-Limit-style setups ─────────────────────────
+// Computes both target P&amp;L and stop-out P&amp;L from two OrderImpact legs (the
+// closing portion of a trade plan). R:R = |reward| / |risk|.
+struct StopTargetPreview {
+    double targetPnL = 0.0;
+    double stopPnL   = 0.0;   // negative for losses
+    double rrRatio   = 0.0;   // 0 if either leg is undefined
+    bool   valid     = false;
+};
+
+inline StopTargetPreview PreviewStopTarget(const OrderImpact& target,
+                                           const OrderImpact& stop) {
+    StopTargetPreview p;
+    if (!target.isClosingPath || !stop.isClosingPath) return p;
+    if (target.closeQty <= 0.0 || stop.closeQty <= 0.0) return p;
+    double reward = target.closePnL;
+    double risk   = -stop.closePnL;   // stop is a loss → positive risk
+    if (risk <= 0.0) return p;
+    p.valid     = true;
+    p.targetPnL = reward;
+    p.stopPnL   = stop.closePnL;
+    p.rrRatio   = reward / risk;
+    return p;
 }
 
 } // namespace core::services
