@@ -1210,7 +1210,7 @@ TEST_CASE("ApplyPreset(Free) stamps construction-default baseline", "[analysis][
 
 // ── OrderImpact — side-intent badge & P&L preview ─────────────────────────────
 
-TEST_CASE("ComputeOrderImpact: no position + BUY → OpenLong", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: no position + BUY -> OpenLong", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(0.0, 0.0, 0.0, true, 100.0, 187.42);
     REQUIRE(r.kind == OrderImpactKind::OpenLong);
     REQUIRE(r.closeQty == Catch::Approx(0.0));
@@ -1220,7 +1220,7 @@ TEST_CASE("ComputeOrderImpact: no position + BUY → OpenLong", "[analysis][orde
     REQUIRE(r.isClosingPath == false);
 }
 
-TEST_CASE("ComputeOrderImpact: no position + SELL → OpenShort", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: no position + SELL -> OpenShort", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(0.0, 0.0, 0.0, false, 100.0, 187.42);
     REQUIRE(r.kind == OrderImpactKind::OpenShort);
     REQUIRE(r.closeQty == Catch::Approx(0.0));
@@ -1230,7 +1230,7 @@ TEST_CASE("ComputeOrderImpact: no position + SELL → OpenShort", "[analysis][or
     REQUIRE(r.isClosingPath == false);
 }
 
-TEST_CASE("ComputeOrderImpact: long 100@$150 + BUY 50@$160 → AddToLong", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: long 100@$150 + BUY 50@$160 -> AddToLong", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(100.0, 150.0, 0.0, true, 50.0, 160.0);
     REQUIRE(r.kind == OrderImpactKind::AddToLong);
     REQUIRE(r.isClosingPath == false);
@@ -1240,7 +1240,7 @@ TEST_CASE("ComputeOrderImpact: long 100@$150 + BUY 50@$160 → AddToLong", "[ana
     REQUIRE(r.newAvgCost == Catch::Approx(153.33333));
 }
 
-TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$155 → ReduceLong", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$155 -> ReduceLong", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(100.0, 150.0, 0.0, false, 50.0, 155.0);
     REQUIRE(r.kind == OrderImpactKind::ReduceLong);
     REQUIRE(r.isClosingPath == true);
@@ -1251,7 +1251,7 @@ TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$155 → ReduceLong", "[a
     REQUIRE(r.newPosQty == Catch::Approx(50.0));
 }
 
-TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 100@$155 → CloseLong", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 100@$155 -> CloseLong", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 155.0);
     REQUIRE(r.kind == OrderImpactKind::CloseLong);
     REQUIRE(r.isClosingPath == true);
@@ -1261,7 +1261,7 @@ TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 100@$155 → CloseLong", "[a
     REQUIRE(r.newPosQty == Catch::Approx(0.0));
 }
 
-TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 150@$155 → FlipToShort", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 150@$155 -> FlipToShort", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(100.0, 150.0, 0.0, false, 150.0, 155.0);
     REQUIRE(r.kind == OrderImpactKind::FlipToShort);
     REQUIRE(r.isClosingPath == true);
@@ -1272,7 +1272,7 @@ TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 150@$155 → FlipToShort", "
     REQUIRE(r.newAvgCost == Catch::Approx(155.0));
 }
 
-TEST_CASE("ComputeOrderImpact: short 100@$150 + SELL 50@$155 → AddToShort", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: short 100@$150 + SELL 50@$155 -> AddToShort", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(-100.0, 150.0, 0.0, false, 50.0, 155.0);
     REQUIRE(r.kind == OrderImpactKind::AddToShort);
     REQUIRE(r.isClosingPath == false);
@@ -1282,7 +1282,7 @@ TEST_CASE("ComputeOrderImpact: short 100@$150 + SELL 50@$155 → AddToShort", "[
     REQUIRE(r.newAvgCost == Catch::Approx(151.66667));
 }
 
-TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 50@$148 → ReduceShort", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 50@$148 -> ReduceShort", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(-100.0, 150.0, 0.0, true, 50.0, 148.0);
     REQUIRE(r.kind == OrderImpactKind::ReduceShort);
     REQUIRE(r.isClosingPath == true);
@@ -1293,7 +1293,7 @@ TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 50@$148 → ReduceShort", "[
     REQUIRE(r.newPosQty == Catch::Approx(-50.0));
 }
 
-TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 100@$148 → CloseShort", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 100@$148 -> CloseShort", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(-100.0, 150.0, 0.0, true, 100.0, 148.0);
     REQUIRE(r.kind == OrderImpactKind::CloseShort);
     REQUIRE(r.isClosingPath == true);
@@ -1303,7 +1303,7 @@ TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 100@$148 → CloseShort", "[
     REQUIRE(r.newPosQty == Catch::Approx(0.0));
 }
 
-TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 150@$148 → FlipToLong", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 150@$148 -> FlipToLong", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(-100.0, 150.0, 0.0, true, 150.0, 148.0);
     REQUIRE(r.kind == OrderImpactKind::FlipToLong);
     REQUIRE(r.isClosingPath == true);
@@ -1314,7 +1314,7 @@ TEST_CASE("ComputeOrderImpact: short 100@$150 + BUY 150@$148 → FlipToLong", "[
     REQUIRE(r.newAvgCost == Catch::Approx(148.0));
 }
 
-TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$140 → loss path", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$140 -> loss path", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(100.0, 150.0, 0.0, false, 50.0, 140.0);
     REQUIRE(r.kind == OrderImpactKind::ReduceLong);
     REQUIRE(r.isClosingPath == true);
@@ -1322,7 +1322,7 @@ TEST_CASE("ComputeOrderImpact: long 100@$150 + SELL 50@$140 → loss path", "[an
     REQUIRE(r.closePnL == Catch::Approx(-500.0));
 }
 
-TEST_CASE("ComputeOrderImpact: degenerate — qty ≤ 0", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: degenerate -- qty <= 0", "[analysis][order-impact]") {
     auto r1 = ComputeOrderImpact(0.0, 0.0, 0.0, true, 0.0, 100.0);
     REQUIRE(r1.kind == OrderImpactKind::Invalid);
 
@@ -1330,7 +1330,7 @@ TEST_CASE("ComputeOrderImpact: degenerate — qty ≤ 0", "[analysis][order-impa
     REQUIRE(r2.kind == OrderImpactKind::Invalid);
 }
 
-TEST_CASE("ComputeOrderImpact: degenerate — fillPrice ≤ 0", "[analysis][order-impact]") {
+TEST_CASE("ComputeOrderImpact: degenerate -- fillPrice <= 0", "[analysis][order-impact]") {
     auto r = ComputeOrderImpact(0.0, 0.0, 0.0, true, 100.0, 0.0);
     REQUIRE(r.kind == OrderImpactKind::Invalid);
 }
@@ -1356,7 +1356,7 @@ TEST_CASE("PreviewStopTarget: long entry $150, target=$155 stop=$148", "[analysi
     REQUIRE(p.rrRatio == Catch::Approx(2.5));   // 500/200
 }
 
-TEST_CASE("PreviewStopTarget: invalid — non-closing leg", "[analysis][order-impact]") {
+TEST_CASE("PreviewStopTarget: invalid -- non-closing leg", "[analysis][order-impact]") {
     // OpenLong is not a closing path
     auto open  = ComputeOrderImpact(0.0, 0.0, 0.0, true, 100.0, 150.0);
     auto close = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 155.0);
@@ -1364,7 +1364,7 @@ TEST_CASE("PreviewStopTarget: invalid — non-closing leg", "[analysis][order-im
     REQUIRE(p.valid == false);
 }
 
-TEST_CASE("PreviewStopTarget: invalid — zero stop risk", "[analysis][order-impact]") {
+TEST_CASE("PreviewStopTarget: invalid -- zero stop risk", "[analysis][order-impact]") {
     // Close at entry price → zero P&L, risk=0 → invalid R:R
     auto target = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 155.0);
     auto stop   = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 150.0);
