@@ -6,6 +6,7 @@
 #include <deque>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace ui {
 
@@ -54,6 +55,28 @@ public:
     void SetNextOrderId(int id);
     // Inject position from IB portfolio data (qty>0 long, <0 short, 0 flat)
     void SetPosition(double qty, double avgCost);
+
+    // Unguarded-position warning hint — pushed once per frame from main.cpp.
+    // active=false (or different-symbol) clears the strip. Same shape as
+    // ChartWindow::UnguardedHint; declared here so the two windows stay
+    // independent (no header coupling between TradingWindow and ChartWindow).
+    struct UnguardedHint {
+        bool        active   = false;
+        std::string symbol;
+        double      qty      = 0.0;
+        double      avgCost  = 0.0;
+        double      stopTrig = 0.0;
+        double      stopLmt  = 0.0;
+        double      pctRisk  = 0.0;
+    };
+    void SetUnguardedSuggestion(const UnguardedHint& h);
+
+    // Receive auto-detected support/resistance levels from the first chart
+    // window on the same symbol. Used to overlay S/R markers in the DOM.
+    // atrLast = 0.0 means "not yet computed" — markers stay hidden.
+    void SetAutoLevels(const std::vector<double>& supports,
+                       const std::vector<double>& resistances,
+                       double atrLast);
 
     std::function<void(const core::Order&)> OnOrderSubmit;
     std::function<void(int orderId)> OnOrderCancel;
@@ -139,6 +162,13 @@ private:
     bool ValidateOrder(std::string& err) const;
     void SubmitOrder();
     void DrawConfirmationPopup();
+    void DrawUnguardedStrip();   // yellow protective-stop warning above order entry
+    void DrawOrderImpactBadge();  // side-intent + P&amp;L preview below order form
+
+    // ── Unguarded-position warning state ────────────────────────────────────
+    UnguardedHint                   m_unguarded;
+    std::unordered_set<std::string> m_dismissedUnguarded;
+    double                          m_lastWarnedQty = 0.0;
 
     // ── Open orders ──────────────────────────────────────────────────────────
     std::vector<core::Order> m_openOrders;
@@ -161,6 +191,11 @@ private:
     // ── Layout ratios (user-draggable splitters) ─────────────────────────────
     float m_topHeightRatio  = 0.65f;   // top / total height
     float m_bookWidthRatio  = 0.54f;   // book panel / total width
+
+    // ── Auto S/R overlay from chart ──────────────────────────────────────────
+    std::vector<double> m_supportPrices;
+    std::vector<double> m_resistancePrices;
+    double              m_atrForSR = 0.0;   // ATR(14) for proximity tolerance
 
     // ── Helpers ──────────────────────────────────────────────────────────────
     static std::string FmtTime(std::time_t t);

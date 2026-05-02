@@ -18,6 +18,11 @@
 #include <cstdio>
 #include <fstream>
 
+// Selected-account NetLiquidation accessor — defined in main.cpp. Returns 0.0
+// before the first accountSummary() callback fires (or when no portfolio window
+// is alive); the share-count helper treats 0 as "size unknown".
+double GetSelectedAccountEquity();
+
 namespace ui {
 
 static constexpr const char* kHistoryFile = "symbol_history.txt";
@@ -117,6 +122,116 @@ void ChartWindow::AddToHistory(const std::string& symbol) {
 void ChartWindow::setInstanceId(int id) {
     m_instanceId = id;
     std::snprintf(m_title, sizeof(m_title), "Chart %d##chart%d", id, id);
+}
+
+void ChartWindow::setTradingStyle(core::services::TradingStyle s, bool silent) {
+    auto preset = core::services::GetPreset(s);
+
+    // Free mode preserves whatever TF the user had — that's the whole point
+    // of Free. ApplyPreset() always stamps the preset's TF onto m_timeframe,
+    // so we save it first and restore it after.
+    const bool isFree = (s == core::services::TradingStyle::Free);
+    core::Timeframe savedTf = m_timeframe;
+    core::services::ApplyPreset(preset, m_ind, m_auto, m_setupSettings, m_timeframe);
+    if (isFree) m_timeframe = savedTf;
+    m_tradingStyle = s;
+
+    // Wipe every derived buffer so the next prefetch lands into a clean slate.
+    m_xs.clear();      m_idxs.clear();
+    m_opens.clear();   m_highs.clear();
+    m_lows.clear();    m_closes.clear();
+    m_volumes.clear();
+    m_sma1.clear();    m_sma2.clear(); m_ema.clear();
+    m_bbMid.clear();   m_bbUpper.clear(); m_bbLower.clear();
+    m_rsi.clear();
+    m_vwap.clear();
+    m_vwapSd1Up.clear(); m_vwapSd1Dn.clear();
+    m_vwapSd2Up.clear(); m_vwapSd2Dn.clear();
+    m_atr14.clear();
+    m_autoSupports.clear();
+    m_autoResistances.clear();
+    m_autoTrend       = AutoTrend{};
+    m_donchHi.clear(); m_donchLo.clear();
+    m_keltUpper.clear(); m_keltLower.clear();
+    m_autoFib         = AutoFibSpan{};
+    m_pivots          = DailyPivot{};
+    m_pivotsTodayStart = -1;
+    m_pivotsTodayEnd   = -1;
+    m_breakouts.clear();
+    m_breakoutSignal     = BreakoutDirection::None;
+    m_breakoutZoneTop    = 0.0;
+    m_breakoutZoneBot    = 0.0;
+    m_breakoutFromSupply = false;
+    m_breakoutLevelIdx   = -1;
+    m_setup           = SetupPlan{};
+    m_unguarded       = UnguardedHint{};
+    m_drawings.clear();
+    m_drawPending     = false;
+
+    m_loading         = true;
+    m_hasRealData     = false;
+    m_viewInitialized = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
+    m_series          = core::BarSeries{};
+    m_series.symbol    = m_symbol;
+    m_series.timeframe = m_timeframe;
+
+    if (!silent && OnStyleChange) {
+        std::string duration = isFree
+            ? core::TimeframeIBDuration(m_timeframe)
+            : std::string(preset.historyDuration);
+        OnStyleChange(s, duration, m_useRTH);
+    }
+}
+
+void ChartWindow::setTimeframeFree(core::Timeframe tf, bool silent) {
+    if (tf == m_timeframe) return;
+    m_timeframe = tf;
+
+    // Wipe data buffers + derived analysis state. User-configured settings
+    // (m_ind / m_auto / m_setupSettings / m_drawings) survive a TF change
+    // within Free mode — only the data and what was computed from it goes.
+    m_xs.clear();      m_idxs.clear();
+    m_opens.clear();   m_highs.clear();
+    m_lows.clear();    m_closes.clear();
+    m_volumes.clear();
+    m_sma1.clear();    m_sma2.clear(); m_ema.clear();
+    m_bbMid.clear();   m_bbUpper.clear(); m_bbLower.clear();
+    m_rsi.clear();
+    m_vwap.clear();
+    m_vwapSd1Up.clear(); m_vwapSd1Dn.clear();
+    m_vwapSd2Up.clear(); m_vwapSd2Dn.clear();
+    m_atr14.clear();
+    m_autoSupports.clear();
+    m_autoResistances.clear();
+    m_autoTrend       = AutoTrend{};
+    m_donchHi.clear(); m_donchLo.clear();
+    m_keltUpper.clear(); m_keltLower.clear();
+    m_autoFib         = AutoFibSpan{};
+    m_pivots          = DailyPivot{};
+    m_pivotsTodayStart = -1;
+    m_pivotsTodayEnd   = -1;
+    m_breakouts.clear();
+    m_breakoutSignal     = BreakoutDirection::None;
+    m_breakoutZoneTop    = 0.0;
+    m_breakoutZoneBot    = 0.0;
+    m_breakoutFromSupply = false;
+    m_breakoutLevelIdx   = -1;
+    m_setup           = SetupPlan{};
+
+    m_loading         = true;
+    m_hasRealData     = false;
+    m_viewInitialized = false;
+    m_loadingMore     = false;
+    m_historyAtStart  = false;
+    m_series          = core::BarSeries{};
+    m_series.symbol    = m_symbol;
+    m_series.timeframe = m_timeframe;
+
+    if (!silent && OnStyleChange)
+        OnStyleChange(core::services::TradingStyle::Free,
+                      core::TimeframeIBDuration(tf), m_useRTH);
 }
 
 void ChartWindow::SetSymbol(const std::string& symbol) {
@@ -352,6 +467,16 @@ void ChartWindow::SetPosition(const PositionInfo& pos) {
     m_position = pos;
 }
 
+void ChartWindow::SetUnguardedSuggestion(const UnguardedHint& h) {
+    // A position-quantity change resets the per-symbol dismissal so the strip
+    // re-appears after the user trims/adds to the position.
+    if (std::abs(h.qty - m_lastWarnedQty) > 1e-9) {
+        m_dismissedUnguarded.erase(h.symbol);
+        m_lastWarnedQty = h.qty;
+    }
+    m_unguarded = h;
+}
+
 void ChartWindow::OnWshEvent(const WshData::WshEvent& event) {
     for (const auto& e : m_wshEvents)
         if (e.date == event.date && e.type == event.type) return;
@@ -363,6 +488,8 @@ void ChartWindow::RequestNewData() {
     m_xs.clear(); m_opens.clear(); m_highs.clear();
     m_lows.clear(); m_closes.clear(); m_volumes.clear();
     m_vwap.clear();
+    m_vwapSd1Up.clear(); m_vwapSd1Dn.clear();
+    m_vwapSd2Up.clear(); m_vwapSd2Dn.clear();
     m_loadingMore    = false;
     m_historyAtStart = false;
 
@@ -425,6 +552,7 @@ bool ChartWindow::Render() {
 
     if (!m_viewInitialized) InitViewRange();
 
+    DrawUnguardedStrip();   // yellow protective-stop warning when applicable
     DrawInfoBar();
     DrawPositionStrip();
     DrawCandleChart();
@@ -500,22 +628,50 @@ void ChartWindow::DrawToolbar() {
         if (active) ImGui::PopStyleColor();
     }
 
-    // Timeframe combo
-    row.item(em(55), 16);
-    ImGui::SetNextItemWidth(em(55));
-    if (ImGui::BeginCombo("##tf", core::TimeframeLabel(m_timeframe))) {
-        for (core::Timeframe tf : kAllTimeframes) {
-            bool sel = (m_timeframe == tf);
-            if (ImGui::Selectable(core::TimeframeLabel(tf), sel)) {
-                if (m_timeframe != tf) {
-                    m_timeframe = tf;
-                    m_viewInitialized = false;
-                    RequestNewData();
-                }
-            }
-            if (sel) ImGui::SetItemDefaultFocus();
+    // Trading style combo — hard-binds timeframe + history horizon + analysis
+    // params. The "Free" entry unlocks the timeframe combo so the user can
+    // pick any TF themselves. See .claude/plans/trading-styles.md.
+    {
+        static constexpr const char* kStyleLabels[] = {
+            "Scalping", "Day Trading", "Swing", "Investment", "Free"
+        };
+        row.item(em(105), 16);
+        ImGui::SetNextItemWidth(em(105));
+        int curStyleIdx = static_cast<int>(m_tradingStyle);
+        if (ImGui::Combo("##style", &curStyleIdx, kStyleLabels, IM_ARRAYSIZE(kStyleLabels))) {
+            auto next = static_cast<core::services::TradingStyle>(curStyleIdx);
+            if (next != m_tradingStyle) setTradingStyle(next);
         }
-        ImGui::EndCombo();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Trading style preset.\n"
+                              "Sets timeframe + history horizon + analysis params.\n"
+                              "Switching modes cancels current bars and prefetches the new horizon.\n"
+                              "\"Free\" unlocks the timeframe combo and preserves your settings.");
+    }
+
+    // Timeframe — read-only label when bound to a style; editable combo in Free mode.
+    if (m_tradingStyle == core::services::TradingStyle::Free) {
+        row.item(em(70), 8);
+        ImGui::SetNextItemWidth(em(70));
+        int curTfIdx = 0;
+        for (int i = 0; i < (int)std::size(kAllTimeframes); ++i)
+            if (kAllTimeframes[i] == m_timeframe) { curTfIdx = i; break; }
+        const char* tfLabels[std::size(kAllTimeframes)];
+        for (int i = 0; i < (int)std::size(kAllTimeframes); ++i)
+            tfLabels[i] = core::TimeframeLabel(kAllTimeframes[i]);
+        if (ImGui::Combo("##tf", &curTfIdx, tfLabels, (int)std::size(kAllTimeframes))) {
+            core::Timeframe next = kAllTimeframes[curTfIdx];
+            if (next != m_timeframe) setTimeframeFree(next);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Free mode: pick any timeframe.\n"
+                              "History duration uses the IB default for the chosen TF.");
+    } else {
+        row.item(em(55), 8);
+        ImGui::TextDisabled("[%s]", core::TimeframeLabel(m_timeframe));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Timeframe is set by the trading style.\nSwitch styles to change.\n"
+                              "Pick \"Free\" to unlock the timeframe combo.");
     }
 
     // Horizontal zoom buttons — contract/expand the visible X window by 25%
@@ -574,6 +730,12 @@ void ChartWindow::DrawToolbar() {
     ImGui::Checkbox("BB",     &m_ind.bbands);
     row.item(FlexRow::checkboxW("VWAP"));
     ImGui::Checkbox("VWAP",   &m_ind.vwap);
+    if (m_ind.vwap) {
+        row.item(FlexRow::checkboxW("±σ"));
+        ImGui::Checkbox("±σ", &m_ind.vwapBands);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show ±1σ and ±2σ volume-weighted bands around VWAP.");
+    }
     row.item(FlexRow::checkboxW("Vol"));
     ImGui::Checkbox("Vol",    &m_ind.volume);
     row.item(FlexRow::checkboxW("RSI"));
@@ -694,6 +856,13 @@ void ChartWindow::DrawAnalysisToolbar() {
         ImGui::SetTooltip("Triangle markers on bars that closed through a "
                           "detected support or resistance.");
 
+    row.item(FlexRow::checkboxW("Setup"), 4);
+    if (ImGui::Checkbox("Setup", &m_setupSettings.overlay)) DetectStructure();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Reference entry/stop/target levels when an active "
+                          "supply or demand zone has a fresh setup signal.\n"
+                          "Structure-based suggestions, not advice.");
+
     row.item(FlexRow::buttonW("Auto..."), 4);
     if (ImGui::SmallButton("Auto...")) ImGui::OpenPopup("##auto_settings");
     if (ImGui::IsItemHovered())
@@ -779,9 +948,98 @@ void ChartWindow::DrawAutoSettingsPopup() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Lookback window for the Donchian channel high/low.");
 
+    DrawSetupSettingsPopup();
+    // DrawSetupSettingsPopup writes its own InputFloat / Checkbox results into
+    // m_setupSettings; we re-run DetectStructure unconditionally if any of them
+    // changed by piggy-backing on the same `changed` flag — see the helper.
+
     if (changed) DetectStructure();
 
     ImGui::EndPopup();
+}
+
+// ============================================================================
+// DrawSetupSettingsPopup — appended inside DrawAutoSettingsPopup so all auto-
+// analysis tuning lives in a single popup. Triggers a DetectStructure() refresh
+// when any field changes.
+// ============================================================================
+void ChartWindow::DrawSetupSettingsPopup() {
+    ImGui::Spacing();
+    ImGui::TextDisabled("Setup suggestions");
+    ImGui::Separator();
+
+    bool changed = false;
+    float buf;
+
+    ImGui::SetNextItemWidth(em(80));
+    buf = (float)m_setupSettings.rrMin;
+    if (ImGui::InputFloat("R:R minimum", &buf, 0.1f, 0.0f, "%.2f")) {
+        if (buf < 1.0f) buf = 1.0f;
+        if (buf > 5.0f) buf = 5.0f;
+        m_setupSettings.rrMin = buf;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Minimum reward/risk ratio. Below this the plan is "
+                          "suppressed (still shows the active zone).");
+
+    ImGui::SetNextItemWidth(em(80));
+    buf = (float)m_setupSettings.atrPad;
+    if (ImGui::InputFloat("ATR padding (k)", &buf, 0.05f, 0.0f, "%.2f")) {
+        if (buf < 0.1f) buf = 0.1f;
+        if (buf > 2.0f) buf = 2.0f;
+        m_setupSettings.atrPad = buf;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stop is placed k * ATR(14) past the structural "
+                          "anchor. Higher = more breathing room.");
+
+    ImGui::SetNextItemWidth(em(80));
+    buf = (float)m_setupSettings.roundPad;
+    if (ImGui::InputFloat("Round-number pad ($)", &buf, 0.01f, 0.0f, "%.2f")) {
+        if (buf < 0.0f)  buf = 0.0f;
+        if (buf > 0.50f) buf = 0.50f;
+        m_setupSettings.roundPad = buf;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Push the stop at least this many dollars away from "
+                          ".00 / .25 / .50 / .75 marks where retail stops "
+                          "cluster.");
+
+    ImGui::SetNextItemWidth(em(80));
+    buf = (float)m_setupSettings.stopOffset;
+    if (ImGui::InputFloat("Stop-limit offset ($)", &buf, 0.01f, 0.0f, "%.2f")) {
+        if (buf < 0.0f) buf = 0.0f;
+        if (buf > 1.0f) buf = 1.0f;
+        m_setupSettings.stopOffset = buf;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Slippage allowance between the stop trigger and the "
+                          "limit price. Too tight risks no-fill on a sweep.");
+
+    ImGui::SetNextItemWidth(em(80));
+    buf = (float)m_setupSettings.riskPct;
+    if (ImGui::InputFloat("Risk per trade (%)", &buf, 0.1f, 0.0f, "%.2f")) {
+        if (buf < 0.1f) buf = 0.1f;
+        if (buf > 5.0f) buf = 5.0f;
+        m_setupSettings.riskPct = buf;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Percentage of NetLiquidation risked per trade — "
+                          "drives the share count.");
+
+    if (ImGui::Checkbox("Use Stop-Limit (off = plain Stop)",
+                        &m_setupSettings.useStopLmt))
+        changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("ON: protective stop is a Stop-Limit (default).\n"
+                          "OFF: plain Stop-Market (always fills, may slip).");
+
+    if (changed) DetectStructure();
 }
 
 // ============================================================================
@@ -975,6 +1233,84 @@ void ChartWindow::DrawAutoZones() {
                       ImVec2(labelX + labelSz.x + 2, triY + labelSz.y * 0.5f + 2),
                       bg, 2.f);
     dl->AddText(ImVec2(labelX, triY - labelSz.y * 0.5f), col, label);
+}
+
+// ============================================================================
+// DrawSetupOverlay — three dashed h-lines (entry / stop / target) plus an
+// optional faint stop-limit companion line. Right-edge label tags stay flush to
+// the plot's right edge (S/R uses the left edge, so the two label families
+// don't collide). Drawn between DrawAutoSupportResistance() and the user
+// drawings so user-placed h-lines, trend lines, and fibs render on top.
+//
+// Wording is deliberately neutral — "ENTRY" / "STOP" / "TGT" framed as
+// reference levels, not directives. The tooltip on the toolbar checkbox
+// reinforces "structure-based suggestions, not advice".
+// ============================================================================
+void ChartWindow::DrawSetupOverlay() {
+    if (!m_setup.valid)             return;
+    if (m_xMin >= m_xMax)            return;
+    if (m_closes.empty())            return;
+
+    ImDrawList* dl   = ImPlot::GetPlotDrawList();
+    ImVec2      pMin = ImPlot::GetPlotPos();
+    ImVec2      pMax = ImVec2(pMin.x + ImPlot::GetPlotSize().x,
+                              pMin.y + ImPlot::GetPlotSize().y);
+
+    bool isLong = (m_setup.side == 1);
+
+    static constexpr ImU32 kEntryCol = IM_COL32( 80, 200, 240, 230);   // cyan
+    static constexpr ImU32 kStopCol  = IM_COL32(230,  80,  80, 230);   // red
+    static constexpr ImU32 kTgtCol   = IM_COL32( 80, 220, 110, 230);   // green
+    static constexpr ImU32 kBg       = IM_COL32( 25,  25,  25, 235);
+
+    auto drawLine = [&](double price, ImU32 col, const char* leadLabel) {
+        ImVec2 p0 = ImPlot::PlotToPixels(m_xMin, price);
+        ImVec2 p1 = ImPlot::PlotToPixels(m_xMax, price);
+        DrawDashedHLine(dl, p0.x, p1.x, p0.y, col, 1.5f, 6.f, 4.f);
+
+        ImVec2 sz   = ImGui::CalcTextSize(leadLabel);
+        float  tagX = pMax.x - sz.x - 4.f;
+        dl->AddRectFilled(ImVec2(tagX - 2,        p0.y - sz.y * 0.5f - 2),
+                          ImVec2(tagX + sz.x + 2, p0.y + sz.y * 0.5f + 2),
+                          kBg, 2.f);
+        dl->AddText(ImVec2(tagX, p0.y - sz.y * 0.5f), col, leadLabel);
+    };
+
+    // Entry — append " x N sh" when share count is known.
+    char entryBuf[64];
+    if (m_setup.shares > 0)
+        std::snprintf(entryBuf, sizeof(entryBuf),
+                      " ENTRY %.2f x %d sh ", m_setup.entry, m_setup.shares);
+    else
+        std::snprintf(entryBuf, sizeof(entryBuf),
+                      " ENTRY %.2f ", m_setup.entry);
+    drawLine(m_setup.entry, kEntryCol, entryBuf);
+
+    // Stop — show distance from entry as a percentage.
+    double stopPct = (m_setup.entry > 0.0)
+        ? (isLong ? (m_setup.entry - m_setup.stop) / m_setup.entry * 100.0
+                  : (m_setup.stop - m_setup.entry) / m_setup.entry * 100.0)
+        : 0.0;
+    char stopBuf[64];
+    std::snprintf(stopBuf, sizeof(stopBuf),
+                  " STOP %.2f (-%.2f%%) ", m_setup.stop, std::abs(stopPct));
+    drawLine(m_setup.stop, kStopCol, stopBuf);
+
+    // Optional faint stop-limit companion line (slightly below the stop for a
+    // long, slightly above for a short — same direction as core::Order will
+    // submit).
+    if (m_setupSettings.useStopLmt) {
+        ImU32 faint = (kStopCol & 0x00FFFFFFu) | (110u << 24);   // ~43% alpha
+        ImVec2 p0   = ImPlot::PlotToPixels(m_xMin, m_setup.stopLmt);
+        ImVec2 p1   = ImPlot::PlotToPixels(m_xMax, m_setup.stopLmt);
+        DrawDashedHLine(dl, p0.x, p1.x, p0.y, faint, 1.0f, 3.f, 5.f);
+    }
+
+    // Target — show R:R magnitude.
+    char tgtBuf[64];
+    std::snprintf(tgtBuf, sizeof(tgtBuf),
+                  " TGT %.2f (R:R %.1f) ", m_setup.target, m_setup.rr);
+    drawLine(m_setup.target, kTgtCol, tgtBuf);
 }
 
 // ============================================================================
@@ -1286,6 +1622,29 @@ void ChartWindow::DrawTradePanel() {
     bool sellClicked = ImGui::Button(" SELL  ##ord", ImVec2(kBtnW, 0));
     ImGui::PopStyleColor(3);
 
+    // ── "Use suggestion" button ──────────────────────────────────────────────
+    // Renders only when an active setup plan exists. Click stages the entry leg
+    // (Limit) into the confirmation popup — never auto-fires, regardless of the
+    // Transmit Instantly toggle. v1 covers the entry leg only; the protective
+    // stop is handled by the unguarded-position warning in Task C.
+    bool useSuggClicked = false;
+    if (m_setupSettings.overlay && m_setup.valid) {
+        const float kUseW = em(120);
+        row.item(kUseW, 8);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.10f, 0.30f, 0.55f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.45f, 0.75f, 1.f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.06f, 0.22f, 0.42f, 1.f));
+        useSuggClicked = ImGui::Button("Use suggestion", ImVec2(kUseW, 0));
+        ImGui::PopStyleColor(3);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Stage a Limit order at the suggested entry "
+                              "($%.2f, %d shares) and open the confirmation "
+                              "popup. Reference plan, not advice.",
+                              m_setup.entry,
+                              m_setup.shares > 0 ? m_setup.shares : m_orderQty);
+        }
+    }
+
     // ── Status hint when armed ───────────────────────────────────────────────
     if (m_limitArmed) {
         ImVec4 hintCol = (m_limitSide == "BUY")
@@ -1370,6 +1729,29 @@ void ChartWindow::DrawTradePanel() {
 
     if (buyClicked)  fireOrder("BUY");
     if (sellClicked) fireOrder("SELL");
+
+    // ── Use suggestion → stage Limit entry leg into confirmation popup ───────
+    if (useSuggClicked && m_setup.valid) {
+        // Force order type to Limit (idx 1 in kOrderTypes — see file-scope
+        // table). Adopt the suggested share count when available.
+        m_orderTypeIdx = 1;
+        if (m_setup.shares > 0) m_orderQty = m_setup.shares;
+        m_limitArmed       = false;
+        m_firstPricePlaced = false;
+        m_limitPlaced      = false;
+        m_placedDragging   = false;
+
+        const std::string side = (m_setup.side == 1) ? "BUY" : "SELL";
+        core::Order o   = buildOrder(side);
+        o.limitPrice    = m_setup.entry;
+        m_pendingConfirmOrder = o;
+        m_showConfirmPopup    = true;
+    }
+
+    // ── Order-impact badge ─────────────────────────────────────────────────
+    // Side-intent + P&L preview. Visible when side and fill price can be
+    // derived from the current form/chart-click state.
+    DrawOrderImpactBadge();
 
     // Escape cancels armed state (both phases)
     if (m_limitArmed && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
@@ -1513,6 +1895,109 @@ void ChartWindow::DrawConfirmPopup() {
         if (refP > 0.0) {
             ImGui::Spacing();
             ImGui::Text("Est. value: $%.2f", o.quantity * refP);
+        }
+    }
+
+    // ── Position impact ────────────────────────────────────────────────────
+    {
+        double posQty = m_position.hasPosition ? m_position.qty : 0.0;
+        double avgCost = m_position.hasPosition ? m_position.avgCost : 0.0;
+        double commPerShare = 0.0;
+        if (m_position.hasPosition && std::abs(m_position.qty) > 0.0)
+            commPerShare = m_position.commission / std::abs(m_position.qty);
+
+        // Derive fill price from the order struct
+        double fPrice = 0.0;
+        switch (o.type) {
+            case core::OrderType::Limit:
+            case core::OrderType::LOC:       fPrice = o.limitPrice; break;
+            case core::OrderType::Stop:      fPrice = o.stopPrice;  break;
+            case core::OrderType::StopLimit: fPrice = o.limitPrice > 0.0 ? o.limitPrice : o.stopPrice; break;
+            case core::OrderType::MIT:       fPrice = o.auxPrice;   break;
+            case core::OrderType::LIT:       fPrice = o.limitPrice > 0.0 ? o.limitPrice : o.auxPrice; break;
+            case core::OrderType::Trail:
+            case core::OrderType::TrailLimit:
+                fPrice = m_position.lastPrice;
+                if (fPrice > 0.0 && o.trailingPercent > 0.0)
+                    fPrice += isBuy ? (-fPrice * o.trailingPercent / 100.0)
+                                    : ( fPrice * o.trailingPercent / 100.0);
+                else if (fPrice > 0.0 && o.auxPrice > 0.0)
+                    fPrice += isBuy ? -o.auxPrice : o.auxPrice;
+                break;
+            case core::OrderType::Relative:
+                fPrice = m_position.lastPrice;
+                if (fPrice > 0.0 && o.auxPrice > 0.0)
+                    fPrice += isBuy ? o.auxPrice : -o.auxPrice;
+                break;
+            default:  // Market, MOC, MTL, Midprice
+                if (!m_closes.empty()) fPrice = m_closes.back();
+                if (fPrice <= 0.0) fPrice = m_position.lastPrice;
+                break;
+        }
+
+        if (fPrice > 0.0) {
+            auto imp = core::services::ComputeOrderImpact(posQty, avgCost, commPerShare,
+                                                           isBuy, o.quantity, fPrice);
+            if (imp.kind != core::services::OrderImpactKind::Invalid) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                const char* kindStr = "";
+                ImVec4 impactCol = ImVec4(0.70f, 0.70f, 0.70f, 1.f);
+                switch (imp.kind) {
+                    case core::services::OrderImpactKind::OpenLong:
+                    case core::services::OrderImpactKind::OpenShort:
+                    case core::services::OrderImpactKind::AddToLong:
+                    case core::services::OrderImpactKind::AddToShort:
+                        kindStr = imp.kind == core::services::OrderImpactKind::OpenLong  ? "OPEN LONG"  :
+                                  imp.kind == core::services::OrderImpactKind::OpenShort ? "OPEN SHORT" :
+                                  imp.kind == core::services::OrderImpactKind::AddToLong ? "ADD TO LONG" : "ADD TO SHORT";
+                        impactCol = ImVec4(0.40f, 0.70f, 1.00f, 1.f);
+                        break;
+                    case core::services::OrderImpactKind::ReduceLong:
+                    case core::services::OrderImpactKind::ReduceShort:
+                    case core::services::OrderImpactKind::CloseLong:
+                    case core::services::OrderImpactKind::CloseShort:
+                        kindStr = imp.kind == core::services::OrderImpactKind::ReduceLong  ? "REDUCE LONG"  :
+                                  imp.kind == core::services::OrderImpactKind::ReduceShort ? "REDUCE SHORT" :
+                                  imp.kind == core::services::OrderImpactKind::CloseLong   ? "CLOSE LONG"   : "CLOSE SHORT";
+                        impactCol = imp.closePnL > 0.0
+                                    ? ImVec4(0.25f, 0.90f, 0.35f, 1.f)
+                                    : ImVec4(0.95f, 0.40f, 0.30f, 1.f);
+                        break;
+                    case core::services::OrderImpactKind::FlipToShort:
+                    case core::services::OrderImpactKind::FlipToLong:
+                        kindStr = imp.kind == core::services::OrderImpactKind::FlipToShort ? "FLIP TO SHORT" : "FLIP TO LONG";
+                        impactCol = ImVec4(1.00f, 0.70f, 0.20f, 1.f);
+                        break;
+                    default: break;
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Text, impactCol);
+                ImGui::TextUnformatted(kindStr);
+                ImGui::PopStyleColor();
+
+                if (imp.isClosingPath) {
+                    double pctPnL = 0.0;
+                    if (imp.closeQty > 0.0 && avgCost > 0.0)
+                        pctPnL = (imp.closePnL / (avgCost * imp.closeQty)) * 100.0;
+                    ImGui::Text("  Close:    %.0f sh", imp.closeQty);
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                        imp.closePnL >= 0.0 ? ImVec4(0.25f, 0.90f, 0.35f, 1.f)
+                                            : ImVec4(0.95f, 0.40f, 0.30f, 1.f));
+                    ImGui::Text("  Est. P&L: %+.2f (%+.2f%%)", imp.closePnL, pctPnL);
+                    ImGui::PopStyleColor();
+                    if (imp.openQty > 0.0) {
+                        const char* openDir = (imp.kind == core::services::OrderImpactKind::FlipToShort)
+                                              ? "short" : "long";
+                        ImGui::Text("  Open:     %.0f %s @ $%.2f", imp.openQty, openDir, fPrice);
+                    }
+                } else {
+                    ImGui::Text("  Shares:   %.0f @ $%.2f", o.quantity, fPrice);
+                    ImGui::Text("  Cost:     ~ $%'.2f", o.quantity * fPrice);
+                }
+            }
         }
     }
 
@@ -1698,6 +2183,8 @@ void ChartWindow::DrawOverlays(double /*step*/) {
     ImDrawList* dl   = ImPlot::GetPlotDrawList();
     ImPlot::PushPlotClipRect();
 
+    m_liveCursorPrice = 0.0;   // reset each frame; set below when armed+hovered
+
     // Use direct rect-hit for hover (robust even if NoInputs is active for drawing tools)
     ImVec2 pMin = ImPlot::GetPlotPos();
     ImVec2 pMax = ImVec2(pMin.x + ImPlot::GetPlotSize().x,
@@ -1767,6 +2254,9 @@ void ChartWindow::DrawOverlays(double /*step*/) {
 
     // ── Auto-detected supports / resistances ──────────────────────────────────
     DrawAutoSupportResistance();
+
+    // ── Setup-suggestion overlay (entry / stop / target reference levels) ─────
+    if (m_setupSettings.overlay && m_setup.valid) DrawSetupOverlay();
 
     // ── Auto trend line ───────────────────────────────────────────────────────
     if (m_auto.trend) DrawAutoTrend();
@@ -1930,17 +2420,20 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         // Returns net P&L (gross minus entry commission) when this order closes the
         // current position at the given price; returns NaN when not applicable.
         auto calcOrderPnL = [&](double price) -> double {
-            if (isAux) return std::nan("");            // aux leg: P&L on main leg
+            // For dual-price orders (STP LMT / LIT) the fill happens at the
+            // limit (aux leg), not the stop/trigger (main leg). Show P&L on
+            // whichever leg represents the actual fill price.
+            bool isDual = (order.orderType == "STP LMT" ||
+                           order.orderType == "LIT");
+            if (isAux != isDual) return std::nan("");
             if (!m_position.hasPosition) return std::nan("");
-            double posQty = m_position.qty;
-            bool closingLong  = !order.isBuy && posQty >  1e-9;
-            bool closingShort =  order.isBuy && posQty < -1e-9;
-            if (!closingLong && !closingShort) return std::nan("");
-            double closeQty = std::min((double)order.qty, std::abs(posQty));
-            double gross = closingLong
-                           ? (price - m_position.avgCost) * closeQty
-                           : (m_position.avgCost - price) * closeQty;
-            return gross - m_position.commission;
+            double commPerShare = std::abs(m_position.qty) > 0.0
+                                  ? m_position.commission / std::abs(m_position.qty) : 0.0;
+            auto imp = core::services::ComputeOrderImpact(
+                m_position.qty, m_position.avgCost, commPerShare,
+                order.isBuy, (double)order.qty, price);
+            if (!imp.isClosingPath) return std::nan("");
+            return imp.closePnL;
         };
 
         // Pre-compute label text and cancel-button rect so we can exclude the
@@ -1961,8 +2454,12 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                                   order.isBuy ? "BUY" : "SELL",
                                   legTag[0] ? legTag : "", order.qty, drawPrice);
             } else if (legTag[0]) {
-                std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f ",
-                              order.isBuy ? "BUY" : "SELL", legTag, drawPrice);
+                if (!std::isnan(pnl))
+                    std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f  %+.2f ",
+                                  order.isBuy ? "BUY" : "SELL", legTag, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f ",
+                                  order.isBuy ? "BUY" : "SELL", legTag, drawPrice);
             } else if (!std::isnan(pnl)) {
                 std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
                               order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
@@ -1974,11 +2471,13 @@ void ChartWindow::DrawOverlays(double /*step*/) {
 
         ImVec2 lblSz  = ImGui::CalcTextSize(lbl);
         float  lblX   = lp0.x + 20.f;
-        float  btnX   = lblX + lblSz.x + 4.f;
         float  btnY   = lp0.y - 7.f;
-        ImVec2 btnMin(btnX, btnY), btnMax(btnX + 14.f, btnY + 14.f);
+        // Guard button rect (approx, before P&L rebuild). The real rect is
+        // recomputed after the label is extended with P&L below.
+        float  guardBtnX   = lblX + lblSz.x + 4.f;
+        ImVec2 guardBtnMin(guardBtnX, btnY), guardBtnMax(guardBtnX + 14.f, btnY + 14.f);
         bool   cancelBtnHovered = !isAux && !isDragging &&
-                                  ImGui::IsMouseHoveringRect(btnMin, btnMax, false);
+                                  ImGui::IsMouseHoveringRect(guardBtnMin, guardBtnMax, false);
 
         // Proximity + interaction guard
         bool canInteract = !m_limitArmed &&
@@ -2033,11 +2532,24 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                                   order.isBuy ? "BUY" : "SELL",
                                   legTag[0] ? legTag : "", order.qty, drawPrice);
             } else if (!std::isnan(pnl)) {
-                std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
-                              order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
+                if (legTag[0])
+                    std::snprintf(lbl, sizeof(lbl), " %s %s $%.2f  %+.2f ",
+                                  order.isBuy ? "BUY" : "SELL", legTag, drawPrice, pnl);
+                else
+                    std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
+                                  order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
             }
             lblSz = ImGui::CalcTextSize(lbl);
         }
+
+        // Recompute cancel-button rect AND hover state from the final label
+        // (may have grown with P&L text above).  +6 px gutter so the "x"
+        // never clips into decimals.  Must also refresh cancelBtnHovered so
+        // the hit-test matches the visible button, not the earlier guard rect.
+        float  btnX   = lblX + lblSz.x + 6.f;
+        ImVec2 btnMin(btnX, btnY), btnMax(btnX + 14.f, btnY + 14.f);
+        if (!isAux && !isDragging)
+            cancelBtnHovered = ImGui::IsMouseHoveringRect(btnMin, btnMax, false);
 
         float lineThick = (nearLine || isDragging) ? 2.5f : 1.5f;
         DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol, lineThick, 8.f, 5.f);
@@ -2084,6 +2596,7 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         bool isDual   = kOrderTypes[m_orderTypeIdx].isDualPrice;
         bool isBuy    = (m_limitSide == "BUY");
         double cursorPrice = std::round(mp.y / 0.01) * 0.01;
+        m_liveCursorPrice  = cursorPrice;   // feed the order-impact badge
 
         // Helper: draw a floating dashed line with a price bubble at the cursor.
         // pnl=NaN → no P&L annotation.
@@ -2095,14 +2608,20 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol,
                             followsCursor ? 2.0f : 2.5f, 8.f, 5.f);
 
-            // Floating price bubble at cursor X (or center for fixed line)
-            char bubBuf[64];
-            if (!std::isnan(pnl))
+            // Floating price bubble at cursor X (or center for fixed line).
+            // Closing paths show P&L; opening/add paths show estimated cost.
+            char bubBuf[80];
+            if (!std::isnan(pnl)) {
                 std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f   P&L %+.2f",
                               tag[0] ? tag : m_limitSide.c_str(), linePrice, pnl);
-            else
+            } else if (m_orderQty > 0) {
+                double cost = linePrice * (double)m_orderQty;
+                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f  ~ $%'.0f",
+                              tag[0] ? tag : m_limitSide.c_str(), linePrice, cost);
+            } else {
                 std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f",
                               tag[0] ? tag : m_limitSide.c_str(), linePrice);
+            }
             ImVec2 bubSz  = ImGui::CalcTextSize(bubBuf);
             float  mouseX = followsCursor
                             ? ImGui::GetIO().MousePos.x
@@ -2118,14 +2637,19 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                                   ImVec2(midX+4, by+bubSz.y+4),
                                   ImVec2(midX,   lp0.y), bubBg);
 
-            // Right-edge label (shows P&L when available)
-            char edgeBuf[64];
-            if (!std::isnan(pnl))
+            // Right-edge label (P&L for closing, cost for opening/add)
+            char edgeBuf[80];
+            if (!std::isnan(pnl)) {
                 std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f   %+.2f ",
                               m_limitSide.c_str(), tag, linePrice, pnl);
-            else
+            } else if (m_orderQty > 0) {
+                double cost = linePrice * (double)m_orderQty;
+                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f  ~ $%'.0f ",
+                              m_limitSide.c_str(), tag, linePrice, cost);
+            } else {
                 std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f ",
                               m_limitSide.c_str(), tag, linePrice);
+            }
             ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
             dl->AddRectFilled(ImVec2(lp1.x, lp0.y-9),
                               ImVec2(lp1.x+eSz.x+4, lp0.y+9), bubBg, 2.f);
@@ -2137,15 +2661,13 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             if (!m_position.hasPosition || std::abs(m_position.qty) < 1e-9 ||
                 m_position.avgCost <= 0.0)
                 return std::numeric_limits<double>::quiet_NaN();
-            bool closingLong  = (m_limitSide == "SELL") && (m_position.qty >  1e-9);
-            bool closingShort = (m_limitSide == "BUY")  && (m_position.qty < -1e-9);
-            if (!closingLong && !closingShort)
-                return std::numeric_limits<double>::quiet_NaN();
-            double closeQty = std::min((double)m_orderQty, std::abs(m_position.qty));
-            double gross = closingLong
-                           ? (price - m_position.avgCost) * closeQty
-                           : (m_position.avgCost - price) * closeQty;
-            return gross - m_position.commission;
+            bool isBuy = (m_limitSide == "BUY");
+            double commPerShare = m_position.commission / std::abs(m_position.qty);
+            auto imp = core::services::ComputeOrderImpact(
+                m_position.qty, m_position.avgCost, commPerShare,
+                isBuy, (double)m_orderQty, price);
+            if (!imp.isClosingPath) return std::numeric_limits<double>::quiet_NaN();
+            return imp.closePnL;
         };
 
         // Colors
@@ -2196,12 +2718,12 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                 }
             }
         } else {
-            // Phase 1: single moving line (stop/trigger for dual, price for single)
+            // Phase 1: single moving line (stop/trigger for dual, price for single).
+            // For dual-price types the cursor IS the stop/trigger leg. Showing P&L
+            // at this price gives a worst-case estimate — Phase 2 refines it to
+            // the limit fill price.
             const char* tag = isDual ? "STOP" : "";
-            // For dual types the P&L is shown later (phase 2 limit leg); for single types
-            // show it now — a stop on a long position exits at the stop price.
-            double armedPnL = isDual ? std::numeric_limits<double>::quiet_NaN()
-                                     : calcArmedPnL(cursorPrice);
+            double armedPnL = calcArmedPnL(cursorPrice);
             drawArmedLine(cursorPrice, stopCol, stopBg, tag, true, armedPnL);
 
             bool ctrlHeld = ImGui::GetIO().KeyCtrl;
@@ -2248,22 +2770,325 @@ void ChartWindow::DrawOverlays(double /*step*/) {
 }
 
 // ============================================================================
+// Order-impact badge — side-intent + P&L preview
+//
+// Rendered below the BUY / SELL / [Use suggestion] row in DrawTradePanel.
+// Shows what the staged order would do to the current position (open / add /
+// reduce / close / flip) and the projected P&L at the estimated fill price.
+// Pure visualisation — no behaviour change.
+// ============================================================================
+void ChartWindow::DrawOrderImpactBadge() {
+    if (m_orderQty <= 0) return;
+
+    // ── Determine side (BUY / SELL) ────────────────────────────────────────
+    bool isBuy;
+    bool haveSide = false;
+    if (m_limitArmed) {
+        isBuy = (m_limitSide == "BUY");
+        haveSide = true;
+    }
+    if (!haveSide) return;
+
+    // ── Derive fill price from order type and current form/placed state ────
+    const auto& ot = kOrderTypes[m_orderTypeIdx];
+    double last = m_position.lastPrice;
+    double fillPrice = 0.0;
+
+    if (ot.needsPrice) {
+        // Use the live cursor price when the user is positioning the order
+        // on the chart (updated each frame from DrawOverlays). This makes
+        // the badge track the cursor in real-time. For dual-price types
+        // (STP LMT / LIT), when m_firstPricePlaced the cursor IS the
+        // limit leg — exactly the fill price we want.
+        if (m_liveCursorPrice > 0.0) {
+            fillPrice = m_liveCursorPrice;
+        } else if (ot.isDualPrice) {
+            if (m_firstPricePlaced && m_firstPrice > 0.0)
+                fillPrice = m_firstPrice;          // fallback: stop/trigger leg
+            else return;
+        } else {
+            if (m_limitPlaced && m_placedPrice > 0.0)
+                fillPrice = m_placedPrice;         // fallback: placed+dragging
+            else return;
+        }
+    } else {
+        if (last <= 0.0) return;
+        switch (ot.coreType) {
+            case core::OrderType::Market:
+            case core::OrderType::MOC:
+            case core::OrderType::MTL:
+            case core::OrderType::Midprice:
+                fillPrice = last;  break;
+            case core::OrderType::Trail:
+            case core::OrderType::TrailLimit:
+                fillPrice = isBuy ? (last - m_trailAmount) : (last + m_trailAmount);
+                break;
+            case core::OrderType::Relative:
+                fillPrice = isBuy ? (last + m_pegOffset) : (last - m_pegOffset);
+                break;
+            default: return;
+        }
+    }
+    if (fillPrice <= 0.0) return;
+
+    // ── Compute impact ─────────────────────────────────────────────────────
+    double posQty = m_position.hasPosition ? m_position.qty : 0.0;
+    double avgCost = m_position.hasPosition ? m_position.avgCost : 0.0;
+    double commPerShare = 0.0;
+    if (m_position.hasPosition && std::abs(m_position.qty) > 0.0)
+        commPerShare = m_position.commission / std::abs(m_position.qty);
+
+    auto imp = core::services::ComputeOrderImpact(posQty, avgCost, commPerShare,
+                                                   isBuy, (double)m_orderQty, fillPrice);
+    if (imp.kind == core::services::OrderImpactKind::Invalid) return;
+
+    // ── Colour palette ─────────────────────────────────────────────────────
+    static constexpr ImVec4 kOpenAddBg   = ImVec4(0.05f, 0.12f, 0.22f, 0.90f);
+    static constexpr ImVec4 kOpenAddBdr  = ImVec4(0.20f, 0.50f, 0.85f, 0.90f);
+    static constexpr ImVec4 kGreenBg     = ImVec4(0.05f, 0.18f, 0.08f, 0.90f);
+    static constexpr ImVec4 kGreenBdr    = ImVec4(0.15f, 0.65f, 0.25f, 0.90f);
+    static constexpr ImVec4 kRedBg       = ImVec4(0.22f, 0.08f, 0.05f, 0.90f);
+    static constexpr ImVec4 kRedBdr      = ImVec4(0.80f, 0.25f, 0.15f, 0.90f);
+    static constexpr ImVec4 kFlipBg      = ImVec4(0.25f, 0.15f, 0.05f, 0.90f);
+    static constexpr ImVec4 kFlipBdr     = ImVec4(0.90f, 0.55f, 0.10f, 0.90f);
+
+    ImVec4 bgCol, bdrCol, textCol;
+    bool isOpenOrAdd = false;
+
+    switch (imp.kind) {
+        case core::services::OrderImpactKind::OpenLong:
+        case core::services::OrderImpactKind::OpenShort:
+        case core::services::OrderImpactKind::AddToLong:
+        case core::services::OrderImpactKind::AddToShort:
+            bgCol = kOpenAddBg;  bdrCol = kOpenAddBdr;
+            textCol = ImVec4(0.40f, 0.70f, 1.00f, 1.f);
+            isOpenOrAdd = true;
+            break;
+        case core::services::OrderImpactKind::ReduceLong:
+        case core::services::OrderImpactKind::ReduceShort:
+        case core::services::OrderImpactKind::CloseLong:
+        case core::services::OrderImpactKind::CloseShort:
+            if (imp.closePnL > 0.0) {
+                bgCol = kGreenBg; bdrCol = kGreenBdr;
+                textCol = ImVec4(0.25f, 0.90f, 0.35f, 1.f);
+            } else {
+                bgCol = kRedBg; bdrCol = kRedBdr;
+                textCol = ImVec4(0.95f, 0.40f, 0.30f, 1.f);
+            }
+            break;
+        case core::services::OrderImpactKind::FlipToShort:
+        case core::services::OrderImpactKind::FlipToLong:
+            bgCol = kFlipBg; bdrCol = kFlipBdr;
+            textCol = ImVec4(1.00f, 0.70f, 0.20f, 1.f);
+            break;
+        default: return;
+    }
+
+    float stripH = ImGui::GetTextLineHeightWithSpacing()
+                 + ImGui::GetStyle().FramePadding.y * 2.0f + 6.0f;
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,    bgCol);
+    ImGui::PushStyleColor(ImGuiCol_Border,     bdrCol);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+    ImGui::BeginChild("##orderimpact", ImVec2(-1, stripH),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, textCol);
+
+    char buf[200];
+    const char* kindStr = "";
+    switch (imp.kind) {
+        case core::services::OrderImpactKind::OpenLong:     kindStr = "OPEN LONG";      break;
+        case core::services::OrderImpactKind::OpenShort:    kindStr = "OPEN SHORT";     break;
+        case core::services::OrderImpactKind::AddToLong:    kindStr = "ADD TO LONG";    break;
+        case core::services::OrderImpactKind::AddToShort:   kindStr = "ADD TO SHORT";   break;
+        case core::services::OrderImpactKind::ReduceLong:   kindStr = "REDUCE LONG";    break;
+        case core::services::OrderImpactKind::ReduceShort:  kindStr = "REDUCE SHORT";   break;
+        case core::services::OrderImpactKind::CloseLong:    kindStr = "CLOSE LONG";     break;
+        case core::services::OrderImpactKind::CloseShort:   kindStr = "CLOSE SHORT";    break;
+        case core::services::OrderImpactKind::FlipToShort:  kindStr = "FLIP TO SHORT";  break;
+        case core::services::OrderImpactKind::FlipToLong:   kindStr = "FLIP TO LONG";   break;
+        default: break;
+    }
+
+    if (isOpenOrAdd) {
+        double cost = fillPrice * (double)m_orderQty;
+        std::snprintf(buf, sizeof(buf), "  %s  ·  %.0f sh @ $%.2f  ·  cost ~~ $%'.0f",
+                      kindStr, (double)m_orderQty, fillPrice, cost);
+    } else if (imp.kind == core::services::OrderImpactKind::FlipToShort ||
+               imp.kind == core::services::OrderImpactKind::FlipToLong) {
+        const char* openDir = (imp.kind == core::services::OrderImpactKind::FlipToShort)
+                              ? "short" : "long";
+        std::snprintf(buf, sizeof(buf), "  %s  ·  close %.0f (%+.2f)  →  open %.0f %s @ $%.2f",
+                      kindStr, imp.closeQty, imp.closePnL,
+                      imp.openQty, openDir, fillPrice);
+    } else {
+        double pctPnL = 0.0;
+        if (imp.closeQty > 0.0 && m_position.hasPosition && m_position.avgCost > 0.0)
+            pctPnL = (imp.closePnL / (m_position.avgCost * imp.closeQty)) * 100.0;
+        std::snprintf(buf, sizeof(buf), "  %s  ·  %.0f sh  ·  est. P&L %+.2f (%+.2f%%)",
+                      kindStr, imp.closeQty, imp.closePnL, pctPnL);
+    }
+    ImGui::TextUnformatted(buf);
+
+    // Second line: Target/Stop preview when setup overlay is active
+    if (m_setupSettings.overlay && m_setup.valid && imp.isClosingPath) {
+        auto stopImp = core::services::ComputeOrderImpact(posQty, avgCost, commPerShare,
+                                                          !isBuy, (double)m_orderQty,
+                                                          m_setup.stop);
+        if (stopImp.isClosingPath) {
+            auto stp = core::services::PreviewStopTarget(imp, stopImp);
+            if (stp.valid) {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.70f, 0.70f, 0.70f, 1.f));
+                char buf2[160];
+                std::snprintf(buf2, sizeof(buf2),
+                              "  |  Target $%.2f %+.2f  |  Stop $%.2f %+.2f  |  R:R %.1f",
+                              m_setup.target, stp.targetPnL,
+                              m_setup.stop, stp.stopPnL, stp.rrRatio);
+                ImGui::TextUnformatted(buf2);
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+
+    ImGui::PopStyleColor();
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+}
+
+// ============================================================================
+// Unguarded-position warning strip
+//
+// Yellow strip rendered above DrawInfoBar() / DrawPositionStrip() / chart when
+// the active hint says we have an open position with no protective stop on the
+// books. "Place stop" stages a StopLimit (or plain Stop, depending on
+// m_setupSettings.useStopLmt) order through the existing DrawConfirmPopup() so
+// the user always sees the order before it leaves. "Dismiss" hides the strip
+// for this symbol until the position quantity changes.
+//
+// The strip is intentionally non-blocking — no modal, no big banner, no red.
+// Yellow signals "attention required, but you choose what to do".
+// ============================================================================
+void ChartWindow::DrawUnguardedStrip() {
+    if (!m_unguarded.active)               return;
+    if (m_unguarded.symbol != m_symbol)    return;   // hint is for a different chart
+    if (m_dismissedUnguarded.count(m_symbol)) return;
+    if (m_unguarded.stopTrig <= 0.0)       return;
+
+    bool isLong = (m_unguarded.qty > 0.0);
+    double absQty = std::abs(m_unguarded.qty);
+
+    static constexpr ImVec4 kStripBg     = ImVec4(0.30f, 0.24f, 0.05f, 0.90f);
+    static constexpr ImVec4 kStripBorder = ImVec4(1.00f, 0.80f, 0.20f, 0.90f);
+    static constexpr ImVec4 kWarnText    = ImVec4(1.00f, 0.85f, 0.25f, 1.00f);
+
+    float stripH = ImGui::GetTextLineHeightWithSpacing()
+                 + ImGui::GetStyle().FramePadding.y * 2.0f + 6.0f;
+
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,    kStripBg);
+    ImGui::PushStyleColor(ImGuiCol_Border,     kStripBorder);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.5f);
+    ImGui::BeginChild("##unguarded", ImVec2(-1, stripH),
+                      ImGuiChildFlags_Borders,
+                      ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoScrollWithMouse);
+
+    FlexRow row;
+
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "WARNING  %s %s %.0f sh @ $%.2f - no protective stop. "
+                  "Suggested stop $%.2f (-%.2f%%).",
+                  m_symbol,
+                  isLong ? "long" : "short",
+                  absQty,
+                  m_unguarded.avgCost,
+                  m_unguarded.stopTrig,
+                  m_unguarded.pctRisk);
+    row.item(FlexRow::textW(msg), 0);
+    ImGui::PushStyleColor(ImGuiCol_Text, kWarnText);
+    ImGui::TextUnformatted(msg);
+    ImGui::PopStyleColor();
+
+    bool placeClicked = false;
+    bool dismissClicked = false;
+
+    const float kPlaceW   = em(110);
+    const float kDismissW = em(80);
+
+    row.item(kPlaceW, 12);
+    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.55f, 0.42f, 0.10f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.60f, 0.18f, 1.f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.42f, 0.32f, 0.06f, 1.f));
+    placeClicked = ImGui::Button("Place stop", ImVec2(kPlaceW, 0));
+    ImGui::PopStyleColor(3);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Stage a %s order at the suggested level. "
+                          "You'll review the full order before sending.",
+                          m_setupSettings.useStopLmt ? "Stop-Limit" : "Stop");
+
+    row.item(kDismissW, 4);
+    dismissClicked = ImGui::Button("Dismiss", ImVec2(kDismissW, 0));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Hide this warning until the position quantity "
+                          "changes.");
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+
+    if (dismissClicked) {
+        m_dismissedUnguarded.insert(m_symbol);
+        return;
+    }
+
+    if (placeClicked) {
+        // Build a protective StopLimit (or plain Stop) on the OPPOSITE side of
+        // the position, full quantity, DAY only, RTH only. Route through the
+        // existing confirmation popup — never bypasses confirmation.
+        core::Order o;
+        o.symbol     = m_symbol;
+        o.side       = isLong ? core::OrderSide::Sell : core::OrderSide::Buy;
+        o.quantity   = absQty;
+        o.tif        = core::TimeInForce::Day;
+        o.outsideRth = false;
+        o.exchange   = "SMART";
+        if (m_setupSettings.useStopLmt) {
+            o.type       = core::OrderType::StopLimit;
+            o.stopPrice  = m_unguarded.stopTrig;
+            o.limitPrice = m_unguarded.stopLmt;
+        } else {
+            o.type      = core::OrderType::Stop;
+            o.stopPrice = m_unguarded.stopTrig;
+        }
+        m_pendingConfirmOrder = o;
+        m_showConfirmPopup    = true;
+    }
+}
+
+// ============================================================================
 // Position P&L strip
 // ============================================================================
 void ChartWindow::DrawPositionStrip() {
-    if (!m_position.hasPosition || std::abs(m_position.qty) < 1e-9) return;
+    bool hasPos = m_position.hasPosition && std::abs(m_position.qty) >= 1e-9;
+    bool showOrder = m_limitArmed;
+    if (!hasPos && !showOrder) return;
 
     double qty    = m_position.qty;
     double entry  = m_position.avgCost;
     double last   = m_position.lastPrice > 0.0 ? m_position.lastPrice
                                                 : m_position.avgCost;
     double comm   = m_position.commission;
-    double unreal = m_position.unrealPnL;   // IB-computed; fallback below
+    double unreal = m_position.unrealPnL;
     if (unreal == 0.0 && entry > 0.0)
         unreal = (last - entry) * qty;
     double net    = unreal - comm;
 
-    // Height accommodates up to 2 wrapped lines
     float stripH = ImGui::GetTextLineHeightWithSpacing() * 2.0f
                  + ImGui::GetStyle().WindowPadding.y;
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.12f, 1.0f));
@@ -2273,65 +3098,102 @@ void ChartWindow::DrawPositionStrip() {
 
     FlexRow row;
 
-    row.item(FlexRow::textW("Position:"), 0);
-    ImGui::TextDisabled("Position:");
+    if (hasPos) {
+        row.item(FlexRow::textW("Position:"), 0);
+        ImGui::TextDisabled("Position:");
 
-    char qtyBuf[24];
-    std::snprintf(qtyBuf, sizeof(qtyBuf), "%.0f sh", qty);
-    row.item(FlexRow::textW(qtyBuf), 6);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        qty >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
-                 : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::TextUnformatted(qtyBuf);
-    ImGui::PopStyleColor();
+        char qtyBuf[24];
+        std::snprintf(qtyBuf, sizeof(qtyBuf), "%.0f sh", qty);
+        row.item(FlexRow::textW(qtyBuf), 6);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            qty >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+                     : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+        ImGui::TextUnformatted(qtyBuf);
+        ImGui::PopStyleColor();
 
-    row.item(FlexRow::textW("Entry:"), 12);
-    ImGui::TextDisabled("Entry:");
-    char entryBuf[16];
-    std::snprintf(entryBuf, sizeof(entryBuf), "$%.2f", entry);
-    row.item(FlexRow::textW(entryBuf), 4);
-    ImGui::TextUnformatted(entryBuf);
+        row.item(FlexRow::textW("Entry:"), 12);
+        ImGui::TextDisabled("Entry:");
+        char entryBuf[16];
+        std::snprintf(entryBuf, sizeof(entryBuf), "$%.2f", entry);
+        row.item(FlexRow::textW(entryBuf), 4);
+        ImGui::TextUnformatted(entryBuf);
 
-    row.item(FlexRow::textW("Last:"), 12);
-    ImGui::TextDisabled("Last:");
-    char lastBuf[16];
-    std::snprintf(lastBuf, sizeof(lastBuf), "$%.2f", last);
-    row.item(FlexRow::textW(lastBuf), 4);
-    ImGui::TextUnformatted(lastBuf);
+        row.item(FlexRow::textW("Last:"), 12);
+        ImGui::TextDisabled("Last:");
+        char lastBuf[16];
+        std::snprintf(lastBuf, sizeof(lastBuf), "$%.2f", last);
+        row.item(FlexRow::textW(lastBuf), 4);
+        ImGui::TextUnformatted(lastBuf);
 
-    row.item(FlexRow::textW("Unreal P&L:"), 16);
-    ImGui::TextDisabled("Unreal P&L:");
-    char unrealBuf[16];
-    std::snprintf(unrealBuf, sizeof(unrealBuf), "%+.2f", unreal);
-    row.item(FlexRow::textW(unrealBuf), 4);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        unreal >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
-                    : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::TextUnformatted(unrealBuf);
-    ImGui::PopStyleColor();
+        row.item(FlexRow::textW("Unreal P&L:"), 16);
+        ImGui::TextDisabled("Unreal P&L:");
+        char unrealBuf[16];
+        std::snprintf(unrealBuf, sizeof(unrealBuf), "%+.2f", unreal);
+        row.item(FlexRow::textW(unrealBuf), 4);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            unreal >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+                        : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+        ImGui::TextUnformatted(unrealBuf);
+        ImGui::PopStyleColor();
 
-    if (comm > 0.0) {
-        row.item(FlexRow::textW("Comm:"), 12);
-        ImGui::TextDisabled("Comm:");
-        char commBuf[16];
-        std::snprintf(commBuf, sizeof(commBuf), "-$%.2f", comm);
-        row.item(FlexRow::textW(commBuf), 4);
-        ImGui::TextUnformatted(commBuf);
+        if (comm > 0.0) {
+            row.item(FlexRow::textW("Comm:"), 12);
+            ImGui::TextDisabled("Comm:");
+            char commBuf[16];
+            std::snprintf(commBuf, sizeof(commBuf), "-$%.2f", comm);
+            row.item(FlexRow::textW(commBuf), 4);
+            ImGui::TextUnformatted(commBuf);
+        }
+
+        double displayNet   = (m_position.dailyPnL != 0.0) ? m_position.dailyPnL : net;
+        const char* netLabel = (m_position.dailyPnL != 0.0) ? "Day P&L:" : "Net:";
+        row.item(FlexRow::textW(netLabel), 16);
+        ImGui::TextDisabled("%s", netLabel);
+        char netBuf[16];
+        std::snprintf(netBuf, sizeof(netBuf), "%+.2f", displayNet);
+        row.item(FlexRow::textW(netBuf), 4);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            displayNet >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
+                            : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
+        ImGui::TextUnformatted(netBuf);
+        ImGui::PopStyleColor();
     }
 
-    // Prefer IB-computed daily P&L when available; fall back to gross-minus-comm.
-    double displayNet   = (m_position.dailyPnL != 0.0) ? m_position.dailyPnL : net;
-    const char* netLabel = (m_position.dailyPnL != 0.0) ? "Day P&L:" : "Net:";
-    row.item(FlexRow::textW(netLabel), 16);
-    ImGui::TextDisabled("%s", netLabel);
-    char netBuf[16];
-    std::snprintf(netBuf, sizeof(netBuf), "%+.2f", displayNet);
-    row.item(FlexRow::textW(netBuf), 4);
-    ImGui::PushStyleColor(ImGuiCol_Text,
-        displayNet >= 0 ? ImVec4(0.20f, 0.90f, 0.40f, 1.f)
-                        : ImVec4(0.95f, 0.30f, 0.30f, 1.f));
-    ImGui::TextUnformatted(netBuf);
-    ImGui::PopStyleColor();
+    // ── Armed order info: type + live price ────────────────────────────────
+    if (showOrder) {
+        const auto& ot = kOrderTypes[m_orderTypeIdx];
+        double price = m_liveCursorPrice;
+        bool isBuy = (m_limitSide == "BUY");
+
+        if (hasPos) {
+            // Separator from position data
+            row.item(em(12), 12);
+            ImGui::TextDisabled("|");
+        }
+
+        row.item(FlexRow::textW("Order:"), 12);
+        ImGui::TextDisabled("Order:");
+
+        char orderBuf[64];
+        if (ot.isDualPrice && m_firstPricePlaced) {
+            std::snprintf(orderBuf, sizeof(orderBuf), "%s %s  STP $%.2f  LMT $%.2f",
+                          isBuy ? "BUY" : "SELL",
+                          ot.label, m_firstPrice,
+                          price > 0.0 ? price : m_placedPrice);
+        } else if (ot.needsPrice && price > 0.0) {
+            std::snprintf(orderBuf, sizeof(orderBuf), "%s %s @ $%.2f",
+                          isBuy ? "BUY" : "SELL", ot.label, price);
+        } else {
+            std::snprintf(orderBuf, sizeof(orderBuf), "%s %s",
+                          isBuy ? "BUY" : "SELL", ot.label);
+        }
+        row.item(FlexRow::textW(orderBuf), 4);
+        ImGui::PushStyleColor(ImGuiCol_Text,
+            isBuy ? ImVec4(0.25f, 0.80f, 0.40f, 1.f)
+                  : ImVec4(0.95f, 0.35f, 0.30f, 1.f));
+        ImGui::TextUnformatted(orderBuf);
+        ImGui::PopStyleColor();
+    }
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
@@ -2417,6 +3279,16 @@ void ChartWindow::DrawCandleChart() {
     if (m_ind.vwap && (int)m_vwap.size() == n) {
         ImPlot::SetNextLineStyle(ImVec4(1.f, 1.f, 1.f, 1.f), 2.f);
         ImPlot::PlotLine("VWAP", m_idxs.data(), m_vwap.data(), n);
+        if (m_ind.vwapBands && (int)m_vwapSd2Up.size() == n) {
+            ImPlot::SetNextLineStyle(ImVec4(1.f, 0.85f, 0.0f, 0.30f), 1.f);
+            ImPlot::PlotLine("VWAP+1σ", m_idxs.data(), m_vwapSd1Up.data(), n);
+            ImPlot::SetNextLineStyle(ImVec4(1.f, 0.85f, 0.0f, 0.30f), 1.f);
+            ImPlot::PlotLine("VWAP-1σ", m_idxs.data(), m_vwapSd1Dn.data(), n);
+            ImPlot::SetNextLineStyle(ImVec4(1.f, 0.85f, 0.0f, 0.18f), 1.f);
+            ImPlot::PlotLine("VWAP+2σ", m_idxs.data(), m_vwapSd2Up.data(), n);
+            ImPlot::SetNextLineStyle(ImVec4(1.f, 0.85f, 0.0f, 0.18f), 1.f);
+            ImPlot::PlotLine("VWAP-2σ", m_idxs.data(), m_vwapSd2Dn.data(), n);
+        }
     }
 
     if (m_auto.donchian) DrawDonchian();
@@ -2852,8 +3724,27 @@ void ChartWindow::ComputeIndicators() {
     CalcBollingerBands(m_closes, m_ind.bbPeriod, m_ind.bbSigma,
                        m_bbMid, m_bbUpper, m_bbLower);
     m_rsi  = CalcRSI(m_closes, m_ind.rsiPeriod);
-    m_vwap = CalcVWAP(m_highs, m_lows, m_closes, m_volumes, m_xs,
-                      IsIntraday(m_timeframe));
+    {
+        std::vector<int> sessionStarts;
+        if (IsIntraday(m_timeframe)) {
+            for (int i = 1; i < (int)m_xs.size(); ++i) {
+                std::time_t a = (std::time_t)m_xs[i - 1];
+                std::time_t b = (std::time_t)m_xs[i];
+                std::tm* ta = std::gmtime(&a);
+                int dayA = ta ? ta->tm_yday : 0;
+                std::tm* tb = std::gmtime(&b);
+                int dayB = tb ? tb->tm_yday : 0;
+                if (dayA != dayB) sessionStarts.push_back(i);
+            }
+        }
+        auto vw = core::services::SessionVwap(m_highs, m_lows, m_closes,
+                                              m_volumes, sessionStarts);
+        m_vwap      = std::move(vw.vwap);
+        m_vwapSd1Up = std::move(vw.sd1Up);
+        m_vwapSd1Dn = std::move(vw.sd1Dn);
+        m_vwapSd2Up = std::move(vw.sd2Up);
+        m_vwapSd2Dn = std::move(vw.sd2Dn);
+    }
     DetectStructure();
 }
 
@@ -2879,6 +3770,8 @@ void ChartWindow::DetectStructure() {
     m_breakoutZoneTop    = 0.0;
     m_breakoutZoneBot    = 0.0;
     m_breakoutFromSupply = false;
+    m_breakoutLevelIdx   = -1;
+    m_setup              = SetupPlan{};
 
     int n = static_cast<int>(m_closes.size());
     if (n < 30) return;
@@ -2958,6 +3851,10 @@ void ChartWindow::DetectStructure() {
                                     m_highs, m_lows, m_closes, m_atr14,
                                     /*lookback=*/50, m_auto.minTouches);
     }
+
+    if (m_setupSettings.overlay && m_breakoutSignal != BreakoutDirection::None) {
+        ComputeSetupPlan();
+    }
 }
 
 // ============================================================================
@@ -3034,13 +3931,15 @@ void ChartWindow::ComputeBreakoutSignal() {
     double buffer = 0.5 * atr;
 
     auto findContaining = [&](const std::vector<AutoLevel>& levels, bool isSupply) {
-        for (const auto& lvl : levels) {
+        for (int i = 0; i < (int)levels.size(); ++i) {
+            const auto& lvl = levels[i];
             double bot = lvl.minPrice - buffer;
             double top = lvl.maxPrice + buffer;
             if (last >= bot && last <= top) {
                 m_breakoutZoneTop    = top;
                 m_breakoutZoneBot    = bot;
                 m_breakoutFromSupply = isSupply;
+                m_breakoutLevelIdx   = i;
                 return true;
             }
         }
@@ -3079,6 +3978,73 @@ void ChartWindow::ComputeBreakoutSignal() {
         m_breakoutSignal = BreakoutDirection::LongSetup;
     else if (last < midZone && bearish)
         m_breakoutSignal = BreakoutDirection::ShortSetup;
+}
+
+// ============================================================================
+// ComputeSetupPlan — assembles a reference-only entry/stop/target plan from
+// the active breakout signal. Caller has already verified m_breakoutSignal !=
+// None and m_setupSettings.overlay is on.
+//
+// Long path:  active zone is a demand zone (m_autoSupports), nearest opposing
+//             level is the closest resistance ABOVE the latest close.
+// Short path: active zone is a supply zone (m_autoResistances), nearest
+//             opposing level is the closest support BELOW the latest close.
+// ============================================================================
+void ChartWindow::ComputeSetupPlan() {
+    if (m_closes.empty() || m_atr14.empty()) return;
+    if (m_breakoutZoneTop <= m_breakoutZoneBot) return;
+
+    int    n   = (int)m_closes.size();
+    double atr = (n > 14 && (int)m_atr14.size() == n) ? m_atr14[n - 1] : 0.0;
+    if (atr <= 0.0) return;
+
+    double last = m_closes.back();
+    int    side = (m_breakoutSignal == BreakoutDirection::LongSetup) ? 1 : 0;
+
+    // Anchor = longest-wick edge of the active zone. The breakout signal
+    // populates m_breakoutFromSupply: true → resistance/supply zone (short),
+    // false → support/demand zone (long).
+    double anchor = 0.0;
+    if (side == 1) {
+        // Long: pick the demand zone the price is sitting in. Use minPrice as
+        // the structural anchor (the deepest wick).
+        if (m_breakoutLevelIdx < 0 ||
+            m_breakoutLevelIdx >= (int)m_autoSupports.size()) return;
+        anchor = m_autoSupports[m_breakoutLevelIdx].minPrice;
+    } else {
+        if (m_breakoutLevelIdx < 0 ||
+            m_breakoutLevelIdx >= (int)m_autoResistances.size()) return;
+        anchor = m_autoResistances[m_breakoutLevelIdx].maxPrice;
+    }
+
+    // Nearest opposing level becomes the target. For a long, that's the closest
+    // resistance ABOVE last; for a short, the closest support BELOW last.
+    double opposing = 0.0;
+    if (side == 1) {
+        double bestAbove = std::numeric_limits<double>::infinity();
+        for (const auto& r : m_autoResistances)
+            if (r.price > last && r.price < bestAbove) bestAbove = r.price;
+        if (!std::isfinite(bestAbove)) return;
+        opposing = bestAbove;
+    } else {
+        double bestBelow = -std::numeric_limits<double>::infinity();
+        for (const auto& s : m_autoSupports)
+            if (s.price < last && s.price > bestBelow) bestBelow = s.price;
+        if (!std::isfinite(bestBelow)) return;
+        opposing = bestBelow;
+    }
+
+    double equity = GetSelectedAccountEquity();
+    m_setup = core::services::SuggestSetup(
+        side,
+        m_breakoutZoneTop, m_breakoutZoneBot,
+        anchor, opposing,
+        atr, last,
+        m_setupSettings.atrPad,
+        m_setupSettings.roundPad,
+        m_setupSettings.stopOffset,
+        m_setupSettings.rrMin,
+        equity, m_setupSettings.riskPct);
 }
 
 // ============================================================================
@@ -3140,32 +4106,6 @@ std::vector<double> ChartWindow::CalcRSI(const std::vector<double>& close, int p
         ag = (ag * (period - 1) + (d > 0 ? d : 0.0)) / period;
         al = (al * (period - 1) + (d < 0 ? -d : 0.0)) / period;
         out[i] = rsi(ag, al);
-    }
-    return out;
-}
-
-std::vector<double> ChartWindow::CalcVWAP(const std::vector<double>& high,
-                                           const std::vector<double>& low,
-                                           const std::vector<double>& close,
-                                           const std::vector<double>& volume,
-                                           const std::vector<double>& timestamps,
-                                           bool intradayReset) {
-    int n = (int)close.size();
-    std::vector<double> out(n, 0.0);
-    if (n == 0) return out;
-    double cumTPV = 0.0, cumVol = 0.0;
-    int prevDay = -1;
-    for (int i = 0; i < n; i++) {
-        if (intradayReset) {
-            std::time_t t = (std::time_t)timestamps[i];
-            std::tm* tm   = std::gmtime(&t);
-            int day       = tm->tm_year * 366 + tm->tm_yday;
-            if (day != prevDay) { cumTPV = 0.0; cumVol = 0.0; prevDay = day; }
-        }
-        double tp = (high[i] + low[i] + close[i]) / 3.0;
-        cumTPV   += tp * volume[i];
-        cumVol   += volume[i];
-        out[i]    = (cumVol > 0.0) ? (cumTPV / cumVol) : close[i];
     }
     return out;
 }

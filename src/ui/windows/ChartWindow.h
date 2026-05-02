@@ -3,11 +3,13 @@
 #include "core/models/MarketData.h"
 #include "core/models/OrderData.h"
 #include "core/services/ChartAnalysis.h"
+#include "core/services/TradingStyle.h"
 #include "ui/WshData.h"
 #include <string>
 #include <vector>
 #include <deque>
 #include <functional>
+#include <unordered_set>
 
 struct ImDrawList;   // forward-declare to avoid pulling imgui.h into every TU
 
@@ -47,6 +49,19 @@ public:
         double dailyPnL    = 0.0;   // IB-computed today's P&L from reqPnLSingle (0 = not yet available)
     };
 
+    // ---- Unguarded-position warning hint (pushed by main.cpp once per frame) -
+    // active=false → no warning to show (no position, or stop already on the
+    // book, or chart S/R hasn't produced a usable suggestion yet).
+    struct UnguardedHint {
+        bool        active   = false;
+        std::string symbol;        // symbol the hint refers to (must match m_symbol)
+        double      qty      = 0.0;   // signed; positive = long, negative = short
+        double      avgCost  = 0.0;
+        double      stopTrig = 0.0;
+        double      stopLmt  = 0.0;
+        double      pctRisk  = 0.0;   // |entry-stop|/entry × 100
+    };
+
     ChartWindow();
 
     bool Render();
@@ -54,6 +69,29 @@ public:
     void SetSymbol(const std::string& symbol);
     std::string     getSymbol()    const { return m_symbol; }
     core::Timeframe getTimeframe() const { return m_timeframe; }
+
+    // Trading-style preset — hard-binds timeframe + history horizon + analysis
+    // params + setup-overlay params + default-overlay toggles. See
+    // .claude/plans/trading-styles.md.
+    core::services::TradingStyle tradingStyle() const { return m_tradingStyle; }
+
+    // Apply a preset; the host (main.cpp) handles the IB prefetch via
+    // OnStyleChange. `silent=true` skips firing OnStyleChange (used at
+    // restore-from-config time to avoid issuing a duplicate historical
+    // request when CreateTradingWindows already issued one with default mode).
+    //
+    // Free-mode special case: when `s == Free`, the chart's current
+    // `m_timeframe` is preserved across the call (Free's whole purpose is
+    // to let the user pick any TF), and the OnStyleChange duration is
+    // computed from the preserved TF via TimeframeIBDuration().
+    void setTradingStyle(core::services::TradingStyle s, bool silent = false);
+
+    // Free-mode TF setter — only meaningful when m_tradingStyle == Free.
+    // Updates m_timeframe, wipes data buffers + derived analysis state
+    // (NOT user settings: m_ind / m_auto / m_setupSettings / m_drawings),
+    // and fires OnStyleChange with TimeframeIBDuration(tf). `silent=true`
+    // skips the callback (used at restore-from-config time).
+    void setTimeframeFree(core::Timeframe tf, bool silent = false);
     void setGroupId(int id)    { m_groupId = id; }
     int  groupId() const       { return m_groupId; }
     void setInstanceId(int id);
@@ -85,9 +123,22 @@ public:
     // Push current position info for this symbol.
     void SetPosition(const PositionInfo& pos);
 
+    // Push the unguarded-position hint for this chart's symbol. Called once per
+    // frame from main.cpp's PushUnguardedHintsToWindows(). Setting active=false
+    // (or providing a hint for a different symbol) clears the strip.
+    void SetUnguardedSuggestion(const UnguardedHint& h);
+
     // Fired when user changes symbol/timeframe/rth — host wires to ReqHistoricalData
     // useRTH=false → include pre/post-market bars
     std::function<void(const std::string& sym, core::Timeframe tf, bool useRTH)> OnDataRequest;
+
+    // Fired when user picks a new style from the Style combo (NOT on initial
+    // set / silent restore). Host cancels current historical sub, enqueues the
+    // mode-switch fetch (1s throttle), and re-issues ReqHistoricalData with
+    // the preset's TF + historyDuration.
+    std::function<void(core::services::TradingStyle s,
+                       const std::string& historyDuration,
+                       bool useRTH)> OnStyleChange;
 
     // Fired when user pans left past the first bar to request older history.
     // endDateTime: IB-formatted "YYYYMMDD HH:MM:SS UTC" of the oldest known bar.
@@ -119,13 +170,14 @@ public:
 private:
     // ---- Indicator settings -------------------------------------------------
     struct IndicatorSettings {
-        bool sma20   = true;
-        bool sma50   = true;
-        bool ema20   = false;
-        bool bbands  = true;
-        bool vwap    = true;
-        bool volume  = true;
-        bool rsi     = true;
+        bool sma20      = true;
+        bool sma50      = true;
+        bool ema20      = false;
+        bool bbands     = true;
+        bool vwap       = true;
+        bool vwapBands  = false;   // ±1σ / ±2σ volume-weighted bands around VWAP
+        bool volume     = true;
+        bool rsi        = true;
 
         int   smaPeriod1 = 20;
         int   smaPeriod2 = 50;
@@ -163,7 +215,40 @@ private:
     using AutoFibSpan  = core::services::AutoFibSpan;
     using DailyPivot   = core::services::DailyPivot;
     using BreakoutMark = core::services::BreakoutMark;
+    using SetupPlan    = core::services::SetupPlan;
 
+    // ---- Setup-suggestion settings ------------------------------------------
+    // Reference-only trade plan derived from the active supply/demand signal.
+    // Defaults reflect the SL-hunter defenses agreed in the plan: 0.5×ATR pad,
+    // 7-cent round-number avoidance, 10-cent stop-limit slippage allowance,
+    // 2.0 minimum reward/risk, 1% account risk per trade.
+    struct SetupSettings {
+        bool   overlay     = false;
+        double rrMin       = 2.0;
+        double atrPad      = 0.5;
+        double roundPad    = 0.07;
+        double stopOffset  = 0.10;
+        double riskPct     = 1.0;
+        bool   useStopLmt  = true;
+    };
+
+public:
+    // Snapshot of this chart's auto-detected structure, used by main.cpp to build
+    // protective-stop suggestions for any open position on this symbol.
+    struct AutoLevelSnapshot {
+        std::vector<AutoLevel> supports;
+        std::vector<AutoLevel> resistances;
+        double                 atrLast = 0.0;
+    };
+    AutoLevelSnapshot getAutoLevels() const {
+        AutoLevelSnapshot s;
+        s.supports    = m_autoSupports;
+        s.resistances = m_autoResistances;
+        s.atrLast     = m_atr14.empty() ? 0.0 : m_atr14.back();
+        return s;
+    }
+
+private:
     // ---- State --------------------------------------------------------------
     int               m_groupId         = 0;
     int               m_instanceId      = 1;
@@ -177,6 +262,8 @@ private:
     bool              m_useRTH          = false;  // false = include extended hours
     bool              m_showOvernight   = false;  // show overnight bars (separate toggle)
     bool              m_showSessions    = true;   // draw session background bands
+
+    core::services::TradingStyle m_tradingStyle = core::services::TradingStyle::Swing;
 
     // Linked axis ranges (shared across all sub-plots)
     double            m_xMin            = 0.0;
@@ -209,6 +296,10 @@ private:
     std::vector<double> m_bbLower;
     std::vector<double> m_rsi;
     std::vector<double> m_vwap;
+    std::vector<double> m_vwapSd1Up;
+    std::vector<double> m_vwapSd1Dn;
+    std::vector<double> m_vwapSd2Up;
+    std::vector<double> m_vwapSd2Dn;
 
     // Auto-detected structure (populated by DetectStructure)
     std::vector<double>    m_atr14;
@@ -230,6 +321,11 @@ private:
     double                 m_breakoutZoneTop    = 0.0;
     double                 m_breakoutZoneBot    = 0.0;
     bool                   m_breakoutFromSupply = false; // true = supply zone, false = demand
+    int                    m_breakoutLevelIdx   = -1;    // idx into m_autoResistances / m_autoSupports
+
+    // Setup-suggestion state (populated at the tail of DetectStructure()).
+    SetupSettings          m_setupSettings;
+    SetupPlan              m_setup;
 
     int   m_hoverIdx          = -1;
     float m_chartHeightRatio  = 0.60f;
@@ -242,6 +338,11 @@ private:
     // ---- Pending order lines and position -----------------------------------
     std::vector<PendingOrderLine> m_pendingOrders;
     PositionInfo                  m_position;
+
+    // ---- Unguarded-position warning (managed by main.cpp per frame) ---------
+    UnguardedHint                       m_unguarded;
+    std::unordered_set<std::string>     m_dismissedUnguarded;
+    double                              m_lastWarnedQty = 0.0;  // detect position changes to clear dismissal
 
     // ---- Drawing tool state -------------------------------------------------
     DrawTool             m_drawTool    = DrawTool::Cursor;
@@ -279,6 +380,10 @@ private:
     double      m_dragPendingPrice  = 0.0;  // live price shown during drag
     bool        m_dragPendingActive = false; // drag is in progress
     bool        m_dragPendingIsAux  = false; // true = dragging the limit (aux) leg
+
+    // ---- Live cursor price during armed mode (updated each frame from
+    //      DrawOverlays; 0.0 when not armed or mouse outside plot) --------------
+    double      m_liveCursorPrice   = 0.0;
 
     // ---- Dual-price placement (STP LMT: click stop, then click limit) --------
     bool        m_firstPricePlaced  = false; // stop price has been clicked, limit line active
@@ -336,6 +441,11 @@ private:
     void DrawAutoSettingsPopup();
     void ComputeBreakoutSignal();
     void ComputeDailyPivots();    // walks m_xs to find prev day's OHLC; intraday only
+    void ComputeSetupPlan();      // populates m_setup from active breakout signal
+    void DrawSetupOverlay();      // dashed entry / stop / target lines + R:R tag
+    void DrawSetupSettingsPopup();// section appended inside DrawAutoSettingsPopup
+    void DrawUnguardedStrip();    // yellow protective-stop warning above the chart
+    void DrawOrderImpactBadge();  // side-intent + P&L preview below BUY/SELL row
 
     // Helpers
     static void DrawDashedHLine(ImDrawList* dl,
@@ -354,13 +464,6 @@ private:
                                    std::vector<double>& mid, std::vector<double>& upper,
                                    std::vector<double>& lower);
     static std::vector<double> CalcRSI(const std::vector<double>& close, int period);
-    static std::vector<double> CalcVWAP(const std::vector<double>& high,
-                                        const std::vector<double>& low,
-                                        const std::vector<double>& close,
-                                        const std::vector<double>& volume,
-                                        const std::vector<double>& timestamps,
-                                        bool intradayReset);
-
     static core::BarSeries GenerateSimulatedBars(const std::string& symbol,
                                                   core::Timeframe tf, int count);
 };
