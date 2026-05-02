@@ -473,6 +473,7 @@ static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 // Per-instance helpers: each window type has its own slot.
 //   Chart   hist:  1,3,5,...,19  ext: 2,4,6,...,20  mkt: 100-109
 //   Trading mkt:   110-119       depth: 120-129
+//   Futures /ES,/NQ: 140-141    (market health indicators)
 //   Scanner scan:  1000,1100,...,1900 (+99 ea)  mkt: 800,812,...,908 (+12 ea, 12 slots each)
 //   News:          201(RT), 400-420(conId), 500-520(hist), 600-699(art), 700-759(mkt)
 //   Account:       900
@@ -1541,6 +1542,10 @@ static void FinishConnect(bool isReconnect) {
         for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
             for (int i = 0; i < kMktSeedCount; ++i)
                 g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+
+        // Futures market health (/ES and /NQ) — reqIds 140, 141
+        g_IBClient->ReqFuturesMarketData(140, "/ES");
+        g_IBClient->ReqFuturesMarketData(141, "/NQ");
     } else {
         printf("[IB] Reconnected — re-subscribing all windows.\n");
         g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
@@ -1576,6 +1581,10 @@ static void FinishConnect(bool isReconnect) {
         for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni)
             for (int i = 0; i < kMktSeedCount; ++i)
                 g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
+
+        // Futures market health
+        g_IBClient->ReqFuturesMarketData(140, "/ES");
+        g_IBClient->ReqFuturesMarketData(141, "/NQ");
     }
 
     // Re-subscribe to TWS display groups if sync was already enabled before (re)connect.
@@ -1720,6 +1729,13 @@ static void WireIBCallbacks() {
             default: break;
         }
 
+        // Futures market health (reqIds 140 /ES, 141 /NQ) — fan out to all charts
+        if (tickerId == 140 || tickerId == 141) {
+            for (auto& ce : g_chartEntries)
+                if (ce.win) ce.win->OnFuturesTick(tickerId, field, price);
+            return;
+        }
+
         // Watchlist entries (reqIds 7000–7999) — self-routing by reqId
         if (tickerId >= 7000 && tickerId < 8000) {
             for (auto& we : g_watchlistEntries)
@@ -1836,10 +1852,12 @@ static void WireIBCallbacks() {
 
     // ── Market depth (Level II order book) ───────────────────────────────
     g_IBClient->onDepthUpdate = [](int id, bool isBid, int pos, int op,
-                                   double price, double size) {
+                                   double price, double size,
+                                   const std::string& exchange, bool isSmartDepth) {
         for (auto& te : g_tradingEntries)
             if (id == te.depthId && te.win)
-                te.win->OnDepthUpdate(id, isBid, pos, op, price, size);
+                te.win->OnDepthUpdate(id, isBid, pos, op, price, size,
+                                      exchange, isSmartDepth);
     };
 
     // ── Account values ────────────────────────────────────────────────────

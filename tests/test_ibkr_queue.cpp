@@ -163,17 +163,22 @@ TEST_CASE("ProcessMessages dispatches MsgDepth to onDepthUpdate", "[queue][depth
     int    op_out  = -1;
     double price_out = -1.0;
     double size_out  = -1.0;
+    std::string exch_out;
+    bool   smart_out = false;
 
-    client.onDepthUpdate = [&](int id, bool bid, int pos, int op, double price, double size) {
+    client.onDepthUpdate = [&](int id, bool bid, int pos, int op, double price, double size,
+                                const std::string& exchange, bool isSmartDepth) {
         id_out    = id;
         isBid     = bid;
         pos_out   = pos;
         op_out    = op;
         price_out = price;
         size_out  = size;
+        exch_out  = exchange;
+        smart_out = isSmartDepth;
     };
 
-    client.inject(MsgDepth{120, true, 0, 1, 149.50, 200.0});
+    client.inject(MsgDepth{120, true, 0, 1, 149.50, 200.0, "NYSE", false});
     client.ProcessMessages();
 
     REQUIRE(id_out    == 120);
@@ -182,6 +187,8 @@ TEST_CASE("ProcessMessages dispatches MsgDepth to onDepthUpdate", "[queue][depth
     REQUIRE(op_out    == 1);
     REQUIRE(price_out == Catch::Approx(149.50));
     REQUIRE(size_out  == Catch::Approx(200.0));
+    REQUIRE(exch_out  == "NYSE");
+    REQUIRE(smart_out == false);
 }
 
 // ── MsgError ─────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <ctime>
 #include <numeric>
 
@@ -32,37 +33,107 @@ TradingWindow::TradingWindow() {}
 // Public API — IB Gateway callbacks
 // ============================================================================
 void TradingWindow::OnDepthUpdate(int /*reqId*/, bool isBid, int pos, int op,
-                                   double price, double size) {
+                                   double price, double size,
+                                   const std::string& exchange, bool isSmartDepth) {
+    (void)isSmartDepth;
     m_depthStatus = SubStatus::Ok;
-    auto& levels = isBid ? m_bids : m_asks;
 
-    if (op == 0) {
-        // Insert
-        core::DepthLevel lvl;
-        lvl.price    = price;
-        lvl.size     = size;
-        lvl.flashAge = 0.0f;
-        if (pos >= (int)levels.size())
-            levels.push_back(lvl);
-        else
-            levels.insert(levels.begin() + pos, lvl);
-        if ((int)levels.size() > kDepthLevels)
-            levels.resize(kDepthLevels);
-    } else if (op == 1) {
-        // Update
-        if (pos < 0 || pos >= (int)levels.size()) return;
-        levels[pos].flashAge = 0.0f;
-        levels[pos].price    = price;
-        levels[pos].size     = size;
-    } else if (op == 2) {
-        // Delete
-        if (pos < 0 || pos >= (int)levels.size()) return;
-        levels.erase(levels.begin() + pos);
+    if (m_useL2) {
+        // L2 mode: write into per-exchange bucket.
+        // IB's pos index is per-exchange — each exchange has its own book.
+        auto& buckets = isBid ? m_bidBuckets : m_askBuckets;
+        std::string key = exchange.empty() ? "SMART" : exchange;
+        auto& levels = buckets[key];
+
+        if (op == 0) {
+            core::DepthLevel lvl;
+            lvl.price    = price;
+            lvl.size     = size;
+            lvl.flashAge = 0.0f;
+            lvl.exchange = key;
+            if (pos >= (int)levels.size())
+                levels.push_back(lvl);
+            else
+                levels.insert(levels.begin() + pos, lvl);
+            if ((int)levels.size() > kDepthLevels)
+                levels.resize(kDepthLevels);
+        } else if (op == 1) {
+            if (pos < 0 || pos >= (int)levels.size()) return;
+            levels[pos].flashAge = 0.0f;
+            levels[pos].price    = price;
+            levels[pos].size     = size;
+            levels[pos].exchange = key;
+        } else if (op == 2) {
+            if (pos < 0 || pos >= (int)levels.size()) return;
+            levels.erase(levels.begin() + pos);
+        }
+
+        RefreshExchangeFilterList();
+        RebuildDepthView();
+    } else {
+        // L1 mode: flat vectors as before.
+        auto& levels = isBid ? m_bids : m_asks;
+
+        if (op == 0) {
+            core::DepthLevel lvl;
+            lvl.price    = price;
+            lvl.size     = size;
+            lvl.flashAge = 0.0f;
+            lvl.exchange = exchange;
+            if (pos >= (int)levels.size())
+                levels.push_back(lvl);
+            else
+                levels.insert(levels.begin() + pos, lvl);
+            if ((int)levels.size() > kDepthLevels)
+                levels.resize(kDepthLevels);
+        } else if (op == 1) {
+            if (pos < 0 || pos >= (int)levels.size()) return;
+            levels[pos].flashAge = 0.0f;
+            levels[pos].price    = price;
+            levels[pos].size     = size;
+            levels[pos].exchange = exchange;
+        } else if (op == 2) {
+            if (pos < 0 || pos >= (int)levels.size()) return;
+            levels.erase(levels.begin() + pos);
+        }
     }
 
     m_maxDepthSize = 100.0;
     for (auto& l : m_asks) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
     for (auto& l : m_bids) m_maxDepthSize = std::max(m_maxDepthSize, l.size);
+}
+
+void TradingWindow::RefreshExchangeFilterList() {
+    std::set<std::string> seen;
+    seen.insert("All");
+    for (const auto& [exch, _] : m_askBuckets) if (!exch.empty()) seen.insert(exch);
+    for (const auto& [exch, _] : m_bidBuckets) if (!exch.empty()) seen.insert(exch);
+    m_exchangeList.assign(seen.begin(), seen.end());
+    if (m_exchangeFilterIdx >= (int)m_exchangeList.size())
+        m_exchangeFilterIdx = 0;
+}
+
+void TradingWindow::RebuildDepthView() {
+    if (!m_useL2) return;
+    const std::string& filter = (m_exchangeFilterIdx < (int)m_exchangeList.size())
+                                ? m_exchangeList[m_exchangeFilterIdx] : "All";
+    auto rebuild = [&](auto& flat, auto& buckets, bool asc) {
+        flat.clear();
+        if (filter == "All") {
+            // Merge all buckets into flat view sorted by price
+            for (auto& [_, vec] : buckets)
+                for (auto& l : vec) flat.push_back(l);
+            std::sort(flat.begin(), flat.end(), [asc](auto& a, auto& b) {
+                return asc ? (a.price < b.price) : (a.price > b.price);
+            });
+        } else {
+            auto it = buckets.find(filter);
+            if (it != buckets.end()) flat = it->second;
+        }
+        if ((int)flat.size() > kDepthLevels) flat.resize(kDepthLevels);
+    };
+    rebuild(m_asks, m_askBuckets, false); // asks: high → low
+    rebuild(m_bids, m_bidBuckets, true);  // bids: low → high
 }
 
 void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
@@ -192,6 +263,10 @@ void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
     m_midPrice        = midPrice;
     m_bids.clear();
     m_asks.clear();
+    m_askBuckets.clear();
+    m_bidBuckets.clear();
+    m_exchangeList = {"SMART"};
+    m_exchangeFilterIdx = 0;
     m_maxDepthSize    = 1.0;
     m_mktDataStatus   = SubStatus::Unknown;
     m_depthStatus     = SubStatus::Unknown;
@@ -448,6 +523,41 @@ void TradingWindow::DrawOrderBook() {
             m_ladderRows = kLadderOptions[m_ladderRowsIdx];
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Virtual price rows shown above ask and below bid\nwhen no Level II subscription is active.");
+    }
+
+    // ── L1 / L2 depth toggle ─────────────────────────────────────────────────
+    hdr.item(FlexRow::buttonW("L1"), 8);
+    if (ImGui::Button(m_useL2 ? "L2" : "L1")) {
+        m_useL2 = !m_useL2;
+        if (m_useL2) {
+            m_askBuckets.clear();
+            m_bidBuckets.clear();
+            m_exchangeFilterIdx = 0;
+        }
+        RebuildDepthView();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("L1 = SMART aggregated depth\nL2 = per-exchange depth (TotalView/OpenBook)");
+
+    if (m_useL2) {
+        hdr.item(em(80), 4);
+        ImGui::SetNextItemWidth(em(80));
+        const char* filterLabel = (m_exchangeFilterIdx < (int)m_exchangeList.size())
+                                  ? m_exchangeList[m_exchangeFilterIdx].c_str()
+                                  : "All";
+        if (ImGui::BeginCombo("##exch_filter", filterLabel)) {
+            for (int i = 0; i < (int)m_exchangeList.size(); ++i) {
+                bool sel = (i == m_exchangeFilterIdx);
+                if (ImGui::Selectable(m_exchangeList[i].c_str(), sel, 0, ImVec2(0, 0))) {
+                    m_exchangeFilterIdx = i;
+                    RebuildDepthView();
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Filter L2 depth by exchange");
     }
 
     // ── Subscription banners ──────────────────────────────────────────────────
@@ -723,7 +833,10 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::SameLine(0.f, 2.f);
             }
             ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
-            ImGui::Text("%.2f", lvl.price);
+            if (m_useL2 && !lvl.exchange.empty())
+                ImGui::Text("%.2f [%s]", lvl.price, lvl.exchange.c_str());
+            else
+                ImGui::Text("%.2f", lvl.price);
             ImGui::PopStyleColor();
         }
 
@@ -1047,7 +1160,10 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::SameLine(0.f, 2.f);
             }
             ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
-            ImGui::Text("%.2f", lvl.price);
+            if (m_useL2 && !lvl.exchange.empty())
+                ImGui::Text("%.2f [%s]", lvl.price, lvl.exchange.c_str());
+            else
+                ImGui::Text("%.2f", lvl.price);
             ImGui::PopStyleColor();
         }
 
@@ -1085,6 +1201,8 @@ void TradingWindow::DrawOrderEntry() {
         auto applySymbol = [this]() {
             m_bids.clear();
             m_asks.clear();
+            m_askBuckets.clear();
+            m_bidBuckets.clear();
             m_volAtPrice.clear();
             m_maxVolAtPrice  = 1.0;
             m_maxDepthSize   = 1.0;
