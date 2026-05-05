@@ -3,6 +3,7 @@
 #include <cstring>
 
 #include "core/models/MarketData.h"
+#include "core/services/IBKRUtils.h"
 
 // Helper: build a UTC time_t from calendar components without local-timezone
 // influence (avoids mktime() DST guessing).
@@ -16,12 +17,7 @@ static std::time_t utc(int year, int mon, int day,
     t.tm_hour  = hour;
     t.tm_min   = min;
     t.tm_sec   = sec;
-    t.tm_isdst = 0;
-#ifdef _WIN32
-    return _mkgmtime(&t);
-#else
-    return timegm(&t);
-#endif
+    return core::services::Timegm(&t);
 }
 
 // ── TimeframeLabel ────────────────────────────────────────────────────────────

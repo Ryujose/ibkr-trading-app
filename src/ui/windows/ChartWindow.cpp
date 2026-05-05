@@ -393,12 +393,7 @@ void ChartWindow::EnsureTodayBar(double price) {
     // Build today's bar at noon UTC — same convention as ParseIBTime("YYYYMMDD").
     struct tm noon = nowTm;
     noon.tm_hour = 12; noon.tm_min = noon.tm_sec = 0;
-    noon.tm_isdst = 0;
-#ifdef _WIN32
-    auto todayTs = static_cast<double>(_mkgmtime(&noon));
-#else
-    auto todayTs = static_cast<double>(timegm(&noon));
-#endif
+    auto todayTs = static_cast<double>(core::services::Timegm(&noon));
 
     core::Bar today{};
     today.timestamp = todayTs;

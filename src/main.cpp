@@ -40,6 +40,7 @@
 #include "ui/SymbolSearch.h"
 
 #include "core/services/IBKRClient.h"
+#include "core/services/IBKRUtils.h"
 #include "core/models/WindowGroup.h"
 
 // ============================================================================
@@ -1602,7 +1603,7 @@ static void SpawnReplayWindow(int idx) {
             std::tm tm{};
             tm.tm_year = y - 1900; tm.tm_mon = m - 1; tm.tm_mday = d;
             tm.tm_hour = 12;
-            return timegm(&tm);
+            return core::services::Timegm(&tm);
         };
         std::string duration = core::TimeframeIBDuration(tf);
         if (!dateFrom.empty() && !dateTo.empty() && dateFrom != dateTo) {

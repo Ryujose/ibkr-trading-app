@@ -19,12 +19,7 @@ static std::time_t utc(int year, int mon, int day,
     t.tm_hour  = hour;
     t.tm_min   = min;
     t.tm_sec   = sec;
-    t.tm_isdst = 0;
-#ifdef _WIN32
-    return _mkgmtime(&t);
-#else
-    return timegm(&t);
-#endif
+    return core::services::Timegm(&t);
 }
 
 // ── ParseStatus ───────────────────────────────────────────────────────────────

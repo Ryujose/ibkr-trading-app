@@ -12,6 +12,16 @@
 
 namespace core::services {
 
+// Portable timegm — MSVC has _mkgmtime, POSIX has timegm.
+inline std::time_t Timegm(struct tm* t) {
+    t->tm_isdst = 0;
+#ifdef _WIN32
+    return _mkgmtime(t);
+#else
+    return timegm(t);
+#endif
+}
+
 // Maps an IB order-status string to our OrderStatus enum.
 inline ::core::OrderStatus ParseStatus(const std::string& s) {
     if (s == "Filled")                                                    return ::core::OrderStatus::Filled;
@@ -46,12 +56,7 @@ inline std::time_t ParseIBTime(const std::string& ts) {
             struct tm t = {};
             std::istringstream(ts) >> std::get_time(&t, "%Y%m%d");
             t.tm_hour = 12; t.tm_min = t.tm_sec = 0;
-            t.tm_isdst = 0;
-#ifdef _WIN32
-            return _mkgmtime(&t);
-#else
-            return timegm(&t);
-#endif
+            return Timegm(&t);
         }
         // Unix timestamp string (intraday bars with formatDate=2).
         return static_cast<std::time_t>(std::stoll(ts));

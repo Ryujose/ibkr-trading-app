@@ -9,6 +9,7 @@
 #include "core/models/MarketData.h"
 #include "core/models/OrderData.h"
 #include "core/models/ReplayData.h"
+#include "core/services/IBKRUtils.h"
 #include "core/services/ReplayEngine.h"
 
 using core::services::ReplaySession;
@@ -45,7 +46,7 @@ std::time_t utc(int y, int mo, int d, int h, int mi, int s = 0) {
     tm.tm_min  = mi;
     tm.tm_sec  = s;
     tm.tm_isdst = 0;
-    return timegm(&tm);
+    return core::services::Timegm(&tm);
 }
 
 // April 15, 2026 EDT (UTC-4): 09:30 ET = 13:30 UTC

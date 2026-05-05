@@ -7,6 +7,7 @@
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
 #include "core/services/ChartAnalysis.h"
+#include "core/services/IBKRUtils.h"
 #include "implot.h"
 
 #include <algorithm>
@@ -71,7 +72,7 @@ inline void DrawDashedHLine(ImDrawList* dl, float x0, float x1, float y,
 // ============================================================================
 
 ReplayWindow::ReplayWindow() {
-    std::snprintf(m_title, sizeof(m_title), "Replay ????-##replay%d", m_instanceId);
+    std::snprintf(m_title, sizeof(m_title), "Replay \?\?\?\?-##replay%d", m_instanceId);
     m_clock.speed  = 60.0;   // 60× = 1 bar/sec for M1, visually responsive
     m_clock.paused = true;
 }
@@ -273,7 +274,7 @@ void ReplayWindow::DrawToolbar() {
         std::tm tm{};
         tm.tm_year = y - 1900; tm.tm_mon = m - 1; tm.tm_mday = d;
         tm.tm_hour = 12;       // noon UTC, robust against DST
-        return timegm(&tm);
+        return core::services::Timegm(&tm);
     };
     auto rangeCapDays = [](core::Timeframe tf) -> int {
         return (tf == core::Timeframe::M1 || tf == core::Timeframe::M5) ? 30 : 365;
@@ -464,7 +465,7 @@ void ReplayWindow::DrawToolbar() {
     if (m_ind.vwap) {
         indRow.item(FlexRow::checkboxW("\xC2\xB1\xCF\x83"), 4);
         ImGui::Checkbox("\xC2\xB1\xCF\x83##rind", &m_ind.vwapBands);
-        ImGui::SetItemTooltip("Show \xC2\xB11\xCF\x83 / \xC2\xB12\xCF\x83 volume-weighted bands.");
+        ImGui::SetItemTooltip("Show \xC2\xB1" "1\xCF\x83 / \xC2\xB1" "2\xCF\x83 volume-weighted bands.");
     }
     indRow.item(FlexRow::checkboxW("Vol"), 6);
     ImGui::Checkbox("Vol##rind",   &m_ind.volume);
@@ -1323,7 +1324,6 @@ void ReplayWindow::DrawWorkingOrders() {
                        bool isAuxLeg, ImU32 col, ImU32 bg) {
         if (price <= 0.0) return;
         ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, price);
-        ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, price);
         DrawDashedHLine(dl, pMin.x, pMax.x, lp0.y, col, 1.4f, 6.f, 4.f);
 
         char buf[80];
