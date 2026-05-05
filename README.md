@@ -260,7 +260,8 @@ Real-time candlestick charting with technical analysis overlays.
 **Drawing Tools:** Horizontal lines, trendlines, Fibonacci retracements, eraser
 
 **Trading:**
-- Place orders directly from the chart (MKT, LMT, STP, STP LMT, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MIDPRICE, REL)
+- Place orders directly from the chart (MKT, LMT, STP, STP LMT, Bracket, TRAIL, TRAIL LIMIT, MOC, LOC, MTL, MIT, LIT, MIDPRICE, REL)
+- **Bracket** — two-click chart placement: first click sets the STP stop-loss price, second click sets the LMT entry price. The LMT is submitted immediately; the STP is submitted only when IB reports the LMT filled (via `onFillReceived`). Cancelling the LMT discards the pending STP.
 - Working orders displayed as horizontal lines on the price axis
 - Current position shown with entry price, current price, and unrealized P&L strip
 - **Current price line** — dashed horizontal line tracking the latest price, with a right-aligned price tag inside the chart
@@ -284,9 +285,10 @@ Professional Depth of Market ladder for market microstructure analysis and fast 
 - **Bottom**: Tabbed panel (drag the horizontal splitter to resize)
 
 **Order Book:**
-- Up to 50 bid/ask price levels (Level II)
-- Cumulative size and number of orders per level
-- Volume-at-price overlay from executed trades
+- Up to 50 bid/ask price levels (Level II) with per-exchange depth when available
+- L2 "All" filter merges all exchange buckets into a single view, sorted correctly (bids high→low, asks low→high)
+- Cumulative size from the best price, volume-at-price overlay from executed trades
+- L1/L2 toggle with exchange filter dropdown
 
 **Interactive order placement (via IBKR API):**
 - Click any price level to pre-fill an order at that price

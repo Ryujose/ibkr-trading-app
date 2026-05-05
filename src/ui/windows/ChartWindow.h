@@ -62,6 +62,14 @@ public:
         double      pctRisk  = 0.0;   // |entry-stop|/entry × 100
     };
 
+    // ---- Bracket: pending STP stop-loss, submitted when the LMT entry fills ----
+    struct PendingBracketStop {
+        std::string  symbol;
+        core::OrderSide stopSide;
+        double       qty       = 0.0;
+        double       stopPrice = 0.0;
+    };
+
     ChartWindow();
 
     bool Render();
@@ -152,7 +160,11 @@ public:
     // Fired when user places an order from the chart trade panel.
     // The Order struct is fully populated (all price/type fields set); orderId=0
     // and the host (main.cpp) assigns a real ID before calling PlaceOrder.
-    std::function<void(const core::Order&)> OnOrderSubmit;
+    std::function<int(const core::Order&)> OnOrderSubmit;  // returns assigned orderId
+
+    // Fired when a Bracket order's LMT entry is submitted so the host can store
+    // the pending STP and submit it when the LMT fills.
+    std::function<void(int lmtOrderId, const PendingBracketStop&)> OnBracketEntry;
 
     // Fired when user clicks the ✕ button on a pending order line in the chart.
     std::function<void(int orderId)> OnCancelOrder;
@@ -373,6 +385,8 @@ private:
     bool        m_transmitInstantly = true; // false = always show confirmation before sending
     core::Order m_pendingConfirmOrder;      // order staged for the confirmation popup
     bool        m_showConfirmPopup  = false; // set true to open the modal next frame
+    bool        m_isBracketConfirm  = false; // pending confirm is a Bracket (LMT+STP)
+    double      m_bracketStopPrice  = 0.0;  // STP price for the pending bracket
 
     // ---- Placed order line (drag-and-send mode) ------------------------------
     bool        m_limitPlaced    = false;  // line dropped on chart, awaiting send

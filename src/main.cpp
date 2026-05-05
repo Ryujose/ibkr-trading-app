@@ -131,6 +131,7 @@ static std::unordered_map<std::string, double> g_scannerVolume;
 static std::unordered_map<int, std::string> g_tickerSymbols;
 
 static int    g_nextOrderId          = 1;
+static std::unordered_map<int, ui::ChartWindow::PendingBracketStop> g_pendingBracketStops;
 static double g_reconnectNextAttempt = 0.0;   // glfwGetTime() of next auto-reconnect try
 static constexpr double kReconnectIntervalSec = 5.0;
 
@@ -992,7 +993,7 @@ static void SpawnChartWindow(int idx) {
     };
 
     e.win->OnOrderSubmit = [](const core::Order& o) {
-        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        if (!g_IBClient || !g_IBClient->IsConnected()) return 0;
         int id = g_nextOrderId++;
         for (auto& te : g_tradingEntries)
             if (te.win) te.win->SetNextOrderId(g_nextOrderId);
@@ -1006,10 +1007,16 @@ static void SpawnChartWindow(int idx) {
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
         UpdateAllChartPendingOrders();
         g_IBClient->PlaceOrder(order);
+        return id;
     };
 
     e.win->OnCancelOrder = [](int orderId) {
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
+    };
+
+    e.win->OnBracketEntry = [](int lmtOrderId,
+                                const ui::ChartWindow::PendingBracketStop& p) {
+        g_pendingBracketStops[lmtOrderId] = p;
     };
 
     e.win->OnModifyOrder = [](int orderId, double newPrice, double newAuxPrice) {
@@ -2346,6 +2353,12 @@ static void WireIBCallbacks() {
         }
         UpdateAllChartPendingOrders();
         RecomputeUnguardedPositions();
+
+        // Bracket: LMT cancelled/rejected → forget pending STP
+        if (status == core::OrderStatus::Cancelled ||
+            status == core::OrderStatus::Rejected) {
+            g_pendingBracketStops.erase(orderId);
+        }
     };
 
     // ── Fills ─────────────────────────────────────────────────────────────
@@ -2368,6 +2381,30 @@ static void WireIBCallbacks() {
             g_PortfolioWindow->OnTradeExecuted(tr);
         }
         UpdateAllChartPositions();
+
+        // Bracket: LMT filled → submit the pending STP stop-loss
+        auto bit = g_pendingBracketStops.find(fill.orderId);
+        if (bit != g_pendingBracketStops.end()) {
+            int stopId = g_nextOrderId++;
+            core::Order stop;
+            stop.orderId    = stopId;
+            stop.symbol     = bit->second.symbol;
+            stop.side       = bit->second.stopSide;
+            stop.type       = core::OrderType::Stop;
+            stop.quantity   = bit->second.qty;
+            stop.stopPrice  = bit->second.stopPrice;
+            stop.tif        = core::TimeInForce::GTC;
+            stop.outsideRth = false;
+            stop.account    = g_selectedAccount;
+            stop.status     = core::OrderStatus::Pending;
+            stop.submittedAt = std::time(nullptr);
+            stop.updatedAt  = stop.submittedAt;
+            g_liveOrders[stopId] = stop;
+            if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(stop);
+            UpdateAllChartPendingOrders();
+            g_IBClient->PlaceOrder(stop);
+            g_pendingBracketStops.erase(bit);
+        }
     };
     g_IBClient->onQueriedFill = [](const core::Fill& fill) {
         if (g_OrdersWindow) g_OrdersWindow->OnQueriedFill(fill);
