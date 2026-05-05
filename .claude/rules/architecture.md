@@ -133,7 +133,11 @@ The `###` triple-hash gives ImGui a stable identity while the display label chan
 
 ## ChartAnalysis
 
-`src/core/services/ChartAnalysis.h` — standalone header (no IB API / ImGui / ImPlot deps) for the auto technical-analysis layer in `ChartWindow`. Inline free functions in `core::services`:
+`src/core/services/ChartAnalysis.h` — standalone header (no IB API / ImGui / ImPlot deps) for the auto technical-analysis layer **and** the classic single-series indicator helpers. Both `ChartWindow` and `ReplayWindow` call into it, and tests-core verifies the math without a UI/IB dependency. Inline free functions in `core::services`:
+- `SMA(close, period) → vector<double>` — simple moving average; entries before `period-1` are 0.
+- `EMA(close, period) → vector<double>` — exponential moving average seeded with the SMA of the first `period` values; entries before `period-1` are 0.
+- `ComputeBollinger(close, period, sigma) → BollingerBands{mid, upper, lower}` — middle = SMA(period), upper/lower = mid ± sigma·stdev (population stdev with N=period). All three vectors are sized to `close.size()` with leading zeros for indices `< period-1`.
+- `RSI(close, period) → vector<double>` — Wilder-smoothed RSI; `RSI[period]` is the simple-average seed, subsequent values use Wilder smoothing. Entries before `period` are 0.
 - `FindSwings(highs, lows, k, scanCap=0) → SwingResult` — pivot detection with left/right window `k`. Strict `>` on the left and `>=` on the right (mirror for lows) so flat tops/bottoms register as a single swing. `scanCap` limits the scan to the last N bars.
 - `ATR(highs, lows, closes, period) → vector<double>` — Wilder's true-range smoothing.
 - `ClusterLevels(swings, tol) → vector<Level>` — sweeps swings sorted by price, merging consecutive ones within `tol` into a single `Level{price, touches, firstIdx, lastIdx, minPrice, maxPrice}`. Cluster price = mean of constituents; `minPrice`/`maxPrice` track the lowest/highest constituent so ChartWindow can render thickness-aware supply/demand zones.
@@ -417,3 +421,39 @@ Fill-price derivation is per order type:
 - Relative → `last ± pegOffset`
 
 In `ChartWindow` the badge renders below the BUY/SELL row when a side is armed. In `TradingWindow` it renders above the submit button and updates live as the user types prices.
+
+## Replay Window (Phase 14)
+
+Plan at `.claude/plans/replay.md`. Multi-instance (up to 10), group-syncable window for replaying historical trading days.
+
+### Files
+| Path | Purpose |
+|---|---|
+| `src/core/models/ReplayData.h` | `TickType`, `HistoricalTick`, `HistoricalDay` PODs |
+| `src/core/services/ReplayEngine.h` | Pure-logic engine: `ReplaySession`, `ReplayClock`, `SimulatedAccount`/`SimulatedOrderBook`, `EvaluateBar`/`EvaluateTick` (all 13 OrderTypes), `BarRangeForSession`, `SnapCursorToNearestBar` |
+| `src/ui/ChartRender.h` | Shared candlestick rendering (`RenderCandlestickBodies`, `RenderCursorLine`) — used by both `ChartWindow` and `ReplayWindow` |
+| `src/ui/DatePicker.h` | Reusable calendar date-picker popup (`DrawDatePicker`) — shared by `WshCalendarWindow` and `ReplayWindow` |
+| `src/ui/windows/ReplayWindow.{h,cpp}` | Window with toolbar (date picker, session/TF/speed/mode controls, Load/Play/Step buttons), ImPlot candlestick chart, scrubber, status bar, order entry (Operate mode, 13 types + confirmation popup), bottom tabs (Actual Trades, Sim Orders, Stats, AI Analysis), unguarded-position strip |
+| `tests/test_replay.cpp` | 207 cases / 987 assertions under `[replay]` tag |
+
+### Architecture
+```
+ReplayWindow (UI)  →  OnDataRequest  →  main.cpp  →  ReqHistoricalData (IB)
+                    →  OnPaperOrderSubmit  →  SimulatedOrderBook (engine)
+                    →  OnCursorMove  →  BroadcastReplayCursor (group sync)
+
+ReplayEngine (pure logic, no I/O)  →  EvaluateBar/Tick  →  SimulatedAccount
+```
+
+### ReqId layout (11000–11999)
+Per instance N (0–9): base = 11000 + N×100
+- bars initial: base + 0
+- bars extend: base + 1
+
+### Key patterns
+- **Data flow**: `ReqHistoricalData` → `onBarData` routing (reqIds 11000+) → `pendingBars` → `HistoricalDay` → `SetDay()`
+- **Engine tick**: Clock always advances in both modes; bar evaluation + fills only in Operate mode
+- **Progressive reveal**: Only candles up to `cursorBarIdx` are rendered via `RenderCandlestickBodies`'s `visibleCount` parameter
+- **Group-time-sync**: `BroadcastReplayCursor()` with 100ms throttle per group, `g_replayCursorSyncInProgress` guard
+- **Persistence**: `~/.config/ibkr-trading-app/replay-windows.cfg` — atomic `.tmp`+`rename`, per-second flush, restore on `FinishConnect`
+- **Safety**: `ReplayWindow` holds no `IBKRClient` pointer; all orders go through `OnPaperOrderSubmit` → engine

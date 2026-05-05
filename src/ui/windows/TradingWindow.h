@@ -32,6 +32,9 @@ public:
     int  groupId() const       { return m_groupId; }
     void setInstanceId(int id);
     int  instanceId() const    { return m_instanceId; }
+    bool useL2() const         { return m_useL2; }
+    int  numDepthRows() const  { return m_numDepthRows; }
+    void setNumDepthRows(int n);
 
     // Subscription status per data stream
     enum class SubStatus { Unknown, Ok, NeedSubscription, NotAllowed };
@@ -85,6 +88,11 @@ public:
     // Fired when the user types a new symbol and presses Enter in Order Entry.
     std::function<void(const std::string& symbol)> OnSymbolChanged;
 
+    // Fired when the user toggles between L1 aggregated depth and L2 per-exchange
+    // depth.  main.cpp cancels the current depth subscription and re-subscribes
+    // with the appropriate isSmartDepth flag.
+    std::function<void(bool useL2)> OnDepthModeChanged;
+
     // Replace the exchange combo list with fresh smart-component data.
     // Always leads with "SMART"; resets selected index to 0.
     void SetExchangeList(const std::vector<std::string>& exchanges);
@@ -106,7 +114,7 @@ private:
     double m_nbboAskSz = 0.0;
 
     // ── Symbol / price ───────────────────────────────────────────────────────
-    char   m_symbol[16]   = "AAPL";
+    char   m_symbol[32]   = "AAPL";
     double m_midPrice     = 0.0;
     double m_prevMidPrice = 0.0;
 
@@ -115,7 +123,8 @@ private:
     double m_avgEntryPrice = 0.0;
 
     // ── Order Book (Level II) ────────────────────────────────────────────────
-    static constexpr int kDepthLevels = 50;
+    static constexpr int kDepthLevels = 300;  // max display cap; request rows is separate
+    int m_numDepthRows = 25;  // numRows sent to IB, synced with m_ladderRows
     std::vector<core::DepthLevel> m_asks;
     std::vector<core::DepthLevel> m_bids;
     double m_maxDepthSize = 1.0;

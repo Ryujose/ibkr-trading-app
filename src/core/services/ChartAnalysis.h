@@ -12,6 +12,98 @@ namespace core::services {
 // No IB API / ImGui / ImPlot dependency — testable from tests-core.
 // ============================================================================
 
+// ============================================================================
+// Classic single-series indicator helpers — extracted from ChartWindow so both
+// ChartWindow and ReplayWindow can call them and tests-core can verify the math
+// without an IB API or ImGui dependency.
+// ============================================================================
+
+// Simple Moving Average. Returns vector of length n; entries before `period-1`
+// are 0 (consistent with CalcEMA / CalcBollingerBands convention).
+inline std::vector<double> SMA(const std::vector<double>& close, int period) {
+    int n = static_cast<int>(close.size());
+    std::vector<double> out(n, 0.0);
+    if (period <= 0 || n < period) return out;
+    double sum = 0.0;
+    for (int i = 0; i < period; ++i) sum += close[i];
+    out[period - 1] = sum / period;
+    for (int i = period; i < n; ++i) {
+        sum += close[i] - close[i - period];
+        out[i] = sum / period;
+    }
+    return out;
+}
+
+// Exponential Moving Average. Seeded with the SMA of the first `period` values
+// at index `period-1`; entries before that index are 0.
+inline std::vector<double> EMA(const std::vector<double>& close, int period) {
+    int n = static_cast<int>(close.size());
+    std::vector<double> out(n, 0.0);
+    if (period <= 0 || n < period) return out;
+    double k = 2.0 / (period + 1.0), ema = 0.0;
+    for (int i = 0; i < period; ++i) ema += close[i];
+    ema /= period;
+    out[period - 1] = ema;
+    for (int i = period; i < n; ++i) {
+        ema = close[i] * k + ema * (1.0 - k);
+        out[i] = ema;
+    }
+    return out;
+}
+
+// Bollinger Bands result triplet — same vector length as the input close series.
+struct BollingerBands {
+    std::vector<double> mid;
+    std::vector<double> upper;
+    std::vector<double> lower;
+};
+
+// Bollinger Bands: middle = SMA(period), upper/lower = mid ± sigma·stdev
+// (population stdev with N=period). Entries before `period-1` are 0.
+inline BollingerBands ComputeBollinger(const std::vector<double>& close,
+                                       int period, double sigma) {
+    int n = static_cast<int>(close.size());
+    BollingerBands bb;
+    bb.mid.assign(n, 0.0); bb.upper.assign(n, 0.0); bb.lower.assign(n, 0.0);
+    if (period <= 0 || n < period) return bb;
+    for (int i = period - 1; i < n; ++i) {
+        double sum = 0.0;
+        for (int j = i - period + 1; j <= i; ++j) sum += close[j];
+        double m = sum / period, var = 0.0;
+        for (int j = i - period + 1; j <= i; ++j) var += (close[j] - m) * (close[j] - m);
+        double sd = std::sqrt(var / period);
+        bb.mid[i]   = m;
+        bb.upper[i] = m + sigma * sd;
+        bb.lower[i] = m - sigma * sd;
+    }
+    return bb;
+}
+
+// Wilder-style RSI. Returns vector of length n; entries before `period` are 0.
+// RSI[period] uses the simple-average seed; subsequent values use Wilder smoothing.
+inline std::vector<double> RSI(const std::vector<double>& close, int period) {
+    int n = static_cast<int>(close.size());
+    std::vector<double> out(n, 0.0);
+    if (period <= 0 || n <= period) return out;
+    double ag = 0.0, al = 0.0;
+    for (int i = 1; i <= period; ++i) {
+        double d = close[i] - close[i - 1];
+        if (d > 0) ag += d; else al -= d;
+    }
+    ag /= period; al /= period;
+    auto rsi = [](double g, double l) {
+        return l == 0.0 ? 100.0 : 100.0 - 100.0 / (1.0 + g / l);
+    };
+    out[period] = rsi(ag, al);
+    for (int i = period + 1; i < n; ++i) {
+        double d = close[i] - close[i - 1];
+        ag = (ag * (period - 1) + (d > 0 ?  d : 0.0)) / period;
+        al = (al * (period - 1) + (d < 0 ? -d : 0.0)) / period;
+        out[i] = rsi(ag, al);
+    }
+    return out;
+}
+
 struct Swing {
     int    idx;
     double price;

@@ -257,7 +257,7 @@ private:
     int               m_groupId         = 0;
     int               m_instanceId      = 1;
     char              m_title[32]       = "Chart 1##chart1";
-    char              m_symbol[16]      = "AAPL";
+    char              m_symbol[32]      = "AAPL";
     core::Timeframe   m_timeframe       = core::Timeframe::D1;
     bool              m_needsRefresh    = true;
     bool              m_open            = true;
@@ -470,12 +470,6 @@ private:
     static int  VolTickFormatter(double value, char* buf, int size, void* user_data);
     static int  XTickFormatter(double idx,   char* buf, int size, void* user_data);
 
-    static std::vector<double> CalcSMA(const std::vector<double>& close, int period);
-    static std::vector<double> CalcEMA(const std::vector<double>& close, int period);
-    static void CalcBollingerBands(const std::vector<double>& close, int period, float sigma,
-                                   std::vector<double>& mid, std::vector<double>& upper,
-                                   std::vector<double>& lower);
-    static std::vector<double> CalcRSI(const std::vector<double>& close, int period);
     static core::BarSeries GenerateSimulatedBars(const std::string& symbol,
                                                   core::Timeframe tf, int count);
 };

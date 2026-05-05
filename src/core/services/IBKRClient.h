@@ -25,6 +25,7 @@
 #include "core/models/ScannerData.h"
 #include "core/models/PortfolioData.h"
 #include "core/models/SmartRouting.h"
+#include "core/models/ReplayData.h"
 
 // Forward-declare IB API types we use only in the .cpp
 struct Bar;
@@ -70,6 +71,11 @@ struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
                            std::string articleId; std::string headline; };
 struct MsgHistoricalNewsEnd { int reqId; };
 struct MsgNewsArticle    { int reqId; std::string text; };
+
+// Historical tick data (reqHistoricalTicks) — aggregates TRADES, BID_ASK,
+// and MIDPOINT callbacks into a single variant. Each callback converts its
+// IB-native struct → core::HistoricalTick and pushes one message per batch.
+struct MsgHistoricalTick   { int reqId; std::vector<core::HistoricalTick> ticks; bool done; };
 struct MsgAcctSummary    { std::string tag; std::string value; std::string currency; };
 struct MsgPnL       { int reqId; double daily, unrealized, realized; };
 struct MsgPnLSingle { int reqId; double daily, unrealized, realized, value; };
@@ -129,6 +135,7 @@ using IBMessage = std::variant<
     MsgError, MsgNextOrderId,
     MsgOpenOrder, MsgOpenOrderEnd,
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
+    MsgHistoricalTick,
     MsgAcctSummary, MsgPnL, MsgPnLSingle, MsgSymbolSamples,
     MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti,
     MsgTickByTick, MsgWshEvent,
@@ -160,6 +167,15 @@ public:
                            bool               useRTH      = true,
                            const std::string& endDateTime = "");  // "" = now
     void CancelHistoricalData(int reqId);
+
+    // Historical tick-by-tick data. whatToShow: "TRADES", "BID_ASK", or "MIDPOINT".
+    // ibkr-trading-app convention: reqId range 11000+ (see replay ReqId layout).
+    void ReqHistoricalTicks(int reqId, const std::string& symbol,
+                            const std::string& whatToShow,
+                            const std::string& startDateTime,
+                            const std::string& endDateTime = "",
+                            int numberOfTicks = 1000,
+                            bool useRTH = true, bool ignoreSize = false);
 
     // Contract lookup (needed for reqHistoricalNews which takes conId, not symbol)
     void ReqContractDetails(int reqId, const std::string& symbol);
@@ -198,8 +214,9 @@ public:
                        const std::string& genericTickList = "");
     void CancelMarketData(int reqId);
 
-    void ReqMktDepth(int reqId, const std::string& symbol, int numRows = 10);
-    void CancelMktDepth(int reqId);
+    void ReqMktDepth(int reqId, const std::string& symbol, int numRows = 10,
+                      bool isSmartDepth = false);
+    void CancelMktDepth(int reqId, bool isSmartDepth = false);
 
     // Futures market data for index health indicators (/ES, /NQ, etc.)
     void ReqFuturesMarketData(int reqId, const std::string& symbol);
@@ -342,6 +359,11 @@ public:
     std::function<void(int reqId, int articleType,
                        const std::string& text)>                            onNewsArticle;
 
+    // Historical tick data — one batch per reqHistoricalTicks callback
+    std::function<void(int reqId,
+                       const std::vector<core::HistoricalTick>&,
+                       bool done)>                                          onHistoricalTicks;
+
     // Real-time P&L (account-level and per-position)
     std::function<void(int reqId, double daily,
                        double unrealized, double realized)>                 onPnL;
@@ -436,9 +458,9 @@ private:
                const std::string& advancedOrderRejectJson) override;
 
     void marketDataType(TickerId reqId, int marketDataType) override;
-    void tickPrice(TickerId tickerId, TickType field, double price,
+    void tickPrice(TickerId tickerId, ::TickType field, double price,
                    const TickAttrib& attrib) override;
-    void tickSize(TickerId tickerId, TickType field, Decimal size) override;
+    void tickSize(TickerId tickerId, ::TickType field, Decimal size) override;
 
     void updateMktDepth(TickerId id, int position, int operation, int side,
                         double price, Decimal size) override;
@@ -501,6 +523,15 @@ private:
                         const std::string& articleId,
                         const std::string& headline) override;
     void historicalNewsEnd(int requestId, bool hasMore) override;
+
+    void historicalTicks(int reqId, const std::vector<::HistoricalTick>& ticks,
+                         bool done) override;
+    void historicalTicksBidAsk(int reqId,
+                               const std::vector<::HistoricalTickBidAsk>& ticks,
+                               bool done) override;
+    void historicalTicksLast(int reqId,
+                             const std::vector<::HistoricalTickLast>& ticks,
+                             bool done) override;
 
     void newsArticle(int requestId, int articleType,
                      const std::string& articleText) override;

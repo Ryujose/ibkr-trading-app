@@ -288,6 +288,14 @@ void TradingWindow::UpdateMidPrice(double price) {
         m_mktDataStatus = SubStatus::Ok;
 }
 
+void TradingWindow::setNumDepthRows(int n) {
+    if (n == m_numDepthRows) return;
+    m_numDepthRows = n;
+    // Re-subscribe with the new row count.  Fire OnDepthModeChanged so main.cpp
+    // cancels the old subscription and re-subscribes with the correct rows.
+    if (OnDepthModeChanged) OnDepthModeChanged(m_useL2);
+}
+
 // ============================================================================
 // Render
 // ============================================================================
@@ -514,15 +522,20 @@ void TradingWindow::DrawOrderBook() {
     hdr.item(FlexRow::textW("Levels:"), 16);
     ImGui::TextDisabled("Levels:");
     {
-        static constexpr int  kLadderOptions[] = {5, 10, 15, 20, 25, 30, 40, 50};
-        static const char*    kLadderLabels[]  = {"5","10","15","20","25","30","40","50"};
-        static constexpr int  kLadderCount = 8;
+        static constexpr int  kLadderOptions[] = {5, 10, 15, 20, 25, 30, 40, 50,
+                                                   75, 100, 150, 200, 250, 300};
+        static const char*    kLadderLabels[]  = {"5","10","15","20","25","30","40","50",
+                                                   "75","100","150","200","250","300"};
+        static constexpr int  kLadderCount = 14;
         hdr.item(em(58), 4);
         ImGui::SetNextItemWidth(em(58));
-        if (ImGui::Combo("##ladder_rows", &m_ladderRowsIdx, kLadderLabels, kLadderCount))
+        if (ImGui::Combo("##ladder_rows", &m_ladderRowsIdx, kLadderLabels, kLadderCount)) {
             m_ladderRows = kLadderOptions[m_ladderRowsIdx];
+            setNumDepthRows(m_ladderRows);
+        }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Virtual price rows shown above ask and below bid\nwhen no Level II subscription is active.");
+            ImGui::SetTooltip("Market depth levels requested from IB.\n"
+                              "Also sets virtual fallback rows when no depth subscription is active.");
     }
 
     // ── L1 / L2 depth toggle ─────────────────────────────────────────────────
@@ -532,9 +545,12 @@ void TradingWindow::DrawOrderBook() {
         if (m_useL2) {
             m_askBuckets.clear();
             m_bidBuckets.clear();
+            m_bids.clear();
+            m_asks.clear();
             m_exchangeFilterIdx = 0;
         }
         RebuildDepthView();
+        if (OnDepthModeChanged) OnDepthModeChanged(m_useL2);
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("L1 = SMART aggregated depth\nL2 = per-exchange depth (TotalView/OpenBook)");

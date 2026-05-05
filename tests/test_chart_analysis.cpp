@@ -12,7 +12,12 @@
 using core::services::ATR;
 using core::services::AutoFibSpan;
 using core::services::AvoidRoundNumber;
+using core::services::BollingerBands;
 using core::services::BreakoutMark;
+using core::services::ComputeBollinger;
+using core::services::EMA;
+using core::services::RSI;
+using core::services::SMA;
 using core::services::ClassicPivots;
 using core::services::ClusterLevels;
 using core::services::DailyPivot;
@@ -949,6 +954,8 @@ namespace {
 struct StubInd {
     bool   vwap       = false;
     bool   vwapBands  = false;
+    int    smaPeriod1 = -1;
+    int    smaPeriod2 = -1;
 };
 struct StubAuto {
     bool supports     = false;
@@ -1002,6 +1009,8 @@ TEST_CASE("GetPreset(Scalping): expected 1m / 2 D / scalper params", "[analysis]
     REQUIRE(p.minTouches      == 2);
     REQUIRE(p.indVwap         == true);
     REQUIRE(p.indVwapBands    == false);
+    REQUIRE(p.smaPeriod1      == 9);
+    REQUIRE(p.smaPeriod2      == 20);
     REQUIRE(p.pivotPoints     == true);
     REQUIRE(p.breakouts       == true);
     REQUIRE(p.zones           == true);
@@ -1024,6 +1033,8 @@ TEST_CASE("GetPreset(DayTrading): expected 15m / 20 D / day-trade params", "[ana
     REQUIRE(p.trendLookback   == 40);
     REQUIRE(p.indVwap         == true);
     REQUIRE(p.indVwapBands    == true);
+    REQUIRE(p.smaPeriod1      == 20);
+    REQUIRE(p.smaPeriod2      == 50);
     REQUIRE(p.pivotPoints     == true);
     REQUIRE(p.breakouts       == true);
     REQUIRE(p.zones           == true);
@@ -1041,6 +1052,8 @@ TEST_CASE("GetPreset(Swing): expected 1D / 1 Y / swing params", "[analysis][styl
     REQUIRE(p.trendLookback   == 50);
     REQUIRE(p.indVwap         == false);
     REQUIRE(p.indVwapBands    == false);
+    REQUIRE(p.smaPeriod1      == 20);
+    REQUIRE(p.smaPeriod2      == 50);
     REQUIRE(p.pivotPoints     == false);
     REQUIRE(p.breakouts       == true);
     REQUIRE(p.zones           == true);
@@ -1062,6 +1075,8 @@ TEST_CASE("GetPreset(Investment): expected 1W / 5 Y / investor params", "[analys
     REQUIRE(p.minTouches      == 3);
     REQUIRE(p.indVwap         == false);
     REQUIRE(p.indVwapBands    == false);
+    REQUIRE(p.smaPeriod1      == 50);
+    REQUIRE(p.smaPeriod2      == 200);
     REQUIRE(p.pivotPoints     == false);
     REQUIRE(p.breakouts       == false);
     REQUIRE(p.zones           == false);
@@ -1102,6 +1117,8 @@ TEST_CASE("GetPreset(Free): construction-default baseline + D1 placeholder TF", 
     // Indicators: VWAP on (matches the IndicatorSettings default).
     REQUIRE(p.indVwap         == true);
     REQUIRE(p.indVwapBands    == false);
+    REQUIRE(p.smaPeriod1      == 20);
+    REQUIRE(p.smaPeriod2      == 50);
     // Setup overlay: matches SetupSettings construction defaults.
     REQUIRE(p.setupOverlay    == false);
     REQUIRE(p.rrMin           == Catch::Approx(2.0));
@@ -1138,6 +1155,8 @@ TEST_CASE("ApplyPreset stamps every overridable field onto stub structs", "[anal
 
     REQUIRE(ind.vwap       == true);
     REQUIRE(ind.vwapBands  == true);
+    REQUIRE(ind.smaPeriod1 == 20);
+    REQUIRE(ind.smaPeriod2 == 50);
 
     REQUIRE(s.overlay      == false);
     REQUIRE(s.rrMin        == Catch::Approx(1.75));
@@ -1159,6 +1178,8 @@ TEST_CASE("ApplyPreset round-trip leaves no carry-over from the previous preset"
     REQUIRE(tf == core::Timeframe::M1);
     REQUIRE(a.swingK == 3);
     REQUIRE(ind.vwap == true);
+    REQUIRE(ind.smaPeriod1 == 9);
+    REQUIRE(ind.smaPeriod2 == 20);
 
     ApplyPreset(GetPreset(TradingStyle::Investment), ind, a, s, tf);
     REQUIRE(tf == core::Timeframe::W1);
@@ -1170,6 +1191,8 @@ TEST_CASE("ApplyPreset round-trip leaves no carry-over from the previous preset"
     REQUIRE(a.pivotPoints    == false);
     REQUIRE(ind.vwap         == false);
     REQUIRE(ind.vwapBands    == false);
+    REQUIRE(ind.smaPeriod1   == 50);
+    REQUIRE(ind.smaPeriod2   == 200);
     REQUIRE(s.riskPct        == Catch::Approx(1.5));
     REQUIRE(s.atrPad         == Catch::Approx(1.0));
 }
@@ -1201,6 +1224,8 @@ TEST_CASE("ApplyPreset(Free) stamps construction-default baseline", "[analysis][
     REQUIRE(a.minTouches    == 2);
     REQUIRE(ind.vwap        == true);
     REQUIRE(ind.vwapBands   == false);
+    REQUIRE(ind.smaPeriod1  == 20);
+    REQUIRE(ind.smaPeriod2  == 50);
     REQUIRE(s.overlay       == false);
     REQUIRE(s.rrMin         == Catch::Approx(2.0));
     REQUIRE(s.atrPad        == Catch::Approx(0.5));
@@ -1370,4 +1395,128 @@ TEST_CASE("PreviewStopTarget: invalid -- zero stop risk", "[analysis][order-impa
     auto stop   = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 150.0);
     auto p = PreviewStopTarget(target, stop);
     REQUIRE(p.valid == false);   // stopPnL=0 → risk=0
+}
+
+// ============================================================================
+// [chart-indicators] — extracted single-series indicator helpers
+// (was ChartWindow::CalcSMA / CalcEMA / CalcBollingerBands / CalcRSI before
+// the refactor; now lives in core::services. Tests are a regression net so a
+// future change to the math doesn't silently break ChartWindow / ReplayWindow.)
+// ============================================================================
+
+TEST_CASE("SMA: rolling 3-period on {1..6} matches expected", "[analysis][chart-indicators]") {
+    std::vector<double> in = {1, 2, 3, 4, 5, 6};
+    auto out = SMA(in, 3);
+    REQUIRE(out.size() == 6);
+    REQUIRE(out[0] == 0.0);
+    REQUIRE(out[1] == 0.0);
+    REQUIRE(out[2] == Catch::Approx(2.0));   // (1+2+3)/3
+    REQUIRE(out[3] == Catch::Approx(3.0));   // (2+3+4)/3
+    REQUIRE(out[4] == Catch::Approx(4.0));   // (3+4+5)/3
+    REQUIRE(out[5] == Catch::Approx(5.0));   // (4+5+6)/3
+}
+
+TEST_CASE("SMA: degenerate input returns all zeros", "[analysis][chart-indicators]") {
+    REQUIRE(SMA({1.0, 2.0}, 0).size() == 2);
+    REQUIRE(SMA({1.0, 2.0}, 0)[0] == 0.0);
+    REQUIRE(SMA({1.0, 2.0}, 0)[1] == 0.0);
+    auto small = SMA({1.0, 2.0}, 5);   // n < period
+    REQUIRE(small.size() == 2);
+    REQUIRE(small[0] == 0.0);
+    REQUIRE(small[1] == 0.0);
+    REQUIRE(SMA({}, 3).empty());
+}
+
+TEST_CASE("EMA: 3-period on monotone series, seed equals SMA, smoothing applied",
+          "[analysis][chart-indicators]") {
+    std::vector<double> in = {10, 20, 30, 40, 50};
+    auto out = EMA(in, 3);
+    REQUIRE(out.size() == 5);
+    REQUIRE(out[0] == 0.0);
+    REQUIRE(out[1] == 0.0);
+    REQUIRE(out[2] == Catch::Approx(20.0));   // SMA seed: (10+20+30)/3
+    // k = 2/(3+1) = 0.5
+    // out[3] = 40 * 0.5 + 20 * 0.5 = 30
+    // out[4] = 50 * 0.5 + 30 * 0.5 = 40
+    REQUIRE(out[3] == Catch::Approx(30.0));
+    REQUIRE(out[4] == Catch::Approx(40.0));
+}
+
+TEST_CASE("EMA: degenerate input", "[analysis][chart-indicators]") {
+    auto z = EMA({1.0}, 3);    // n < period
+    REQUIRE(z.size() == 1);
+    REQUIRE(z[0] == 0.0);
+    REQUIRE(EMA({}, 3).empty());
+    auto z2 = EMA({1.0, 2.0}, 0);   // period <= 0
+    REQUIRE(z2.size() == 2);
+    REQUIRE(z2[0] == 0.0);
+}
+
+TEST_CASE("ComputeBollinger: mid equals SMA, bands symmetric around mid",
+          "[analysis][chart-indicators]") {
+    std::vector<double> in = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    auto bb = ComputeBollinger(in, 3, 2.0);
+    auto sma = SMA(in, 3);
+    REQUIRE(bb.mid.size() == 10);
+    REQUIRE(bb.upper.size() == 10);
+    REQUIRE(bb.lower.size() == 10);
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(bb.mid[i] == Catch::Approx(sma[i]));
+        if (i >= 2) {   // warm-up boundary
+            // Symmetric: |upper-mid| == |mid-lower|
+            REQUIRE((bb.upper[i] - bb.mid[i]) == Catch::Approx(bb.mid[i] - bb.lower[i]));
+            REQUIRE(bb.upper[i] > bb.mid[i]);
+            REQUIRE(bb.lower[i] < bb.mid[i]);
+        }
+    }
+    // Stdev of {1,2,3} = sqrt(((1-2)^2 + 0 + (3-2)^2)/3) = sqrt(2/3) ≈ 0.8165
+    // upper[2] = 2 + 2*0.8165 ≈ 3.633
+    REQUIRE(bb.upper[2] == Catch::Approx(2.0 + 2.0 * std::sqrt(2.0 / 3.0)));
+}
+
+TEST_CASE("ComputeBollinger: degenerate", "[analysis][chart-indicators]") {
+    auto bb = ComputeBollinger({1.0, 2.0}, 5, 2.0);   // n < period
+    REQUIRE(bb.mid.size() == 2);
+    REQUIRE(bb.mid[0] == 0.0);
+    REQUIRE(bb.upper[1] == 0.0);
+    auto bb2 = ComputeBollinger({}, 3, 2.0);
+    REQUIRE(bb2.mid.empty());
+    REQUIRE(bb2.upper.empty());
+    REQUIRE(bb2.lower.empty());
+}
+
+TEST_CASE("RSI: strictly rising series -> 100", "[analysis][chart-indicators]") {
+    std::vector<double> in = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    auto out = RSI(in, 2);
+    REQUIRE(out.size() == 10);
+    REQUIRE(out[0] == 0.0);
+    REQUIRE(out[1] == 0.0);   // before period
+    REQUIRE(out[2] == Catch::Approx(100.0));    // al == 0
+    REQUIRE(out[9] == Catch::Approx(100.0));
+}
+
+TEST_CASE("RSI: strictly falling series -> 0", "[analysis][chart-indicators]") {
+    std::vector<double> in = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+    auto out = RSI(in, 2);
+    REQUIRE(out[2] == Catch::Approx(0.0));     // ag == 0 → 100 - 100/(1+0) = 0
+    REQUIRE(out[9] == Catch::Approx(0.0));
+}
+
+TEST_CASE("RSI: mixed series, known midpoint value", "[analysis][chart-indicators]") {
+    // 4-period RSI with equal up/down moves should hover near 50.
+    std::vector<double> in = {10, 11, 10, 11, 10, 11, 10};
+    auto out = RSI(in, 2);
+    REQUIRE(out.size() == 7);
+    REQUIRE(out[2] == Catch::Approx(50.0));   // ag=0.5 al=0.5 → 50
+}
+
+TEST_CASE("RSI: degenerate input", "[analysis][chart-indicators]") {
+    auto z = RSI({1.0, 2.0}, 5);    // n <= period
+    REQUIRE(z.size() == 2);
+    REQUIRE(z[0] == 0.0);
+    REQUIRE(z[1] == 0.0);
+    REQUIRE(RSI({}, 14).empty());
+    auto z2 = RSI({1.0, 2.0, 3.0}, 0);   // period <= 0
+    REQUIRE(z2.size() == 3);
+    REQUIRE(z2[0] == 0.0);
 }

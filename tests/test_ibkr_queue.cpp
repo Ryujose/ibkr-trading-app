@@ -358,3 +358,68 @@ TEST_CASE("ProcessMessages dispatches MsgOrderStatus to onOrderStatusChanged", "
     REQUIRE(receivedFilled == Catch::Approx(100.0));
     REQUIRE(receivedAvg    == Catch::Approx(152.30));
 }
+
+// ── MsgHistoricalTick ─────────────────────────────────────────────────────────
+
+TEST_CASE("ProcessMessages dispatches MsgHistoricalTick to onHistoricalTicks", "[queue][replay]") {
+    TestableIBKRClient client;
+
+    int  receivedReqId = -1;
+    bool receivedDone  = true;
+    std::vector<core::HistoricalTick> receivedTicks;
+
+    client.onHistoricalTicks = [&](int reqId,
+                                   const std::vector<core::HistoricalTick>& ticks,
+                                   bool done) {
+        receivedReqId = reqId;
+        receivedTicks = ticks;
+        receivedDone  = done;
+    };
+
+    std::vector<core::HistoricalTick> ticks;
+    core::HistoricalTick t;
+    t.type  = core::TickType::Trades;
+    t.time  = 1713191400;
+    t.price = 150.25;
+    t.size  = 100.0;
+    ticks.push_back(t);
+
+    client.inject(MsgHistoricalTick{42, ticks, false});
+    client.ProcessMessages();
+
+    REQUIRE(receivedReqId == 42);
+    REQUIRE(receivedTicks.size() == 1);
+    REQUIRE(receivedTicks[0].type == core::TickType::Trades);
+    REQUIRE(receivedTicks[0].price == Catch::Approx(150.25));
+    REQUIRE(receivedTicks[0].size == Catch::Approx(100.0));
+    REQUIRE(receivedDone == false);
+}
+
+TEST_CASE("MsgHistoricalTick fires with done=true on final batch", "[queue][replay]") {
+    TestableIBKRClient client;
+
+    bool receivedDone = false;
+    int  callCount    = 0;
+
+    client.onHistoricalTicks = [&](int, const std::vector<core::HistoricalTick>&, bool done) {
+        receivedDone = done;
+        ++callCount;
+    };
+
+    client.inject(MsgHistoricalTick{1, {}, true});
+    client.ProcessMessages();
+
+    REQUIRE(callCount == 1);
+    REQUIRE(receivedDone == true);
+}
+
+TEST_CASE("MsgHistoricalTick null callback does not crash", "[queue][replay]") {
+    TestableIBKRClient client;
+    // onHistoricalTicks left unset
+
+    std::vector<core::HistoricalTick> ticks;
+    client.inject(MsgHistoricalTick{1, ticks, true});
+    client.ProcessMessages();
+    // No crash = pass
+    SUCCEED();
+}
