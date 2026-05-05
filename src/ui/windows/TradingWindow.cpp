@@ -132,8 +132,8 @@ void TradingWindow::RebuildDepthView() {
         }
         if ((int)flat.size() > kDepthLevels) flat.resize(kDepthLevels);
     };
-    rebuild(m_asks, m_askBuckets, false); // asks: high → low
-    rebuild(m_bids, m_bidBuckets, true);  // bids: low → high
+    rebuild(m_asks, m_askBuckets, true);   // asks: low → high   (best ask at [0])
+    rebuild(m_bids, m_bidBuckets, false);  // bids: high → low   (best bid at [0])
 }
 
 void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
@@ -822,10 +822,11 @@ void TradingWindow::DrawOrderBook() {
     ImGui::TableSetupColumn("Bar",     ImGuiTableColumnFlags_WidthStretch);
     ImGui::TableHeadersRow();
 
-    // ── Ask rows: highest price first ────────────────────────────────────────
+    // ── Ask rows: highest first, descending to best (lowest) at the spread ───
+    // m_asks sorted low→high: index 0 = best, index nAsks-1 = highest.
     for (int i = nAsks - 1; i >= 0; --i) {
         const auto& lvl  = m_asks[i];
-        const bool  best = (i == 0);
+        const bool  best = (i == 0);  // best = lowest price, nearest to spread
         const ImVec4 col = FlashCol(kSellRed, lvl.flashAge);
         const double pnl = CalcPnl(lvl.price);
 
@@ -1141,10 +1142,11 @@ void TradingWindow::DrawOrderBook() {
         ImGui::PopStyleColor();
     }
 
-    // ── Bid rows: best bid first ──────────────────────────────────────────────
+    // ── Bid rows: highest (best) first, descending to lowest ────────────────────
+    // m_bids sorted high→low: index 0 = best bid (highest) → nearest to spread.
     for (int i = 0; i < nBids; ++i) {
         const auto& lvl  = m_bids[i];
-        const bool  best = (i == 0);
+        const bool  best = (i == 0);  // best = highest price, closest to spread
         const ImVec4 col = FlashCol(kBuyGreen, lvl.flashAge);
         const double pnl = CalcPnl(lvl.price);
 

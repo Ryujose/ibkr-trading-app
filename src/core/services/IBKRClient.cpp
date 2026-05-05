@@ -393,6 +393,10 @@ void IBKRClient::PlaceOrder(const ::core::Order& o) {
         if (!o.exchange.empty())
             c.exchange = o.exchange;
 
+        if (o.parentId != 0)
+            ibOrder.parentId = o.parentId;
+        ibOrder.transmit = o.transmit;
+
         m_client->placeOrder(o.orderId, c, ibOrder);
     });
 }
@@ -966,7 +970,7 @@ void IBKRClient::openOrder(OrderId orderId, const Contract& c,
     order.quantity    = DecimalFunctions::decimalToDouble(o.totalQuantity);
     order.limitPrice  = (o.lmtPrice  != UNSET_DOUBLE) ? o.lmtPrice  : 0.0;
     
-    // In core::Order, we use stopPrice for STP/STPLMT trigger, 
+    // In core::Order, we use stopPrice for STP/STPLMT trigger,
     // and auxPrice for others (MIT/LIT/TRAIL/REL).
     double aux = (o.auxPrice != UNSET_DOUBLE) ? o.auxPrice : 0.0;
     order.stopPrice   = aux;

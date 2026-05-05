@@ -59,6 +59,8 @@ struct Order {
     bool        outsideRth     = false; // allow pre/after-hours fills
     std::string account;               // IB account code (required for multi-account / FA)
     std::string exchange;              // routing exchange; empty / "SMART" = IB smart routing
+    int         parentId       = 0;    // 0 = no parent; non-zero = bracket child
+    bool        transmit       = true; // IB transmit flag; false = stage, true = activate
     double      filledQty      = 0.0;
     double      avgFillPrice = 0.0;
     double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)

@@ -40,22 +40,24 @@ struct OrderTypeDef {
     bool firstIsAux;   // first click → auxPrice/trigger (true for LIT), else stop/price
     bool tifLocked;    // lock TIF combo to DAY (MOC / LOC)
     bool noRth;        // disable outside RTH option (MOC / LOC)
+    bool isBracket;    // bracket: first click=LMT entry, second click=STP (placed on fill)
 };
-//                                                                       nP     nT     dP     fA     tL     nR
+//                                                                       nP     nT     dP     fA     tL     nR     bkt
 static constexpr OrderTypeDef kOrderTypes[] = {
-    { "Market",          "MKT",        core::OrderType::Market,   false, false, false, false, false, false },
-    { "Limit",           "LMT",        core::OrderType::Limit,    true,  false, false, false, false, false },
-    { "Stop",            "STP",        core::OrderType::Stop,     true,  false, false, false, false, false },
-    { "Stop Limit",      "STP LMT",    core::OrderType::StopLimit,true,  false, true,  false, false, false },
-    { "Trail Stop",      "TRAIL",      core::OrderType::Trail,    false, true,  false, false, false, false },
-    { "Trail Limit",     "TRAIL LIMIT",core::OrderType::TrailLimit,false, true,  false, false, false, false },
-    { "Market On Close", "MOC",        core::OrderType::MOC,      false, false, false, false, true,  true  },
-    { "Limit On Close",  "LOC",        core::OrderType::LOC,      true,  false, false, false, true,  true  },
-    { "Market to Limit", "MTL",        core::OrderType::MTL,      false, false, false, false, false, false },
-    { "Mkt If Touched",  "MIT",        core::OrderType::MIT,      true,  false, false, false, false, false },
-    { "Lmt If Touched",  "LIT",        core::OrderType::LIT,      true,  false, true,  true,  false, false },
-    { "Midprice",        "MIDPRICE",   core::OrderType::Midprice, false, false, false, false, false, false },
-    { "Relative",        "REL",        core::OrderType::Relative, false, false, false, false, false, false },
+    { "Market",          "MKT",        core::OrderType::Market,   false, false, false, false, false, false, false },
+    { "Limit",           "LMT",        core::OrderType::Limit,    true,  false, false, false, false, false, false },
+    { "Stop",            "STP",        core::OrderType::Stop,     true,  false, false, false, false, false, false },
+    { "Stop Limit",      "STP LMT",    core::OrderType::StopLimit,true,  false, true,  false, false, false, false },
+    { "Bracket",         "LMT",        core::OrderType::Limit,    true,  false, true,  false, false, false, true  },
+    { "Trail Stop",      "TRAIL",      core::OrderType::Trail,    false, true,  false, false, false, false, false },
+    { "Trail Limit",     "TRAIL LIMIT",core::OrderType::TrailLimit,false, true,  false, false, false, false, false },
+    { "Market On Close", "MOC",        core::OrderType::MOC,      false, false, false, false, true,  true,  false },
+    { "Limit On Close",  "LOC",        core::OrderType::LOC,      true,  false, false, false, true,  true,  false },
+    { "Market to Limit", "MTL",        core::OrderType::MTL,      false, false, false, false, false, false, false },
+    { "Mkt If Touched",  "MIT",        core::OrderType::MIT,      true,  false, false, false, false, false, false },
+    { "Lmt If Touched",  "LIT",        core::OrderType::LIT,      true,  false, true,  true,  false, false, false },
+    { "Midprice",        "MIDPRICE",   core::OrderType::Midprice, false, false, false, false, false, false, false },
+    { "Relative",        "REL",        core::OrderType::Relative, false, false, false, false, false, false, false },
 };
 static constexpr int kNumOrderTypes = (int)std::size(kOrderTypes);
 
@@ -1793,8 +1795,13 @@ void ChartWindow::DrawTradePanel() {
             }
         } else {
             // Arm chart-click placement mode (LMT, STP, STP LMT, LOC, MIT, LIT)
-            m_limitArmed = true;
-            m_limitSide  = side;
+            // Reset dual-price phase state so a re-arm (e.g. user clicked BUY,
+            // placed the stop, then clicked SELL or BUY again) starts fresh
+            // instead of inheriting the previous arming's stop/trigger price.
+            m_limitArmed       = true;
+            m_limitSide        = side;
+            m_firstPricePlaced = false;
+            m_firstPrice       = 0.0;
         }
     };
 
@@ -2084,7 +2091,24 @@ void ChartWindow::DrawConfirmPopup() {
         ? ImVec4(0.18f, 0.70f, 0.35f, 1.0f)
         : ImVec4(0.80f, 0.22f, 0.22f, 1.0f));
     if (ImGui::Button("Confirm##cpok", ImVec2(em(130), 0))) {
-        if (OnOrderSubmit) OnOrderSubmit(o);
+        if (OnOrderSubmit) {
+            if (m_isBracketConfirm) {
+                int entryId = OnOrderSubmit(o);
+                if (OnBracketEntry) {
+                    OnBracketEntry(entryId, {
+                        m_symbol,
+                        (o.side == core::OrderSide::Buy) ? core::OrderSide::Sell
+                                                         : core::OrderSide::Buy,
+                        o.quantity,
+                        m_bracketStopPrice
+                    });
+                }
+                m_isBracketConfirm = false;
+                m_bracketStopPrice = 0.0;
+            } else {
+                OnOrderSubmit(o);
+            }
+        }
         m_limitArmed       = false;
         m_firstPricePlaced = false;
         ImGui::CloseCurrentPopup();
@@ -2094,15 +2118,19 @@ void ChartWindow::DrawConfirmPopup() {
     ImGui::SameLine();
 
     if (ImGui::Button("Cancel##cpcancel", ImVec2(em(130), 0))) {
-        m_limitArmed       = false;
-        m_firstPricePlaced = false;
+        m_limitArmed         = false;
+        m_firstPricePlaced   = false;
+        m_isBracketConfirm   = false;
+        m_bracketStopPrice   = 0.0;
         ImGui::CloseCurrentPopup();
     }
 
     // Escape key also cancels
     if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        m_limitArmed       = false;
-        m_firstPricePlaced = false;
+        m_limitArmed         = false;
+        m_firstPricePlaced   = false;
+        m_isBracketConfirm   = false;
+        m_bracketStopPrice   = 0.0;
         ImGui::CloseCurrentPopup();
     }
 
@@ -2790,7 +2818,7 @@ void ChartWindow::DrawOverlays(double /*step*/) {
             drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
                           calcArmedPnL(cursorPrice));
 
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && m_firstPrice > 0.0) {
                 const auto& ot = kOrderTypes[m_orderTypeIdx];
                 static constexpr core::TimeInForce kTIFEnum[] = {
                     core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
@@ -2813,10 +2841,37 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                     o.limitPrice = cursorPrice;
                 }
                 if (m_transmitInstantly) {
-                    if (OnOrderSubmit) OnOrderSubmit(o);
+                    if (OnOrderSubmit) {
+                        if (ot.isBracket) {
+                            // Bracket: first click = STP (stop-loss), second click = LMT (entry).
+                            // LMT submitted now; STP placed on fill at the first-click price.
+                            o.type       = core::OrderType::Limit;
+                            o.limitPrice = cursorPrice;   // second click = LMT entry
+                            o.stopPrice  = 0.0;
+                            int entryId = OnOrderSubmit(o);
+                            if (OnBracketEntry) {
+                                OnBracketEntry(entryId, {
+                                    m_symbol,
+                                    (m_limitSide == "BUY") ? core::OrderSide::Sell
+                                                           : core::OrderSide::Buy,
+                                    static_cast<double>(m_orderQty),
+                                    m_firstPrice          // first click = STP price
+                                });
+                            }
+                        } else {
+                            OnOrderSubmit(o);
+                        }
+                    }
                     m_limitArmed       = false;
                     m_firstPricePlaced = false;
                 } else {
+                    if (ot.isBracket) {
+                        o.type       = core::OrderType::Limit;
+                        o.limitPrice = cursorPrice;   // second click = LMT entry
+                        o.stopPrice  = 0.0;
+                        m_isBracketConfirm = true;
+                        m_bracketStopPrice = m_firstPrice;  // first click = STP
+                    }
                     m_pendingConfirmOrder = o;
                     m_showConfirmPopup    = true;
                     // leave m_limitArmed / m_firstPricePlaced — reset in popup confirm/cancel
