@@ -264,7 +264,7 @@ static std::vector<core::Bar> buildDayBars() {
     return bars;
 }
 
-TEST_CASE("BarRangeForSession: Intraday picks 09:30–16:00 ET bars", "[replay][session]") {
+TEST_CASE("BarRangeForSession: Intraday picks 09:30-16:00 ET bars", "[replay][session]") {
     auto bars = buildDayBars();
     auto r = BarRangeForSession(bars, ReplaySession::Intraday);
     CHECK(r.firstIdx > 0);
@@ -279,7 +279,7 @@ TEST_CASE("BarRangeForSession: Intraday picks 09:30–16:00 ET bars", "[replay][
     CHECK(found);
 }
 
-TEST_CASE("BarRangeForSession: PreMarket picks 04:00–09:30 ET", "[replay][session]") {
+TEST_CASE("BarRangeForSession: PreMarket picks 04:00-09:30 ET", "[replay][session]") {
     auto bars = buildDayBars();
     auto r = BarRangeForSession(bars, ReplaySession::PreMarket);
     // 08:00 UTC = 04:00 ET
@@ -292,7 +292,7 @@ TEST_CASE("BarRangeForSession: PreMarket picks 04:00–09:30 ET", "[replay][sess
     CHECK(found);
 }
 
-TEST_CASE("BarRangeForSession: PostMarket picks 16:00–20:00 ET", "[replay][session]") {
+TEST_CASE("BarRangeForSession: PostMarket picks 16:00-20:00 ET", "[replay][session]") {
     auto bars = buildDayBars();
     auto r = BarRangeForSession(bars, ReplaySession::PostMarket);
     // 20:00 UTC = 16:00 ET
@@ -676,7 +676,7 @@ TEST_CASE("EvaluateBar: Relative SELL pegs above bar.open", "[replay][evalbar]")
 // EvaluateBar — commission, ordering, outsideRth, TIF DAY
 // ============================================================================
 
-TEST_CASE("EvaluateBar: commission is quantity × rate", "[replay][evalbar]") {
+TEST_CASE("EvaluateBar: commission is quantity x rate", "[replay][evalbar]") {
     SimulatedOrderBook book;
     auto placedAt = rthTime(10, 0);
     book.push_back(makeWO(1, core::OrderType::Market, core::OrderSide::Buy,

@@ -1485,7 +1485,7 @@ TEST_CASE("ComputeBollinger: degenerate", "[analysis][chart-indicators]") {
     REQUIRE(bb2.lower.empty());
 }
 
-TEST_CASE("RSI: strictly rising series → 100", "[analysis][chart-indicators]") {
+TEST_CASE("RSI: strictly rising series -> 100", "[analysis][chart-indicators]") {
     std::vector<double> in = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
     auto out = RSI(in, 2);
     REQUIRE(out.size() == 10);
@@ -1495,7 +1495,7 @@ TEST_CASE("RSI: strictly rising series → 100", "[analysis][chart-indicators]")
     REQUIRE(out[9] == Catch::Approx(100.0));
 }
 
-TEST_CASE("RSI: strictly falling series → 0", "[analysis][chart-indicators]") {
+TEST_CASE("RSI: strictly falling series -> 0", "[analysis][chart-indicators]") {
     std::vector<double> in = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
     auto out = RSI(in, 2);
     REQUIRE(out[2] == Catch::Approx(0.0));     // ag == 0 → 100 - 100/(1+0) = 0
