@@ -133,3 +133,167 @@ TEST_CASE("ParseIBTime - 8-digit date: year/month/day boundaries are correct", "
         REQUIRE(gm->tm_mday        == c.d);
     }
 }
+
+// ── Futures symbol helpers ───────────────────────────────────────────────────
+
+#include <string>
+#include <cctype>
+
+using core::services::IsFuturesBaseSymbol;
+using core::services::IsFuturesSymbol;
+using core::services::ParseFuturesSymbol;
+using core::services::StripFuturesPrefix;
+using core::services::FuturesFrontMonth;
+
+TEST_CASE("IsFuturesBaseSymbol: known symbols", "[futures]") {
+    REQUIRE(IsFuturesBaseSymbol("ES"));
+    REQUIRE(IsFuturesBaseSymbol("NQ"));
+    REQUIRE(IsFuturesBaseSymbol("YM"));
+    REQUIRE(IsFuturesBaseSymbol("RTY"));
+    REQUIRE(IsFuturesBaseSymbol("GC"));
+    REQUIRE(IsFuturesBaseSymbol("CL"));
+    REQUIRE(IsFuturesBaseSymbol("NG"));
+    REQUIRE(IsFuturesBaseSymbol("ZN"));
+    REQUIRE(IsFuturesBaseSymbol("ZB"));
+    REQUIRE(IsFuturesBaseSymbol("6E"));
+    REQUIRE(IsFuturesBaseSymbol("6J"));
+    REQUIRE(IsFuturesBaseSymbol("ZC"));
+    REQUIRE(IsFuturesBaseSymbol("ZS"));
+    REQUIRE(IsFuturesBaseSymbol("HE"));
+    REQUIRE(IsFuturesBaseSymbol("LE"));
+}
+
+TEST_CASE("IsFuturesBaseSymbol: unknown symbols", "[futures]") {
+    REQUIRE_FALSE(IsFuturesBaseSymbol("AAPL"));
+    REQUIRE_FALSE(IsFuturesBaseSymbol("MSFT"));
+    REQUIRE_FALSE(IsFuturesBaseSymbol("SPY"));
+    REQUIRE_FALSE(IsFuturesBaseSymbol(""));
+    REQUIRE_FALSE(IsFuturesBaseSymbol("XYZ"));
+}
+
+TEST_CASE("IsFuturesSymbol: /-prefix", "[futures]") {
+    REQUIRE(IsFuturesSymbol("/ES"));
+    REQUIRE(IsFuturesSymbol("/NQ"));
+    REQUIRE(IsFuturesSymbol("/GC"));
+}
+
+TEST_CASE("IsFuturesSymbol: /-prefix requires at least 2 chars", "[futures]") {
+    REQUIRE_FALSE(IsFuturesSymbol("/"));
+}
+
+TEST_CASE("IsFuturesSymbol: plain base symbol", "[futures]") {
+    REQUIRE(IsFuturesSymbol("ES"));
+    REQUIRE(IsFuturesSymbol("NQ"));
+    REQUIRE(IsFuturesSymbol("CL"));
+}
+
+TEST_CASE("IsFuturesSymbol: base symbol with contract month (space)", "[futures]") {
+    REQUIRE(IsFuturesSymbol("NQ 202612"));
+    REQUIRE(IsFuturesSymbol("ES 202606"));
+    REQUIRE(IsFuturesSymbol("CL 202701"));
+}
+
+TEST_CASE("IsFuturesSymbol: base symbol with contract month (colon)", "[futures]") {
+    REQUIRE(IsFuturesSymbol("NQ:202612"));
+    REQUIRE(IsFuturesSymbol("ES:202606"));
+}
+
+TEST_CASE("IsFuturesSymbol: /-prefixed with contract month", "[futures]") {
+    REQUIRE(IsFuturesSymbol("/NQ 202612"));
+    REQUIRE(IsFuturesSymbol("/ES:202606"));
+}
+
+TEST_CASE("IsFuturesSymbol: unknown base with contract month is not futures", "[futures]") {
+    REQUIRE_FALSE(IsFuturesSymbol("AAPL 202612"));
+    REQUIRE_FALSE(IsFuturesSymbol("XYZ:202606"));
+}
+
+TEST_CASE("ParseFuturesSymbol: plain symbol", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("ES", base, month);
+    REQUIRE(base == "ES");
+    REQUIRE(month.empty());
+}
+
+TEST_CASE("ParseFuturesSymbol: /-prefixed", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("/NQ", base, month);
+    REQUIRE(base == "NQ");
+    REQUIRE(month.empty());
+}
+
+TEST_CASE("ParseFuturesSymbol: with space-separated contract month", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("NQ 202612", base, month);
+    REQUIRE(base == "NQ");
+    REQUIRE(month == "202612");
+}
+
+TEST_CASE("ParseFuturesSymbol: with colon-separated contract month", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("ES:202606", base, month);
+    REQUIRE(base == "ES");
+    REQUIRE(month == "202606");
+}
+
+TEST_CASE("ParseFuturesSymbol: /-prefixed with space-separated contract month", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("/NQ 202612", base, month);
+    REQUIRE(base == "NQ");
+    REQUIRE(month == "202612");
+}
+
+TEST_CASE("ParseFuturesSymbol: /-prefixed with colon-separated contract month", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("/ES:202606", base, month);
+    REQUIRE(base == "ES");
+    REQUIRE(month == "202606");
+}
+
+TEST_CASE("ParseFuturesSymbol: non-futures symbol passes through", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("AAPL", base, month);
+    REQUIRE(base == "AAPL");
+    REQUIRE(month.empty());
+}
+
+TEST_CASE("ParseFuturesSymbol: non-digit suffix treated as part of base", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("ES JUN26", base, month);  // not YYYYMM
+    REQUIRE(base == "ES JUN26");
+    REQUIRE(month.empty());
+}
+
+TEST_CASE("ParseFuturesSymbol: short suffix not treated as contract month", "[futures]") {
+    std::string base, month;
+    ParseFuturesSymbol("ES 20261", base, month);  // 5 digits, not 6
+    REQUIRE(base == "ES 20261");
+    REQUIRE(month.empty());
+}
+
+TEST_CASE("StripFuturesPrefix: strips leading slash", "[futures]") {
+    REQUIRE(StripFuturesPrefix("/ES") == "ES");
+    REQUIRE(StripFuturesPrefix("/NQ 202612") == "NQ 202612");
+}
+
+TEST_CASE("StripFuturesPrefix: no slash returns unchanged", "[futures]") {
+    REQUIRE(StripFuturesPrefix("ES") == "ES");
+    REQUIRE(StripFuturesPrefix("NQ 202612") == "NQ 202612");
+    REQUIRE(StripFuturesPrefix("") == "");
+}
+
+TEST_CASE("FuturesFrontMonth: returns 6-char YYYYMM all-digit string", "[futures]") {
+    std::string fm = FuturesFrontMonth();
+    REQUIRE(fm.size() == 6);
+    REQUIRE(fm[0] == '2');   // year starts with 2 (this century)
+    REQUIRE(fm[4] >= '0'); REQUIRE(fm[4] <= '1');  // month first digit 0 or 1
+    REQUIRE(fm[5] >= '0'); REQUIRE(fm[5] <= '9');   // month second digit
+    for (char c : fm) REQUIRE(std::isdigit(static_cast<unsigned char>(c)));
+}
+
+TEST_CASE("FuturesFrontMonth: month is between 01 and 12", "[futures]") {
+    std::string fm = FuturesFrontMonth();
+    int month = std::stoi(fm.substr(4, 2));
+    REQUIRE(month >= 1);
+    REQUIRE(month <= 12);
+}

@@ -17,6 +17,9 @@
 #include "TickAttribLast.h"
 #include "TickAttribBidAsk.h"
 #include "WshEventData.h"
+#include "HistoricalTick.h"
+#include "HistoricalTickBidAsk.h"
+#include "HistoricalTickLast.h"
 
 #include <cstring>
 #include <ctime>
@@ -132,21 +135,19 @@ Contract IBKRClient::MakeStockContract(const std::string& symbol) const {
 }
 
 Contract IBKRClient::MakeFuturesContract(const std::string& symbol) const {
-    // Strip leading '/' if present — both "ES" and "/ES" resolve to front-month.
-    const std::string& sym = (!symbol.empty() && symbol[0] == '/')
-                             ? symbol.substr(1) : symbol;
+    // Parse base symbol and optional contract month.
+    //   "ES"        → base="ES", month=""       → auto front-month
+    //   "NQ 202612" → base="NQ", month="202612" → explicit contract
+    std::string base, contractMonth;
+    ParseFuturesSymbol(symbol, base, contractMonth);
     Contract c;
-    c.symbol   = sym;
+    c.symbol   = base;
     c.secType  = "FUT";
     c.currency = "USD";
     c.exchange = "CME";
+    c.lastTradeDateOrContractMonth = contractMonth.empty()
+        ? FuturesFrontMonth() : contractMonth;
     return c;
-}
-
-// Returns true when the symbol represents a futures contract
-// (e.g. "/ES", "/NQ", "ES", "NQ" after slash-stripping).
-static bool IsFuturesSymbol(const std::string& sym) {
-    return !sym.empty() && (sym[0] == '/' || sym == "ES" || sym == "NQ");
 }
 
 void IBKRClient::ReqHistoricalData(int reqId, const std::string& symbol,
@@ -175,14 +176,21 @@ void IBKRClient::CancelHistoricalData(int reqId) {
 }
 
 void IBKRClient::ReqContractDetails(int reqId, const std::string& symbol) {
-    Contract c;
-    c.symbol   = symbol;
-    c.secType  = "STK";
-    c.currency = "USD";
-    c.exchange = "SMART";
-    // Do NOT set primaryExchange: filtering by it silently drops non-NASDAQ stocks
-    // (e.g. SPY on ARCA, BRK.B on NYSE), so onContractConId would never fire.
+    Contract c = IsFuturesSymbol(symbol) ? MakeFuturesContract(symbol)
+                                         : MakeStockContract(symbol);
     m_client->reqContractDetails(reqId, c);
+}
+
+void IBKRClient::ReqHistoricalTicks(int reqId, const std::string& symbol,
+                                    const std::string& whatToShow,
+                                    const std::string& startDateTime,
+                                    const std::string& endDateTime,
+                                    int numberOfTicks, bool useRTH, bool ignoreSize) {
+    Contract c = MakeStockContract(symbol);
+    TagValueListSPtr empty;
+    m_client->reqHistoricalTicks(reqId, c, startDateTime, endDateTime,
+                                 numberOfTicks, whatToShow, useRTH ? 1 : 0,
+                                 ignoreSize, empty);
 }
 
 void IBKRClient::ReqHistoricalNews(int reqId, int conId, int totalResults,
@@ -228,20 +236,23 @@ void IBKRClient::CancelMarketData(int reqId) {
     m_client->cancelMktData(reqId);
 }
 
-void IBKRClient::ReqMktDepth(int reqId, const std::string& symbol, int numRows) {
-    Contract c = MakeStockContract(symbol);
+void IBKRClient::ReqMktDepth(int reqId, const std::string& symbol, int numRows,
+                              bool isSmartDepth) {
+    Contract c = IsFuturesSymbol(symbol) ? MakeFuturesContract(symbol)
+                                         : MakeStockContract(symbol);
     TagValueListSPtr empty;
-    m_client->reqMktDepth(reqId, c, numRows, false, empty);
+    m_client->reqMktDepth(reqId, c, numRows, isSmartDepth, empty);
 }
 
-void IBKRClient::CancelMktDepth(int reqId) {
-    m_client->cancelMktDepth(reqId, false);
+void IBKRClient::CancelMktDepth(int reqId, bool isSmartDepth) {
+    m_client->cancelMktDepth(reqId, isSmartDepth);
 }
 
 void IBKRClient::ReqTickByTickData(int reqId, const std::string& symbol,
                                     const std::string& tickType,
                                     int numberOfTicks, bool ignoreSize) {
-    Contract c = MakeStockContract(symbol);
+    Contract c = IsFuturesSymbol(symbol) ? MakeFuturesContract(symbol)
+                                         : MakeStockContract(symbol);
     m_client->reqTickByTickData(reqId, c, tickType, numberOfTicks, ignoreSize);
 }
 
@@ -538,6 +549,10 @@ void IBKRClient::ProcessMessages() {
             } else if constexpr (std::is_same_v<T, MsgHistoricalNewsEnd>) {
                 if (onHistoricalNewsEnd) onHistoricalNewsEnd(m.reqId);
 
+            } else if constexpr (std::is_same_v<T, MsgHistoricalTick>) {
+                if (onHistoricalTicks)
+                    onHistoricalTicks(m.reqId, m.ticks, m.done);
+
             } else if constexpr (std::is_same_v<T, MsgNewsArticle>) {
                 if (onNewsArticle) onNewsArticle(m.reqId, 0, m.text);
 
@@ -667,12 +682,12 @@ void IBKRClient::marketDataType(TickerId /*reqId*/, int marketDataType) {
     printf("[IB] Market data type: %d (%s)\n", marketDataType, name);
 }
 
-void IBKRClient::tickPrice(TickerId tickerId, TickType field, double price,
+void IBKRClient::tickPrice(TickerId tickerId, ::TickType field, double price,
                             const TickAttrib& /*attrib*/) {
     Push(MsgTickPrice{static_cast<int>(tickerId), static_cast<int>(field), price});
 }
 
-void IBKRClient::tickSize(TickerId tickerId, TickType field, Decimal size) {
+void IBKRClient::tickSize(TickerId tickerId, ::TickType field, Decimal size) {
     Push(MsgTickSize{static_cast<int>(tickerId),
                      static_cast<int>(field),
                      DecimalFunctions::decimalToDouble(size)});
@@ -687,8 +702,8 @@ void IBKRClient::updateMktDepth(TickerId id, int position, int operation,
                   position, operation,
                   price,
                   DecimalFunctions::decimalToDouble(size),
-                  "",    // exchange (empty = SMART aggregated)
-                  true}); // isSmartDepth
+                  "",     // exchange (empty = SMART aggregated)
+                  false}); // isSmartDepth = false — L1 aggregated depth
 }
 
 void IBKRClient::updateMktDepthL2(TickerId id, int position,
@@ -1028,6 +1043,57 @@ void IBKRClient::historicalNews(int requestId, const std::string& time,
 
 void IBKRClient::historicalNewsEnd(int requestId, bool /*hasMore*/) {
     Push(MsgHistoricalNewsEnd{requestId});
+}
+
+void IBKRClient::historicalTicks(int reqId, const std::vector<::HistoricalTick>& ticks,
+                                 bool done) {
+    std::vector<core::HistoricalTick> out;
+    out.reserve(ticks.size());
+    for (const auto& t : ticks) {
+        core::HistoricalTick ct;
+        ct.type  = core::TickType::Midpoint;
+        ct.time  = static_cast<std::time_t>(t.time);
+        ct.price = t.price;
+        ct.size  = DecimalFunctions::decimalToDouble(t.size);
+        out.push_back(ct);
+    }
+    Push(MsgHistoricalTick{reqId, std::move(out), done});
+}
+
+void IBKRClient::historicalTicksBidAsk(int reqId,
+                                       const std::vector<::HistoricalTickBidAsk>& ticks,
+                                       bool done) {
+    std::vector<core::HistoricalTick> out;
+    out.reserve(ticks.size());
+    for (const auto& t : ticks) {
+        core::HistoricalTick ct;
+        ct.type     = core::TickType::BidAsk;
+        ct.time     = static_cast<std::time_t>(t.time);
+        ct.bidPrice = t.priceBid;
+        ct.askPrice = t.priceAsk;
+        ct.bidSize  = DecimalFunctions::decimalToDouble(t.sizeBid);
+        ct.askSize  = DecimalFunctions::decimalToDouble(t.sizeAsk);
+        out.push_back(ct);
+    }
+    Push(MsgHistoricalTick{reqId, std::move(out), done});
+}
+
+void IBKRClient::historicalTicksLast(int reqId,
+                                     const std::vector<::HistoricalTickLast>& ticks,
+                                     bool done) {
+    std::vector<core::HistoricalTick> out;
+    out.reserve(ticks.size());
+    for (const auto& t : ticks) {
+        core::HistoricalTick ct;
+        ct.type           = core::TickType::Trades;
+        ct.time           = static_cast<std::time_t>(t.time);
+        ct.price          = t.price;
+        ct.size           = DecimalFunctions::decimalToDouble(t.size);
+        ct.exchange       = t.exchange;
+        ct.specialConds   = t.specialConditions;
+        out.push_back(ct);
+    }
+    Push(MsgHistoricalTick{reqId, std::move(out), done});
 }
 
 void IBKRClient::newsArticle(int requestId, int /*articleType*/,

@@ -246,6 +246,7 @@ set(APPLICATION_SOURCES
     src/ui/windows/OrdersWindow.cpp
     src/ui/windows/WatchlistWindow.cpp
     src/ui/windows/WshCalendarWindow.cpp
+    src/ui/windows/ReplayWindow.cpp
 )
 
 set(APPLICATION_LIBS

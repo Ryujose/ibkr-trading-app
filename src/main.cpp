@@ -36,6 +36,7 @@
 #include "ui/windows/OrdersWindow.h"
 #include "ui/windows/WatchlistWindow.h"
 #include "ui/windows/WshCalendarWindow.h"
+#include "ui/windows/ReplayWindow.h"
 #include "ui/SymbolSearch.h"
 
 #include "core/services/IBKRClient.h"
@@ -93,12 +94,24 @@ struct WatchlistEntry {
     ui::WatchlistWindow* win = nullptr;
 };
 
+struct ReplayEntry {
+    ui::ReplayWindow* win        = nullptr;
+    int               baseReqId  = 0;    // 11000 + idx * 100
+    int               histId     = 0;    // baseReqId + 0: reqHistoricalData
+    int               extId      = 0;    // baseReqId + 1: extend-history
+    core::HistoricalDay day;             // current loaded day
+    core::BarSeries     pendingBars;     // accumulating bars from hist fetch
+    std::vector<int>    pendingReqIds;   // in-flight IB reqIds
+    bool               histActive  = false; // true while a hist fetch is in-flight
+};
+
 // ---- Multi-instance containers -----------------------------------------------
 static std::vector<ChartEntry>      g_chartEntries;
 static std::vector<TradingEntry>    g_tradingEntries;
 static std::vector<ScannerEntry>    g_scannerEntries;
 static std::vector<NewsEntry>       g_newsEntries;
 static std::vector<WatchlistEntry>  g_watchlistEntries;
+static std::vector<ReplayEntry>     g_replayEntries;
 
 // ---- Singleton windows (one each) --------------------------------------------
 static ui::PortfolioWindow*    g_PortfolioWindow    = nullptr;
@@ -132,6 +145,7 @@ static ImGuiStyle      g_baseStyle;   // saved after initial style setup; used t
 static std::array<core::GroupState, 4> g_groups;
 // Guard against re-entrant group broadcasts when SetSymbol() re-fires callbacks.
 static bool g_groupSyncInProgress = false;
+static bool g_replayCursorSyncInProgress = false;
 
 // Live orders for chart overlay (orderId → Order; refreshed on every status change)
 static std::unordered_map<int, core::Order> g_liveOrders;
@@ -462,8 +476,10 @@ static constexpr double               kStyleSwitchThrottleSec  = 1.0;
 // Persistence flag — set by OnStyleChange (declared below in SpawnChartWindow),
 // flushed once per second from RenderTradingUI(). Defined here so the lambda
 // can capture it without forward-declaration tricks.
-static bool   g_chartModesDirty    = false;
-static double g_lastChartModesSave = 0.0;
+static bool   g_chartModesDirty      = false;
+static bool   g_replayWindowsDirty    = false;
+static double g_lastChartModesSave    = 0.0;
+static double g_lastReplayWindowsSave = 0.0;
 
 static int g_newsItemId    = 10000;  // unique IDs for real-time market news items
 static int g_histNewsId    = 20000;  // unique IDs for historical news items
@@ -788,11 +804,12 @@ static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
     }
     if (!g_IBClient) return;
     g_IBClient->CancelMarketData(te.mktId);
-    g_IBClient->CancelMktDepth(te.depthId);
+    g_IBClient->CancelMktDepth(te.depthId, te.win ? te.win->useL2() : false);
     g_IBClient->CancelTickByTickData(te.tickId);
     g_tickerSymbols[te.mktId] = sym;
     g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
-    g_IBClient->ReqMktDepth(te.depthId, sym, 20);
+    g_IBClient->ReqMktDepth(te.depthId, sym, te.win ? te.win->numDepthRows() : 20,
+                            te.win ? te.win->useL2() : false);
     g_IBClient->ReqTickByTickData(te.tickId, sym);
 }
 
@@ -826,6 +843,23 @@ static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
 
     g_groupSyncInProgress = false;
 }
+
+// Throttled cursor sync across replay windows in the same group (§6.3).
+// Called from OnCursorMove at most once per 100ms per group.
+static void BroadcastReplayCursor(int groupId, std::time_t cursorTime, int sourceIdx) {
+    if (groupId <= 0 || g_replayCursorSyncInProgress) return;
+    g_replayCursorSyncInProgress = true;
+    for (int i = 0; i < (int)g_replayEntries.size(); ++i) {
+        if (i == sourceIdx) continue;
+        auto& re = g_replayEntries[i];
+        if (re.win && re.win->groupId() == groupId)
+            re.win->SeekToTime(cursorTime);
+    }
+    g_replayCursorSyncInProgress = false;
+}
+
+// Throttle: at most once per 100ms per group to avoid CPU spike at MAX speed.
+static std::unordered_map<int, double> g_lastReplayCursorBroadcast;
 
 // ============================================================================
 // Window lifecycle helpers — per-instance spawn functions
@@ -1037,6 +1071,15 @@ static void SpawnTradingWindow(int idx) {
         BroadcastGroupSymbol(te.win->groupId(), sym);
     };
 
+    e.win->OnDepthModeChanged = [idx](bool useL2) {
+        auto& te = g_tradingEntries[idx];
+        if (!g_IBClient || !te.win) return;
+        std::string sym = te.win->getSymbol();
+        if (sym.empty()) return;
+        g_IBClient->CancelMktDepth(te.depthId, !useL2);  // cancel the old mode
+        g_IBClient->ReqMktDepth(te.depthId, sym, te.win->numDepthRows(), useL2);
+    };
+
     g_tradingEntries.push_back(std::move(e));
 }
 
@@ -1064,10 +1107,10 @@ static void SpawnScannerWindow(int idx) {
             if (te.win && te.win->groupId() == 0) {
                 if (g_IBClient) {
                     g_IBClient->CancelMarketData(te.mktId);
-                    g_IBClient->CancelMktDepth(te.depthId);
+                    g_IBClient->CancelMktDepth(te.depthId, te.win->useL2());
                     g_tickerSymbols[te.mktId] = sym;
                     g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
-                    g_IBClient->ReqMktDepth(te.depthId, sym, 20);
+                    g_IBClient->ReqMktDepth(te.depthId, sym, te.win->numDepthRows(), te.win->useL2());
                 }
                 te.win->SetSymbol(sym, 0.0);
             }
@@ -1265,6 +1308,177 @@ static std::vector<ChartModeBlock> LoadChartModesFromFile() {
     return result;
 }
 
+// ---- Replay window persistence ------------------------------------------------
+
+static std::string ReplayWindowsFilePath() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    return std::string(home) + "/.config/ibkr-trading-app/replay-windows.cfg";
+}
+
+static void SaveReplayWindowsFile() {
+    if (g_replayEntries.empty()) return;
+    EnsureWatchlistConfigDir();
+    std::string path = ReplayWindowsFilePath();
+    std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp);
+        if (!f.is_open()) return;
+        for (int i = 0; i < (int)g_replayEntries.size(); ++i) {
+            const auto& re = g_replayEntries[i];
+            if (!re.win) continue;
+            std::string sym = re.win->getSymbol();
+            if (sym.empty()) continue;
+            f << "INSTANCE:"  << i << "\n";
+            f << "GROUP:"     << re.win->groupId() << "\n";
+            f << "SYMBOL:"    << sym << "\n";
+            f << "DATE_FROM:" << re.win->getDateFromBuf() << "\n";
+            f << "DATE_TO:"   << re.win->getDateToBuf() << "\n";
+            f << "SESSION:"   << (int)re.win->getSession() << "\n";
+            f << "TF:"       << (int)re.win->getTimeframe() << "\n";
+            f << "SPEED:"    << re.win->getSpeed() << "\n";
+            f << "MODE:"     << (int)re.win->getMode() << "\n";
+            f << "CURSOR:"   << re.win->getCursorBarIdx() << "\n";
+            f << "EQUITY:"   << re.win->getStartingCash() << "\n";
+            f << "TICKFILLS:" << (re.win->getTickFills() ? 1 : 0) << "\n";
+            // Indicator state — bit-packed flags + period values (replay-indicators plan §3g).
+            const auto& ind = re.win->getIndicatorSettings();
+            unsigned flags = 0;
+            if (ind.sma20)     flags |= 1u;
+            if (ind.sma50)     flags |= 2u;
+            if (ind.ema20)     flags |= 4u;
+            if (ind.bbands)    flags |= 8u;
+            if (ind.vwap)      flags |= 16u;
+            if (ind.vwapBands) flags |= 32u;
+            if (ind.volume)    flags |= 64u;
+            if (ind.rsi)       flags |= 128u;
+            f << "IND_FLAGS:"     << flags << "\n";
+            f << "IND_SMA1:"      << ind.smaPeriod1 << "\n";
+            f << "IND_SMA2:"      << ind.smaPeriod2 << "\n";
+            f << "IND_EMA:"       << ind.emaPeriod << "\n";
+            f << "IND_BB_PERIOD:" << ind.bbPeriod << "\n";
+            f << "IND_BB_SIGMA:"  << ind.bbSigma << "\n";
+            f << "IND_RSI:"       << ind.rsiPeriod << "\n";
+        }
+    }
+    std::rename(tmp.c_str(), path.c_str());
+    g_replayWindowsDirty = false;
+}
+
+static void LoadReplayWindowsFromFile() {
+    std::ifstream f(ReplayWindowsFilePath());
+    if (!f.is_open()) return;
+
+    struct ReplayBlock {
+        int         instanceIdx = -1;
+        int         groupId     = 1;
+        std::string symbol;
+        std::string dateFrom;
+        std::string dateTo;
+        int         session     = 1;    // Intraday
+        int         tf          = 1;    // M5
+        double      speed       = 1.0;
+        int         mode        = 0;    // Analysis
+        int         cursor      = 0;
+        double      equity      = 100000.0;
+        int         tickFills   = 0;
+        bool        indSet      = false;   // any IND_* line seen → apply on restore
+        ui::ReplayWindow::IndicatorSettings ind;
+    };
+    std::vector<ReplayBlock> blocks;
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.size() >= 9 && line.substr(0, 9) == "INSTANCE:") {
+            ReplayBlock b;
+            try { b.instanceIdx = std::stoi(line.substr(9)); } catch (...) {}
+            blocks.push_back(std::move(b));
+        } else if (!blocks.empty()) {
+            auto& b = blocks.back();
+            if (line.size() >= 6 && line.substr(0, 6) == "GROUP:")
+                try { b.groupId = std::stoi(line.substr(6)); } catch (...) {}
+            else if (line.size() >= 7 && line.substr(0, 7) == "SYMBOL:")
+                b.symbol = line.substr(7);
+            else if (line.size() >= 10 && line.substr(0, 10) == "DATE_FROM:")
+                b.dateFrom = line.substr(10);
+            else if (line.size() >= 8 && line.substr(0, 8) == "DATE_TO:")
+                b.dateTo = line.substr(8);
+            else if (line.size() >= 5 && line.substr(0, 5) == "DATE:") {
+                // Legacy single-day config: map to both endpoints.
+                b.dateFrom = line.substr(5);
+                b.dateTo   = line.substr(5);
+            }
+            else if (line.size() >= 8 && line.substr(0, 8) == "SESSION:")
+                try { b.session = std::stoi(line.substr(8)); } catch (...) {}
+            else if (line.size() >= 3 && line.substr(0, 3) == "TF:")
+                try { b.tf = std::stoi(line.substr(3)); } catch (...) {}
+            else if (line.size() >= 6 && line.substr(0, 6) == "SPEED:")
+                try { b.speed = std::stod(line.substr(6)); } catch (...) {}
+            else if (line.size() >= 5 && line.substr(0, 5) == "MODE:")
+                try { b.mode = std::stoi(line.substr(5)); } catch (...) {}
+            else if (line.size() >= 7 && line.substr(0, 7) == "CURSOR:")
+                try { b.cursor = std::stoi(line.substr(7)); } catch (...) {}
+            else if (line.size() >= 7 && line.substr(0, 7) == "EQUITY:")
+                try { b.equity = std::stod(line.substr(7)); } catch (...) {}
+            else if (line.size() >= 10 && line.substr(0, 10) == "TICKFILLS:")
+                try { b.tickFills = std::stoi(line.substr(10)); } catch (...) {}
+            else if (line.size() >= 10 && line.substr(0, 10) == "IND_FLAGS:") {
+                try {
+                    unsigned f = static_cast<unsigned>(std::stoul(line.substr(10)));
+                    b.ind.sma20     = (f & 1u)   != 0;
+                    b.ind.sma50     = (f & 2u)   != 0;
+                    b.ind.ema20     = (f & 4u)   != 0;
+                    b.ind.bbands    = (f & 8u)   != 0;
+                    b.ind.vwap      = (f & 16u)  != 0;
+                    b.ind.vwapBands = (f & 32u)  != 0;
+                    b.ind.volume    = (f & 64u)  != 0;
+                    b.ind.rsi       = (f & 128u) != 0;
+                    b.indSet = true;
+                } catch (...) {}
+            }
+            else if (line.size() >= 9  && line.substr(0, 9)  == "IND_SMA1:")
+                try { b.ind.smaPeriod1 = std::stoi(line.substr(9));  b.indSet = true; } catch (...) {}
+            else if (line.size() >= 9  && line.substr(0, 9)  == "IND_SMA2:")
+                try { b.ind.smaPeriod2 = std::stoi(line.substr(9));  b.indSet = true; } catch (...) {}
+            else if (line.size() >= 8  && line.substr(0, 8)  == "IND_EMA:")
+                try { b.ind.emaPeriod  = std::stoi(line.substr(8));  b.indSet = true; } catch (...) {}
+            else if (line.size() >= 14 && line.substr(0, 14) == "IND_BB_PERIOD:")
+                try { b.ind.bbPeriod   = std::stoi(line.substr(14)); b.indSet = true; } catch (...) {}
+            else if (line.size() >= 13 && line.substr(0, 13) == "IND_BB_SIGMA:")
+                try { b.ind.bbSigma    = std::stod(line.substr(13)); b.indSet = true; } catch (...) {}
+            else if (line.size() >= 8  && line.substr(0, 8)  == "IND_RSI:")
+                try { b.ind.rsiPeriod  = std::stoi(line.substr(8));  b.indSet = true; } catch (...) {}
+        }
+    }
+
+    // Apply blocks to existing replay windows
+    for (const auto& b : blocks) {
+        if (b.instanceIdx < 0 || b.instanceIdx >= (int)g_replayEntries.size()) continue;
+        auto& re = g_replayEntries[b.instanceIdx];
+        if (!re.win || b.symbol.empty()) continue;
+
+        re.win->setGroupId(b.groupId);
+        re.win->SetSymbol(b.symbol);
+        // Back-compat: if legacy DATE: produced both endpoints equal, this is
+        // identical to setDate(). New configs supply DATE_FROM/DATE_TO directly.
+        re.win->setDateFrom(b.dateFrom.c_str());
+        re.win->setDateTo(b.dateTo.empty() ? b.dateFrom.c_str() : b.dateTo.c_str());
+
+        if (b.session >= 0 && b.session <= 3)
+            re.win->setSession(static_cast<core::services::ReplaySession>(b.session));
+        if (b.tf >= 0 && b.tf <= 8)
+            re.win->setTimeframe(static_cast<core::Timeframe>(b.tf));
+
+        re.win->setSpeed(b.speed);
+        re.win->setMode(b.mode == 1 ? ui::ReplayWindow::Mode::Operate
+                                     : ui::ReplayWindow::Mode::Analysis);
+        re.win->setCursorBarIdx(b.cursor);
+        re.win->setStartingCash(b.equity);
+        re.win->setTickFills(b.tickFills != 0);
+        if (b.indSet) re.win->setIndicatorSettings(b.ind);
+    }
+}
+
 static std::vector<WatchlistSaveBlock> LoadWatchlistsFromFile() {
     std::vector<WatchlistSaveBlock> result;
     std::ifstream f(WatchlistsFilePath());
@@ -1348,6 +1562,102 @@ static void SpawnWatchlistWindow(int idx) {
     g_watchlistEntries.push_back(std::move(e));
 }
 
+static int ReplayBaseReqId(int idx) { return 11000 + idx * 100; }
+
+static void SpawnReplayWindow(int idx) {
+    ReplayEntry e;
+    e.baseReqId = ReplayBaseReqId(idx);
+    e.histId    = e.baseReqId + 0;
+    e.extId     = e.baseReqId + 1;
+    e.win       = new ui::ReplayWindow();
+    e.win->setInstanceId(idx + 1);
+    e.win->setGroupId(idx + 1);
+
+    e.win->OnDataRequest = [idx](const std::string& sym,
+                                  const std::string& dateFrom,
+                                  const std::string& dateTo,
+                                  core::services::ReplaySession /*session*/,
+                                  core::Timeframe tf) {
+        if (!g_IBClient || !g_IBClient->IsConnected()) return;
+        if (idx < 0 || idx >= (int)g_replayEntries.size()) return;
+        auto& re = g_replayEntries[idx];
+        // Only cancel if a prior request is in-flight (avoids spurious error 366)
+        if (re.histActive)
+            g_IBClient->CancelHistoricalData(re.histId);
+        re.histActive = true;
+        re.pendingBars = core::BarSeries{};
+        re.pendingBars.symbol    = sym;
+        re.pendingBars.timeframe = tf;
+
+        // End-datetime in IB format: yyyymmdd-hh:mm:ss (UTC dash format).
+        std::string cleanTo = dateTo.empty() ? dateFrom : dateTo;
+        cleanTo.erase(std::remove(cleanTo.begin(), cleanTo.end(), '-'), cleanTo.end());
+        std::string endDt = cleanTo + "-23:59:59";
+
+        // Duration: compute span in days when range is multi-day; fall back to
+        // the timeframe's default single-day-ish duration when from==to.
+        auto parseYmd = [](const std::string& s) -> std::time_t {
+            int y = 0, m = 0, d = 0;
+            if (std::sscanf(s.c_str(), "%d-%d-%d", &y, &m, &d) != 3) return 0;
+            std::tm tm{};
+            tm.tm_year = y - 1900; tm.tm_mon = m - 1; tm.tm_mday = d;
+            tm.tm_hour = 12;
+            return timegm(&tm);
+        };
+        std::string duration = core::TimeframeIBDuration(tf);
+        if (!dateFrom.empty() && !dateTo.empty() && dateFrom != dateTo) {
+            std::time_t tFrom = parseYmd(dateFrom);
+            std::time_t tTo   = parseYmd(dateTo);
+            if (tFrom > 0 && tTo > tFrom) {
+                int spanDays = static_cast<int>((tTo - tFrom) / 86400) + 1;
+                if (spanDays < 1) spanDays = 1;
+                // IB caps " D" units at 365; longer spans must be expressed in years.
+                if (spanDays > 365)
+                    duration = std::to_string((spanDays + 364) / 365) + " Y";
+                else
+                    duration = std::to_string(spanDays) + " D";
+            }
+        }
+
+        g_IBClient->ReqHistoricalData(re.histId, sym,
+                                      duration,
+                                      core::TimeframeIBBarSize(tf),
+                                      true, endDt);
+        g_replayWindowsDirty = true;
+    };
+
+    e.win->OnPaperOrderSubmit = [idx](const core::Order& o) -> int {
+        if (idx < 0 || idx >= (int)g_replayEntries.size()) return -1;
+        auto& re = g_replayEntries[idx];
+        if (!re.win) return -1;
+        int localId = re.win->nextLocalId();
+        re.win->incNextLocalId();
+        (void)o;
+        return localId;
+    };
+
+    e.win->OnPaperOrderCancel = [idx](int localId) {
+        (void)idx; (void)localId;
+        // The window handles removal from its own m_book directly.
+    };
+
+    e.win->OnCursorMove = [idx](std::time_t cursorTime) {
+        if (idx < 0 || idx >= (int)g_replayEntries.size()) return;
+        auto& re = g_replayEntries[idx];
+        if (!re.win) return;
+        int gid = re.win->groupId();
+        double now = ImGui::GetTime();
+        auto it = g_lastReplayCursorBroadcast.find(gid);
+        if (it != g_lastReplayCursorBroadcast.end() && now - it->second < 0.1)
+            return;  // throttle 100ms
+        g_lastReplayCursorBroadcast[gid] = now;
+        BroadcastReplayCursor(gid, cursorTime, idx);
+        g_replayWindowsDirty = true;
+    };
+
+    g_replayEntries.push_back(std::move(e));
+}
+
 static void CreateTradingWindows() {
     // Singleton windows
     delete g_PortfolioWindow;   g_PortfolioWindow   = new ui::PortfolioWindow();
@@ -1370,6 +1680,7 @@ static void CreateTradingWindows() {
     SpawnScannerWindow(0);
     SpawnNewsWindow(0);
     SpawnWatchlistWindow(0);
+    SpawnReplayWindow(0);
 
     // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
@@ -1406,6 +1717,9 @@ static void DestroyTradingWindows() {
     g_newsEntries.clear();
     for (auto& we : g_watchlistEntries) { if (we.win) { we.win->CancelAll(); delete we.win; we.win = nullptr; } }
     g_watchlistEntries.clear();
+    if (g_replayWindowsDirty) SaveReplayWindowsFile();
+    for (auto& re : g_replayEntries) { delete re.win; re.win = nullptr; }
+    g_replayEntries.clear();
     delete g_PortfolioWindow;   g_PortfolioWindow   = nullptr;
     delete g_OrdersWindow;      g_OrdersWindow      = nullptr;
     delete g_WshCalendarWindow; g_WshCalendarWindow = nullptr;
@@ -1656,6 +1970,26 @@ static void WireIBCallbacks() {
                 } else if (ce.win) {
                     ce.win->SetHistoricalData(ce.pendingBars);
                     ce.pendingBars.bars.clear();
+                }
+                return;
+            }
+        }
+        // Replay entry historical data (reqIds 11000–11999)
+        for (auto& re : g_replayEntries) {
+            if (reqId == re.histId) {
+                if (!done) {
+                    re.pendingBars.bars.push_back(bar);
+                } else if (re.win) {
+                    // Build HistoricalDay from pending bars
+                    core::HistoricalDay day;
+                    day.symbol = re.pendingBars.symbol;
+                    day.bars   = re.pendingBars.bars;
+                    re.day     = day;
+                    fprintf(stderr, "[replay] SetDay: %s %zu bars\n",
+                            day.symbol.c_str(), day.bars.size());
+                    re.win->SetDay(day);
+                    re.pendingBars.bars.clear();
+                    re.histActive = false;
                 }
                 return;
             }
@@ -3208,6 +3542,23 @@ static void RenderTradingUI() {
                             SpawnWatchlistWindow((int)g_watchlistEntries.size());
                     }
                     ImGui::Separator();
+                    // Per-instance replay windows
+                    for (auto& re : g_replayEntries) {
+                        if (!re.win) continue;
+                        char lbl[64];
+                        const std::string sym = re.win->getSymbol();
+                        const int gid = re.win->groupId();
+                        std::snprintf(lbl, sizeof(lbl), "Replay %s %s###replay_menu_%d",
+                            sym.empty() ? "--" : sym.c_str(),
+                            gid > 0 ? ("G" + std::to_string(gid)).c_str() : "G-",
+                            re.win->instanceId());
+                        ImGui::MenuItem(lbl, nullptr, &re.win->open());
+                    }
+                    if ((int)g_replayEntries.size() < kMaxMultiWin) {
+                        if (ImGui::MenuItem("+ New Replay"))
+                            SpawnReplayWindow((int)g_replayEntries.size());
+                    }
+                    ImGui::Separator();
                     // Singleton windows
                     if (g_OrdersWindow)       ImGui::MenuItem("Orders",        nullptr, &g_OrdersWindow->open());
                     if (g_PortfolioWindow)    ImGui::MenuItem("Portfolio",     nullptr, &g_PortfolioWindow->open());
@@ -3329,6 +3680,15 @@ static void RenderTradingUI() {
         }
     }
 
+    // Once-per-second flush of replay-windows.cfg
+    if (g_replayWindowsDirty) {
+        double now = glfwGetTime();
+        if (now - g_lastReplayWindowsSave > 1.0) {
+            SaveReplayWindowsFile();
+            g_lastReplayWindowsSave = now;
+        }
+    }
+
     // Push the unguarded-position warning hints once per frame using each
     // chart's freshly-detected S/R. Cheap (positions × charts is small).
     PushUnguardedHintsToWindows();
@@ -3339,6 +3699,7 @@ static void RenderTradingUI() {
     for (auto& se : g_scannerEntries) if (se.win) se.win->Render();
     for (auto& ne : g_newsEntries)    if (ne.win) ne.win->Render();
     for (auto& we : g_watchlistEntries) if (we.win) we.win->Render();
+    for (auto& re : g_replayEntries)    if (re.win) re.win->Render();
     if (g_PortfolioWindow)   g_PortfolioWindow->Render();
     if (g_OrdersWindow)      g_OrdersWindow->Render();
     if (g_WshCalendarWindow) g_WshCalendarWindow->Render();

@@ -74,6 +74,8 @@ struct StylePreset {
     // IndicatorSettings overrides (only VWAP-related differ across modes today)
     bool indVwap;
     bool indVwapBands;
+    int  smaPeriod1;    // fast SMA
+    int  smaPeriod2;    // slow SMA
 
     // SetupSettings overrides
     bool   setupOverlay;
@@ -110,6 +112,8 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     false,
+                /*smaPeriod1*/       9,
+                /*smaPeriod2*/       20,
                 /*setupOverlay*/     false,
                 /*rrMin*/            1.5,
                 /*atrPad*/           0.4,
@@ -140,6 +144,8 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     true,
+                /*smaPeriod1*/       20,
+                /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
                 /*rrMin*/            1.75,
                 /*atrPad*/           0.5,
@@ -170,6 +176,8 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          false,
                 /*indVwapBands*/     false,
+                /*smaPeriod1*/       20,
+                /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
                 /*rrMin*/            2.0,
                 /*atrPad*/           0.5,
@@ -200,6 +208,8 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          false,
                 /*indVwapBands*/     false,
+                /*smaPeriod1*/       50,
+                /*smaPeriod2*/       200,
                 /*setupOverlay*/     false,
                 /*rrMin*/            3.0,
                 /*atrPad*/           1.0,
@@ -237,6 +247,8 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     false,
+                /*smaPeriod1*/       20,
+                /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
                 /*rrMin*/            2.0,
                 /*atrPad*/           0.5,
@@ -280,6 +292,8 @@ inline void ApplyPreset(const StylePreset& p,
 
     ind.vwap       = p.indVwap;
     ind.vwapBands  = p.indVwapBands;
+    ind.smaPeriod1 = p.smaPeriod1;
+    ind.smaPeriod2 = p.smaPeriod2;
 
     s.overlay     = p.setupOverlay;
     s.rrMin       = p.rrMin;

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "imgui.h"
+#include "core/services/IBKRUtils.h"
 
 namespace ui {
 
@@ -115,10 +116,24 @@ inline bool DrawSymbolInput(const char* id, char* buf, int bufSize, float width,
     // Fire search after debounce expires.
     if (ss.debounceEnd > 0.0 && ImGui::GetTime() >= ss.debounceEnd && buf[0] != '\0') {
         ss.debounceEnd = 0.0;
-        ss.searching   = true;
         std::strncpy(ss.searchedQuery, buf, sizeof(ss.searchedQuery) - 1);
         ss.searchedQuery[sizeof(ss.searchedQuery) - 1] = '\0';
-        if (g_symbolSearchFn) g_symbolSearchFn(std::string(buf));
+
+        // Futures symbols: reqMatchingSymbols only covers stocks, so inject
+        // synthetic results directly rather than waiting for an empty response.
+        std::string pattern(buf);
+        if (core::services::IsFuturesSymbol(pattern)) {
+            std::string base = core::services::StripFuturesPrefix(pattern);
+            ss.results.clear();
+            ss.results.push_back({base, "FUT", "CME", "USD"});
+            ss.searching = false;
+            ss.searched  = true;
+            ss.selected  = 0;
+            ss.popupOpen = true;
+        } else {
+            ss.searching = true;
+            if (g_symbolSearchFn) g_symbolSearchFn(std::move(pattern));
+        }
     }
 
     // If IB returned no results for exactly what's in buf, revert to the last
@@ -185,10 +200,22 @@ inline bool DrawSymbolInput(const char* id, char* buf, int bufSize, float width,
             // then block — user must pick from the dropdown.
             if (ss.debounceEnd > 0.0) {
                 ss.debounceEnd = 0.0;
-                ss.searching   = true;
                 std::strncpy(ss.searchedQuery, buf, sizeof(ss.searchedQuery) - 1);
                 ss.searchedQuery[sizeof(ss.searchedQuery) - 1] = '\0';
-                g_symbolSearchFn(std::string(buf));
+
+                std::string pattern(buf);
+                if (core::services::IsFuturesSymbol(pattern)) {
+                    std::string base = core::services::StripFuturesPrefix(pattern);
+                    ss.results.clear();
+                    ss.results.push_back({base, "FUT", "CME", "USD"});
+                    ss.searching = false;
+                    ss.searched  = true;
+                    ss.selected  = 0;
+                    ss.popupOpen = true;
+                } else {
+                    ss.searching = true;
+                    if (g_symbolSearchFn) g_symbolSearchFn(std::move(pattern));
+                }
             }
         }
     }

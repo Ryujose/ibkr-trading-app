@@ -28,6 +28,7 @@ add_executable(tests-core
     test_models.cpp
     test_ibkr_utils.cpp
     test_chart_analysis.cpp
+    test_replay.cpp
 )
 
 target_include_directories(tests-core PRIVATE

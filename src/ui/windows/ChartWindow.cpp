@@ -636,7 +636,20 @@ void ChartWindow::DrawToolbar() {
     }
 
     // Quick symbol buttons
-    static constexpr const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY", "/ES", "/NQ"};
+    // /ES and /NQ show the December contract of the current year
+    // (e.g. "/ES 202612") so one click loads the back-month future.
+    static char s_esBuf[16], s_nqBuf[16];
+    static bool s_qsInit = false;
+    if (!s_qsInit) {
+        int year = []{
+            auto t = std::time(nullptr);
+            return std::gmtime(&t)->tm_year + 1900;
+        }();
+        std::snprintf(s_esBuf, sizeof(s_esBuf), "/ES %04d12", year);
+        std::snprintf(s_nqBuf, sizeof(s_nqBuf), "/NQ %04d12", year);
+        s_qsInit = true;
+    }
+    const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY", s_esBuf, s_nqBuf};
     for (const char* s : kQuickSyms) {
         row.item(FlexRow::buttonW(s), 4);
         bool active = (std::strcmp(m_symbol, s) == 0);
@@ -743,12 +756,17 @@ void ChartWindow::DrawToolbar() {
     }
 
     // Indicator checkboxes
-    row.item(FlexRow::checkboxW("SMA20"), 16);
-    ImGui::Checkbox("SMA20",  &m_ind.sma20);
-    row.item(FlexRow::checkboxW("SMA50"));
-    ImGui::Checkbox("SMA50",  &m_ind.sma50);
-    row.item(FlexRow::checkboxW("EMA20"));
-    ImGui::Checkbox("EMA20",  &m_ind.ema20);
+    char sma1Label[8], sma2Label[8];
+    std::snprintf(sma1Label, sizeof(sma1Label), "SMA%d", m_ind.smaPeriod1);
+    std::snprintf(sma2Label, sizeof(sma2Label), "SMA%d", m_ind.smaPeriod2);
+    row.item(FlexRow::checkboxW(sma1Label), 16);
+    ImGui::Checkbox(sma1Label,  &m_ind.sma20);
+    row.item(FlexRow::checkboxW(sma2Label));
+    ImGui::Checkbox(sma2Label,  &m_ind.sma50);
+    char emaLabel[8];
+    std::snprintf(emaLabel, sizeof(emaLabel), "EMA%d", m_ind.emaPeriod);
+    row.item(FlexRow::checkboxW(emaLabel));
+    ImGui::Checkbox(emaLabel,  &m_ind.ema20);
     row.item(FlexRow::checkboxW("BB"));
     ImGui::Checkbox("BB",     &m_ind.bbands);
     row.item(FlexRow::checkboxW("VWAP"));
@@ -970,6 +988,41 @@ void ChartWindow::DrawAutoSettingsPopup() {
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Lookback window for the Donchian channel high/low.");
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("Indicator Periods");
+    ImGui::Separator();
+
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("SMA1", &m_ind.smaPeriod1)) {
+        if (m_ind.smaPeriod1 < 2)  m_ind.smaPeriod1 = 2;
+        if (m_ind.smaPeriod1 > 500) m_ind.smaPeriod1 = 500;
+        changed = true;
+    }
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("SMA2", &m_ind.smaPeriod2)) {
+        if (m_ind.smaPeriod2 < 2)  m_ind.smaPeriod2 = 2;
+        if (m_ind.smaPeriod2 > 500) m_ind.smaPeriod2 = 500;
+        changed = true;
+    }
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("EMA", &m_ind.emaPeriod)) {
+        if (m_ind.emaPeriod < 2)  m_ind.emaPeriod = 2;
+        if (m_ind.emaPeriod > 500) m_ind.emaPeriod = 500;
+        changed = true;
+    }
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("BB period", &m_ind.bbPeriod)) {
+        if (m_ind.bbPeriod < 2)  m_ind.bbPeriod = 2;
+        if (m_ind.bbPeriod > 200) m_ind.bbPeriod = 200;
+        changed = true;
+    }
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("RSI", &m_ind.rsiPeriod)) {
+        if (m_ind.rsiPeriod < 2)  m_ind.rsiPeriod = 2;
+        if (m_ind.rsiPeriod > 100) m_ind.rsiPeriod = 100;
+        changed = true;
+    }
 
     DrawSetupSettingsPopup();
     // DrawSetupSettingsPopup writes its own InputFloat / Checkbox results into
@@ -2145,8 +2198,20 @@ void ChartWindow::DrawInfoBar() {
         ImGui::TextColored(col, "%s", buf);
     };
 
-    DrawFuturesItem("/ES", m_esPrice, m_esPrevClose, m_esHasData);
-    DrawFuturesItem("/NQ", m_nqPrice, m_nqPrevClose, m_nqHasData);
+    // December contract of the current year: "ES 202612", "NQ 202612"
+    static char s_esFutLabel[16], s_nqFutLabel[16];
+    static bool s_futLabelsInit = false;
+    if (!s_futLabelsInit) {
+        int year = []{
+            auto t = std::time(nullptr);
+            return std::gmtime(&t)->tm_year + 1900;
+        }();
+        std::snprintf(s_esFutLabel, sizeof(s_esFutLabel), "ES %04d12", year);
+        std::snprintf(s_nqFutLabel, sizeof(s_nqFutLabel), "NQ %04d12", year);
+        s_futLabelsInit = true;
+    }
+    DrawFuturesItem(s_esFutLabel, m_esPrice, m_esPrevClose, m_esHasData);
+    DrawFuturesItem(s_nqFutLabel, m_nqPrice, m_nqPrevClose, m_nqHasData);
 }
 
 // ============================================================================
@@ -3311,15 +3376,21 @@ void ChartWindow::DrawCandleChart() {
     }
     if (m_ind.sma20 && (int)m_sma1.size() == n) {
         ImPlot::SetNextLineStyle(ImVec4(1.f, 0.8f, 0.f, 1.f), 1.5f);
-        ImPlot::PlotLine("SMA20", m_idxs.data(), m_sma1.data(), n);
+        char s1lbl[12];
+        std::snprintf(s1lbl, sizeof(s1lbl), "SMA%d", m_ind.smaPeriod1);
+        ImPlot::PlotLine(s1lbl, m_idxs.data(), m_sma1.data(), n);
     }
     if (m_ind.sma50 && (int)m_sma2.size() == n) {
         ImPlot::SetNextLineStyle(ImVec4(1.f, 0.5f, 0.f, 1.f), 1.5f);
-        ImPlot::PlotLine("SMA50", m_idxs.data(), m_sma2.data(), n);
+        char s2lbl[12];
+        std::snprintf(s2lbl, sizeof(s2lbl), "SMA%d", m_ind.smaPeriod2);
+        ImPlot::PlotLine(s2lbl, m_idxs.data(), m_sma2.data(), n);
     }
     if (m_ind.ema20 && (int)m_ema.size() == n) {
         ImPlot::SetNextLineStyle(ImVec4(0.f, 0.9f, 1.f, 1.f), 1.5f);
-        ImPlot::PlotLine("EMA20", m_idxs.data(), m_ema.data(), n);
+        char elbl[12];
+        std::snprintf(elbl, sizeof(elbl), "EMA%d", m_ind.emaPeriod);
+        ImPlot::PlotLine(elbl, m_idxs.data(), m_ema.data(), n);
     }
     if (m_ind.vwap && (int)m_vwap.size() == n) {
         ImPlot::SetNextLineStyle(ImVec4(1.f, 1.f, 1.f, 1.f), 2.f);
@@ -3454,11 +3525,11 @@ void ChartWindow::DrawHoverTooltip() {
     if (m_ind.vwap && i < (int)m_vwap.size() && m_vwap[i] > 0.0)
         ImGui::TextColored(ImVec4(1.f, 1.f, 1.f, 1.f), "VWAP:   $%.2f", m_vwap[i]);
     if (m_ind.sma20 && i < (int)m_sma1.size() && m_sma1[i] > 0.0)
-        ImGui::TextDisabled("SMA20:  $%.2f", m_sma1[i]);
+        ImGui::TextDisabled("SMA%d:  $%.2f", m_ind.smaPeriod1, m_sma1[i]);
     if (m_ind.sma50 && i < (int)m_sma2.size() && m_sma2[i] > 0.0)
-        ImGui::TextDisabled("SMA50:  $%.2f", m_sma2[i]);
+        ImGui::TextDisabled("SMA%d:  $%.2f", m_ind.smaPeriod2, m_sma2[i]);
     if (m_ind.ema20 && i < (int)m_ema.size()  && m_ema[i]  > 0.0)
-        ImGui::TextDisabled("EMA20:  $%.2f", m_ema[i]);
+        ImGui::TextDisabled("EMA%d:  $%.2f", m_ind.emaPeriod, m_ema[i]);
     if (m_ind.rsi   && i < (int)m_rsi.size()  && m_rsi[i]  > 0.0)
         ImGui::TextDisabled("RSI14:  %.1f",  m_rsi[i]);
     ImGui::EndTooltip();
@@ -3763,12 +3834,16 @@ void ChartWindow::RebuildFlatArrays() {
 }
 
 void ChartWindow::ComputeIndicators() {
-    m_sma1 = CalcSMA(m_closes, m_ind.smaPeriod1);
-    m_sma2 = CalcSMA(m_closes, m_ind.smaPeriod2);
-    m_ema  = CalcEMA(m_closes, m_ind.emaPeriod);
-    CalcBollingerBands(m_closes, m_ind.bbPeriod, m_ind.bbSigma,
-                       m_bbMid, m_bbUpper, m_bbLower);
-    m_rsi  = CalcRSI(m_closes, m_ind.rsiPeriod);
+    m_sma1 = core::services::SMA(m_closes, m_ind.smaPeriod1);
+    m_sma2 = core::services::SMA(m_closes, m_ind.smaPeriod2);
+    m_ema  = core::services::EMA(m_closes, m_ind.emaPeriod);
+    {
+        auto bb = core::services::ComputeBollinger(m_closes, m_ind.bbPeriod, m_ind.bbSigma);
+        m_bbMid   = std::move(bb.mid);
+        m_bbUpper = std::move(bb.upper);
+        m_bbLower = std::move(bb.lower);
+    }
+    m_rsi  = core::services::RSI(m_closes, m_ind.rsiPeriod);
     {
         std::vector<int> sessionStarts;
         if (IsIntraday(m_timeframe)) {
@@ -4090,69 +4165,6 @@ void ChartWindow::ComputeSetupPlan() {
         m_setupSettings.stopOffset,
         m_setupSettings.rrMin,
         equity, m_setupSettings.riskPct);
-}
-
-// ============================================================================
-// Indicator math
-// ============================================================================
-std::vector<double> ChartWindow::CalcSMA(const std::vector<double>& close, int period) {
-    int n = (int)close.size();
-    std::vector<double> out(n, 0.0);
-    if (period <= 0 || n < period) return out;
-    double sum = 0.0;
-    for (int i = 0; i < period; i++) sum += close[i];
-    out[period - 1] = sum / period;
-    for (int i = period; i < n; i++) { sum += close[i] - close[i - period]; out[i] = sum / period; }
-    return out;
-}
-
-std::vector<double> ChartWindow::CalcEMA(const std::vector<double>& close, int period) {
-    int n = (int)close.size();
-    std::vector<double> out(n, 0.0);
-    if (period <= 0 || n < period) return out;
-    double k = 2.0 / (period + 1.0), ema = 0.0;
-    for (int i = 0; i < period; i++) ema += close[i];
-    ema /= period; out[period - 1] = ema;
-    for (int i = period; i < n; i++) { ema = close[i] * k + ema * (1.0 - k); out[i] = ema; }
-    return out;
-}
-
-void ChartWindow::CalcBollingerBands(const std::vector<double>& close, int period, float sigma,
-                                     std::vector<double>& mid,
-                                     std::vector<double>& upper,
-                                     std::vector<double>& lower) {
-    int n = (int)close.size();
-    mid.assign(n, 0.0); upper.assign(n, 0.0); lower.assign(n, 0.0);
-    if (period <= 0 || n < period) return;
-    for (int i = period - 1; i < n; i++) {
-        double sum = 0.0;
-        for (int j = i - period + 1; j <= i; j++) sum += close[j];
-        double m = sum / period, var = 0.0;
-        for (int j = i - period + 1; j <= i; j++) var += (close[j] - m) * (close[j] - m);
-        double sd = std::sqrt(var / period);
-        mid[i] = m; upper[i] = m + sigma * sd; lower[i] = m - sigma * sd;
-    }
-}
-
-std::vector<double> ChartWindow::CalcRSI(const std::vector<double>& close, int period) {
-    int n = (int)close.size();
-    std::vector<double> out(n, 0.0);
-    if (period <= 0 || n <= period) return out;
-    double ag = 0.0, al = 0.0;
-    for (int i = 1; i <= period; i++) {
-        double d = close[i] - close[i - 1];
-        if (d > 0) ag += d; else al -= d;
-    }
-    ag /= period; al /= period;
-    auto rsi = [](double g, double l) { return l == 0.0 ? 100.0 : 100.0 - 100.0 / (1.0 + g / l); };
-    out[period] = rsi(ag, al);
-    for (int i = period + 1; i < n; i++) {
-        double d = close[i] - close[i - 1];
-        ag = (ag * (period - 1) + (d > 0 ? d : 0.0)) / period;
-        al = (al * (period - 1) + (d < 0 ? -d : 0.0)) / period;
-        out[i] = rsi(ag, al);
-    }
-    return out;
 }
 
 // ============================================================================
