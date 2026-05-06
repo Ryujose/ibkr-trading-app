@@ -321,8 +321,8 @@ TEST_CASE("Full pipeline: V-shape yields one support cluster below current price
     for (int i = 0; i < n; ++i) {
         int phase = i % 40;
         double base;
-        if (phase < 20) base = 120.0 - (phase * 1.0);             // 120 → 100
-        else            base = 100.0 + ((phase - 20) * 1.0);      // 100 → 120
+        if (phase < 20) base = 120.0 - (phase * 1.0);             // 120 -> 100
+        else            base = 100.0 + ((phase - 20) * 1.0);      // 100 -> 120
         H[i] = base + 0.3;
         L[i] = base - 0.3;
         C[i] = base;
@@ -438,7 +438,7 @@ TEST_CASE("LargestSwingSpan: window=1 only considers the most recent swing of ea
     std::vector<Swing> H = { {0, 110}, {10, 120}, {20, 100} };
     std::vector<Swing> L = { {5,  90}, {15,  95}, {25,  80} };
     auto s = LargestSwingSpan(H, L, 1);
-    // Only H.back()=100 and L.back()=80 → span 20.
+    // Only H.back()=100 and L.back()=80 -> span 20.
     REQUIRE(s.valid);
     REQUIRE(s.hiPrice == 100.0);
     REQUIRE(s.loPrice ==  80.0);
@@ -606,13 +606,13 @@ TEST_CASE("AvoidRoundNumber: returns input unchanged when already safe",
 
 TEST_CASE("AvoidRoundNumber: pushes price away from round marks",
           "[analysis][setup]") {
-    // $10.00 → push down to $9.93
+    // $10.00 -> push down to $9.93
     REQUIRE(AvoidRoundNumber(10.00, 0.07, true)  == Catch::Approx( 9.93));
     REQUIRE(AvoidRoundNumber(10.00, 0.07, false) == Catch::Approx(10.07));
-    // $187.50 (right on .50) → push to either side by pad
+    // $187.50 (right on .50) -> push to either side by pad
     REQUIRE(AvoidRoundNumber(187.50, 0.07, true)  == Catch::Approx(187.43));
     REQUIRE(AvoidRoundNumber(187.50, 0.07, false) == Catch::Approx(187.57));
-    // $10.95 close to 1.00 → push up past next integer → 11.07
+    // $10.95 close to 1.00 -> push up past next integer -> 11.07
     REQUIRE(AvoidRoundNumber(10.95, 0.07, false) == Catch::Approx(11.07));
 }
 
@@ -640,12 +640,12 @@ TEST_CASE("SuggestSetup: long inside the zone uses zone midpoint as entry",
     REQUIRE(p.valid);
     REQUIRE(p.side    == 1);
     REQUIRE(p.entry   == Catch::Approx(186.00));
-    // raw stop = 184.5 - 0.5*2 = 183.50 (right on .50) → push down to 183.43
+    // raw stop = 184.5 - 0.5*2 = 183.50 (right on .50) -> push down to 183.43
     REQUIRE(p.stop    == Catch::Approx(183.43));
     REQUIRE(p.stopLmt == Catch::Approx(183.33));
     REQUIRE(p.target  == Catch::Approx(192.00));
     REQUIRE(p.rr      == Catch::Approx(6.0 / (186.0 - 183.43)));
-    REQUIRE(p.shares  == 0);   // equity = 0 → unknown
+    REQUIRE(p.shares  == 0);   // equity = 0 -> unknown
 }
 
 TEST_CASE("SuggestSetup: long with last past zoneTop chases at last price",
@@ -693,7 +693,7 @@ TEST_CASE("SuggestSetup: short setup mirrors long path with anchor on zone top",
     REQUIRE(p.valid);
     REQUIRE(p.side    == 0);
     REQUIRE(p.entry   == Catch::Approx(189.00));   // mid (last == mid here)
-    // raw stop = 190.5 + 0.5*2 = 191.50 → push up to 191.57
+    // raw stop = 190.5 + 0.5*2 = 191.50 -> push up to 191.57
     REQUIRE(p.stop    == Catch::Approx(191.57));
     REQUIRE(p.stopLmt == Catch::Approx(191.67));
     REQUIRE(p.target  == Catch::Approx(180.00));
@@ -701,10 +701,10 @@ TEST_CASE("SuggestSetup: short setup mirrors long path with anchor on zone top",
 }
 
 TEST_CASE("SuggestSetup: degenerate input rejected", "[analysis][setup]") {
-    // ATR = 0 → reject
+    // ATR = 0 -> reject
     REQUIRE_FALSE(SuggestSetup(1, 187, 185, 184.5, 192, 0.0, 186,
                                0.5, 0.07, 0.10, 2.0, 0, 1).valid);
-    // zoneTop ≤ zoneBot → reject
+    // zoneTop ≤ zoneBot -> reject
     REQUIRE_FALSE(SuggestSetup(1, 185, 187, 184.5, 192, 2.0, 186,
                                0.5, 0.07, 0.10, 2.0, 0, 1).valid);
     // Invalid side
@@ -726,7 +726,7 @@ TEST_CASE("SuggestStopForPosition: long picks closest support below entry",
                                     /*atrPad=*/0.5, /*roundPad=*/0.07,
                                     /*stopOffset=*/0.10);
     REQUIRE(r.valid);
-    // raw stop = 184.6 - 0.5*2 = 183.6 → frac=.60, dist to .50 = .10 ≥ pad → unchanged
+    // raw stop = 184.6 - 0.5*2 = 183.6 -> frac=.60, dist to .50 = .10 ≥ pad -> unchanged
     REQUIRE(r.stop    == Catch::Approx(183.60));
     REQUIRE(r.stopLmt == Catch::Approx(183.50));
     REQUIRE(r.pctRisk == Catch::Approx((187.0 - 183.6) / 187.0 * 100.0));
@@ -741,7 +741,7 @@ TEST_CASE("SuggestStopForPosition: returns invalid when no qualifying level",
     // Empty levels.
     REQUIRE_FALSE(SuggestStopForPosition(true, 187.0, {}, 2.0, 0.5, 0.07, 0.10).valid);
 
-    // Long: every level is at or above entry → no valid support.
+    // Long: every level is at or above entry -> no valid support.
     std::vector<Level> b = { { 200.0, 5, 0, 0, 199.5, 200.5 } };
     REQUIRE_FALSE(SuggestStopForPosition(true, 187.0, b, 2.0, 0.5, 0.07, 0.10).valid);
 }
@@ -758,7 +758,7 @@ TEST_CASE("SuggestStopForPosition: short picks closest resistance above entry",
                                     /*atrPad=*/0.5, /*roundPad=*/0.07,
                                     /*stopOffset=*/0.10);
     REQUIRE(r.valid);
-    // raw stop = 185.4 + 0.5*2 = 186.4 → frac=.40, dist to .50 = .10 ≥ pad → unchanged
+    // raw stop = 185.4 + 0.5*2 = 186.4 -> frac=.40, dist to .50 = .10 ≥ pad -> unchanged
     REQUIRE(r.stop    == Catch::Approx(186.40));
     REQUIRE(r.stopLmt == Catch::Approx(186.50));
     REQUIRE(r.pctRisk == Catch::Approx((186.4 - 180.0) / 180.0 * 100.0));
@@ -776,8 +776,8 @@ TEST_CASE("SuggestStopForPosition: outputs are tick-clean (regression for IB err
         return std::abs(v * 100.0 - std::round(v * 100.0)) < 1e-9;
     };
 
-    // Long: rawStop = 184.0 - 0.5*2 = 183.0 (exact, lands ON the .00 mark) →
-    // AvoidRoundNumber pushes by 0.07 → 182.929999999… (FP drift) → must round
+    // Long: rawStop = 184.0 - 0.5*2 = 183.0 (exact, lands ON the .00 mark) ->
+    // AvoidRoundNumber pushes by 0.07 -> 182.929999999… (FP drift) -> must round
     // back to 182.93.
     std::vector<Level> longLevels = { { 185.0, 3, 0, 10, 184.0, 185.5 } };
     auto rL = SuggestStopForPosition(true, 200.0, longLevels,
@@ -788,8 +788,8 @@ TEST_CASE("SuggestStopForPosition: outputs are tick-clean (regression for IB err
     REQUIRE(onTick(rL.stop));
     REQUIRE(onTick(rL.stopLmt));
 
-    // Short mirror: rawStop = 185.0 + 1.0 = 186.0 → AvoidRoundNumber → 186.07
-    // (drift) → round to 186.07.
+    // Short mirror: rawStop = 185.0 + 1.0 = 186.0 -> AvoidRoundNumber -> 186.07
+    // (drift) -> round to 186.07.
     std::vector<Level> shortLevels = { { 185.0, 3, 0, 10, 184.5, 185.0 } };
     auto rS = SuggestStopForPosition(false, 180.0, shortLevels,
                                      2.0, 0.5, 0.07, 0.10);
@@ -819,9 +819,9 @@ TEST_CASE("SuggestStopForPosition: outputs are tick-clean (regression for IB err
 // ── PositionSizeShares ──────────────────────────────────────────────────────
 
 TEST_CASE("PositionSizeShares: basic risk math", "[analysis][setup]") {
-    // 1% of 100k = 1000. Risk per share = 3 → 333.
+    // 1% of 100k = 1000. Risk per share = 3 -> 333.
     REQUIRE(PositionSizeShares(100000.0, 1.0, 187.0, 184.0) == 333);
-    // 0.5% of 50k = 250. Risk per share = 2.5 → 100.
+    // 0.5% of 50k = 250. Risk per share = 2.5 -> 100.
     REQUIRE(PositionSizeShares( 50000.0, 0.5, 100.0,  97.5) == 100);
 }
 
@@ -884,7 +884,7 @@ TEST_CASE("FuturesSupportDirection: all neutral passes both sides", "[analysis][
 }
 
 TEST_CASE("FuturesSupportDirection: long blocked by counter move", "[analysis][setup]") {
-    // esChg=-1.0 exceeds threshold=0.5 → blocked
+    // esChg=-1.0 exceeds threshold=0.5 -> blocked
     REQUIRE(FuturesSupportDirection(-1.0, -0.1, 0.0, 0.0, 0.5, 1) == false);
     // All four are against us
     REQUIRE(FuturesSupportDirection(-1.0, -0.8, -0.6, -0.3, 0.5, 1) == false);
@@ -931,7 +931,7 @@ TEST_CASE("SessionVwap: known volume-weighted average across three bars", "[anal
         REQUIRE(r.sd1Up[i] <= r.sd2Up[i] + 1e-12);
     }
 
-    // Bar 0 has no spread vs itself → bands collapse to vwap.
+    // Bar 0 has no spread vs itself -> bands collapse to vwap.
     REQUIRE(r.sd1Up[0] == Catch::Approx(r.vwap[0]).epsilon(1e-12));
     REQUIRE(r.sd1Dn[0] == Catch::Approx(r.vwap[0]).epsilon(1e-12));
 }
@@ -960,7 +960,7 @@ TEST_CASE("SessionVwap: session reset bar restarts cumulator", "[analysis][vwap]
     auto r = SessionVwap(H, L, C, V, starts);
     REQUIRE(r.vwap[0] == Catch::Approx(100.0));
     REQUIRE(r.vwap[1] == Catch::Approx(100.0));
-    // Reset at idx=2 → vwap[2] uses only day-2 data.
+    // Reset at idx=2 -> vwap[2] uses only day-2 data.
     REQUIRE(r.vwap[2] == Catch::Approx(200.0));
     REQUIRE(r.vwap[3] == Catch::Approx(200.0));
 
@@ -976,7 +976,7 @@ TEST_CASE("SessionVwap: zero-volume bar carries previous values forward", "[anal
     std::vector<double> V = {1000.0, 0.0, 1000.0};
     auto r = SessionVwap(H, L, C, V, {});
     REQUIRE(r.vwap[0] == Catch::Approx(100.0));
-    // vol=0 → cumulator unchanged → vwap[1] stays 100 (cumTPV/cumVol same as bar 0).
+    // vol=0 -> cumulator unchanged -> vwap[1] stays 100 (cumTPV/cumVol same as bar 0).
     REQUIRE(r.vwap[1] == Catch::Approx(100.0));
     // bar 2 sees 1000 vol at typical=110 plus prior 1000 vol at typical=100.
     REQUIRE(r.vwap[2] == Catch::Approx((100.0 * 1000.0 + 110.0 * 1000.0) / 2000.0));
@@ -1018,7 +1018,7 @@ TEST_CASE("SessionVwap: band ordering invariant on a varying series", "[analysis
         REQUIRE(r.vwap[i]  <= r.sd1Up[i] + 1e-12);
         REQUIRE(r.sd1Up[i] <= r.sd2Up[i] + 1e-12);
     }
-    // After several bars with rising prices, variance is positive → bands non-collapsed.
+    // After several bars with rising prices, variance is positive -> bands non-collapsed.
     REQUIRE(r.sd1Up.back() > r.vwap.back() + 0.01);
     REQUIRE(r.sd2Up.back() > r.sd1Up.back() + 0.01);
 }
@@ -1506,9 +1506,9 @@ TEST_CASE("ComputeOrderImpact: commission propagation", "[analysis][order-impact
 }
 
 TEST_CASE("PreviewStopTarget: long entry $150, target=$155 stop=$148", "[analysis][order-impact]") {
-    // Target leg: long 100@150 + SELL 100@155 → closePnL = +500
+    // Target leg: long 100@150 + SELL 100@155 -> closePnL = +500
     auto target = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 155.0);
-    // Stop leg:   long 100@150 + SELL 100@148 → closePnL = -200
+    // Stop leg:   long 100@150 + SELL 100@148 -> closePnL = -200
     auto stop   = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 148.0);
 
     auto p = PreviewStopTarget(target, stop);
@@ -1527,11 +1527,11 @@ TEST_CASE("PreviewStopTarget: invalid -- non-closing leg", "[analysis][order-imp
 }
 
 TEST_CASE("PreviewStopTarget: invalid -- zero stop risk", "[analysis][order-impact]") {
-    // Close at entry price → zero P&L, risk=0 → invalid R:R
+    // Close at entry price -> zero P&L, risk=0 -> invalid R:R
     auto target = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 155.0);
     auto stop   = ComputeOrderImpact(100.0, 150.0, 0.0, false, 100.0, 150.0);
     auto p = PreviewStopTarget(target, stop);
-    REQUIRE(p.valid == false);   // stopPnL=0 → risk=0
+    REQUIRE(p.valid == false);   // stopPnL=0 -> risk=0
 }
 
 // ============================================================================
@@ -1635,7 +1635,7 @@ TEST_CASE("RSI: strictly rising series -> 100", "[analysis][chart-indicators]") 
 TEST_CASE("RSI: strictly falling series -> 0", "[analysis][chart-indicators]") {
     std::vector<double> in = {10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
     auto out = RSI(in, 2);
-    REQUIRE(out[2] == Catch::Approx(0.0));     // ag == 0 → 100 - 100/(1+0) = 0
+    REQUIRE(out[2] == Catch::Approx(0.0));     // ag == 0 -> 100 - 100/(1+0) = 0
     REQUIRE(out[9] == Catch::Approx(0.0));
 }
 
@@ -1644,7 +1644,7 @@ TEST_CASE("RSI: mixed series, known midpoint value", "[analysis][chart-indicator
     std::vector<double> in = {10, 11, 10, 11, 10, 11, 10};
     auto out = RSI(in, 2);
     REQUIRE(out.size() == 7);
-    REQUIRE(out[2] == Catch::Approx(50.0));   // ag=0.5 al=0.5 → 50
+    REQUIRE(out[2] == Catch::Approx(50.0));   // ag=0.5 al=0.5 -> 50
 }
 
 TEST_CASE("RSI: degenerate input", "[analysis][chart-indicators]") {
@@ -1663,7 +1663,7 @@ TEST_CASE("RSI: degenerate input", "[analysis][chart-indicators]") {
 TEST_CASE("VolumeProfile: single-bar uniform distribution across all bins",
           "[analysis][volume-profile]") {
     // One bar low=100, high=110, vol=1000 over [100, 110] with 10 bins.
-    // Each bin spans 1.0 of price; overlap fraction is 1/10 per bin → 100 vol/bin.
+    // Each bin spans 1.0 of price; overlap fraction is 1/10 per bin -> 100 vol/bin.
     std::vector<double> highs = {110.0};
     std::vector<double> lows  = {100.0};
     std::vector<double> vols  = {1000.0};
@@ -1746,7 +1746,7 @@ TEST_CASE("VolumeProfile: partial overlap scales proportionally",
     }
 }
 
-TEST_CASE("VolumeProfile: empty input → empty profile",
+TEST_CASE("VolumeProfile: empty input -> empty profile",
           "[analysis][volume-profile]") {
     auto vp = ComputeVolumeProfile({}, {}, {}, 100.0, 110.0, 50);
     REQUIRE(vp.bins.empty());
@@ -1755,7 +1755,7 @@ TEST_CASE("VolumeProfile: empty input → empty profile",
     REQUIRE(vp.totalVol  == 0.0);
 }
 
-TEST_CASE("VolumeProfile: degenerate range → empty profile",
+TEST_CASE("VolumeProfile: degenerate range -> empty profile",
           "[analysis][volume-profile]") {
     std::vector<double> highs = {110.0};
     std::vector<double> lows  = {100.0};
@@ -1767,7 +1767,7 @@ TEST_CASE("VolumeProfile: degenerate range → empty profile",
     REQUIRE(vp2.bins.empty());
 }
 
-TEST_CASE("VolumeProfile: mismatched-length input → empty profile",
+TEST_CASE("VolumeProfile: mismatched-length input -> empty profile",
           "[analysis][volume-profile]") {
     auto vp = ComputeVolumeProfile({100.0, 102.0}, {99.0}, {500.0, 600.0},
                                    99.0, 102.0, 10);
@@ -1798,12 +1798,12 @@ TEST_CASE("VolumeProfile: value area expands outward from POC",
           "[analysis][volume-profile]") {
     // 5 single-price bars at distinct bin indices in a 10-bin profile over
     // [100, 105] (width 0.5):
-    //   101.25 → bin 2 (vol 10), 101.75 → bin 3 (vol 20),
-    //   102.25 → bin 4 (vol 50, POC),
-    //   102.75 → bin 5 (vol 20), 103.25 → bin 6 (vol 10).
+    //   101.25 -> bin 2 (vol 10), 101.75 -> bin 3 (vol 20),
+    //   102.25 -> bin 4 (vol 50, POC),
+    //   102.75 -> bin 5 (vol 20), 103.25 -> bin 6 (vol 10).
     // Total = 110, target = 0.70 × 110 = 77.
-    // Expansion from POC (50): tied 20/20 left/right → algorithm picks right
-    // first → hi=5 acc=70 → 10/20 → left wins → lo=3 acc=90 ≥ 77.
+    // Expansion from POC (50): tied 20/20 left/right -> algorithm picks right
+    // first -> hi=5 acc=70 -> 10/20 -> left wins -> lo=3 acc=90 ≥ 77.
     // Result: valueAreaLoIdx=3, valueAreaHiIdx=5.
     std::vector<double> highs = {101.25, 101.75, 102.25, 102.75, 103.25};
     std::vector<double> lows  = {101.25, 101.75, 102.25, 102.75, 103.25};
