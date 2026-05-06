@@ -169,6 +169,9 @@ void ChartWindow::setTradingStyle(core::services::TradingStyle s, bool silent) {
     m_unguarded       = UnguardedHint{};
     m_drawings.clear();
     m_drawPending     = false;
+    // Clear Dec futures members so stale data doesn't flash on style switch
+    m_esDecPrice = m_esDecPrevClose = m_nqDecPrice = m_nqDecPrevClose = 0.0;
+    m_esDecHasData = m_nqDecHasData = false;
 
     m_loading         = true;
     m_hasRealData     = false;
@@ -221,6 +224,9 @@ void ChartWindow::setTimeframeFree(core::Timeframe tf, bool silent) {
     m_breakoutFromSupply = false;
     m_breakoutLevelIdx   = -1;
     m_setup           = SetupPlan{};
+    // Clear Dec futures members
+    m_esDecPrice = m_esDecPrevClose = m_nqDecPrice = m_nqDecPrevClose = 0.0;
+    m_esDecHasData = m_nqDecHasData = false;
 
     m_loading         = true;
     m_hasRealData     = false;
@@ -253,6 +259,7 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     m_dragPendingActive = false;
     m_dragPendingIsAux  = false;
     m_firstPricePlaced  = false;
+    m_secondPricePlaced = false;
     AddToHistory(symbol);
     RequestNewData();
 }
@@ -493,6 +500,14 @@ void ChartWindow::OnFuturesTick(int reqId, int field, double price) {
         pricePtr     = &m_nqPrice;
         prevClosePtr = &m_nqPrevClose;
         hasData      = &m_nqHasData;
+    } else if (reqId == 142) {
+        pricePtr     = &m_esDecPrice;
+        prevClosePtr = &m_esDecPrevClose;
+        hasData      = &m_esDecHasData;
+    } else if (reqId == 143) {
+        pricePtr     = &m_nqDecPrice;
+        prevClosePtr = &m_nqDecPrevClose;
+        hasData      = &m_nqDecHasData;
     } else return;
 
     if (field == 4 || field == 1 || field == 2) {  // LAST, BID, ASK
@@ -635,7 +650,7 @@ void ChartWindow::DrawToolbar() {
     // Quick symbol buttons
     // /ES and /NQ show the December contract of the current year
     // (e.g. "/ES 202612") so one click loads the back-month future.
-    static char s_esBuf[16], s_nqBuf[16];
+    static char s_esBuf[16], s_nqBuf[16], s_es_midBuf[16], s_nq_midBuf[16];
     static bool s_qsInit = false;
     if (!s_qsInit) {
         int year = []{
@@ -644,9 +659,11 @@ void ChartWindow::DrawToolbar() {
         }();
         std::snprintf(s_esBuf, sizeof(s_esBuf), "/ES %04d12", year);
         std::snprintf(s_nqBuf, sizeof(s_nqBuf), "/NQ %04d12", year);
+        std::snprintf(s_es_midBuf, sizeof(s_es_midBuf), "/ES %04d06", year);
+        std::snprintf(s_nq_midBuf, sizeof(s_nq_midBuf), "/NQ %04d06", year);
         s_qsInit = true;
     }
-    const char* kQuickSyms[] = {"AAPL", "MSFT", "GOOGL", "TSLA", "SPY", s_esBuf, s_nqBuf};
+    const char* kQuickSyms[] = {"AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "TSLA", s_es_midBuf, s_esBuf, s_nq_midBuf, s_nqBuf};
     for (const char* s : kQuickSyms) {
         row.item(FlexRow::buttonW(s), 4);
         bool active = (std::strcmp(m_symbol, s) == 0);
@@ -901,6 +918,13 @@ void ChartWindow::DrawAnalysisToolbar() {
                           "supply or demand zone has a fresh setup signal.\n"
                           "Structure-based suggestions, not advice.");
 
+    row.item(FlexRow::checkboxW("VP"), 4);
+    ImGui::Checkbox("VP", &m_ind.volumeProfile);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Volume Profile — horizontal histogram of volume-by-price "
+                          "for the visible range. Highlights the Point of Control "
+                          "and ~70%% Value Area.");
+
     row.item(FlexRow::buttonW("Auto..."), 4);
     if (ImGui::SmallButton("Auto...")) ImGui::OpenPopup("##auto_settings");
     if (ImGui::IsItemHovered())
@@ -1021,6 +1045,17 @@ void ChartWindow::DrawAutoSettingsPopup() {
         changed = true;
     }
 
+    ImGui::Separator();
+    ImGui::TextDisabled("Volume Profile");
+    ImGui::SetNextItemWidth(em(70));
+    if (ImGui::InputInt("VP bins", &m_ind.vpBins)) {
+        if (m_ind.vpBins < 10)  m_ind.vpBins = 10;
+        if (m_ind.vpBins > 200) m_ind.vpBins = 200;
+        // No DetectStructure recompute needed — the profile rebuckets every
+        // frame from the visible Y-range, so the new bin count takes effect
+        // on the next paint.
+    }
+
     DrawSetupSettingsPopup();
     // DrawSetupSettingsPopup writes its own InputFloat / Checkbox results into
     // m_setupSettings; we re-run DetectStructure unconditionally if any of them
@@ -1111,6 +1146,71 @@ void ChartWindow::DrawSetupSettingsPopup() {
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("ON: protective stop is a Stop-Limit (default).\n"
                           "OFF: plain Stop-Market (always fills, may slip).");
+
+    // ── Confluence gates ──────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::TextDisabled("Confluence gates");
+    ImGui::Separator();
+
+    FlexRow gateRow;
+    gateRow.item(FlexRow::checkboxW("Trend align"), 8);
+    if (ImGui::Checkbox("Trend align", &m_setupSettings.trendAlign)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Long setups only in uptrends; shorts only in downtrends.");
+
+    gateRow.item(FlexRow::checkboxW("VWAP context"), 8);
+    if (ImGui::Checkbox("VWAP context", &m_setupSettings.vwapContext)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Longs only above VWAP; shorts only below VWAP.");
+
+    gateRow.item(FlexRow::checkboxW("Market health"), 8);
+    if (ImGui::Checkbox("Market health", &m_setupSettings.marketHealth)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Reject setups when /ES and /NQ are moving strongly against.");
+
+    if (m_setupSettings.marketHealth) {
+        ImGui::SetNextItemWidth(em(80));
+        buf = (float)m_setupSettings.mhMaxCounterPct;
+        if (ImGui::InputFloat("Max counter move (%)", &buf, 0.1f, 0.0f, "%.2f")) {
+            if (buf < 0.1f) buf = 0.1f;
+            if (buf > 2.0f) buf = 2.0f;
+            m_setupSettings.mhMaxCounterPct = buf;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Max %% that /ES or /NQ can move against the setup "
+                              "before the signal is suppressed.");
+    }
+
+    gateRow.item(FlexRow::checkboxW("RSI filter"), 8);
+    if (ImGui::Checkbox("RSI filter", &m_setupSettings.rsiFilter)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Longs only when RSI < 70; shorts only when RSI > 30.");
+
+    gateRow.item(FlexRow::checkboxW("Volume confl."), 8);
+    if (ImGui::Checkbox("Volume confl.", &m_setupSettings.volumeConfluence)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Active zone must overlap a volume-profile high-volume node.");
+
+    // ── Multi-target ───────────────────────────────────────────────────────────
+    gateRow.item(FlexRow::checkboxW("Multi-target"), 8);
+    if (ImGui::Checkbox("Multi-target", &m_setupSettings.multiTarget)) changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Surface a second take-profit level (T2) at the next "
+                          "opposing S/R level.");
+
+    if (m_setupSettings.multiTarget) {
+        ImGui::SetNextItemWidth(em(80));
+        buf = (float)m_setupSettings.t2SplitPct;
+        if (ImGui::InputFloat("T2 split (%)", &buf, 5.0f, 0.0f, "%.0f")) {
+            if (buf < 10.0f) buf = 10.0f;
+            if (buf > 90.0f) buf = 90.0f;
+            m_setupSettings.t2SplitPct = buf;
+            changed = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Percentage of position for T1 (remainder goes to T2).");
+    }
 
     if (changed) DetectStructure();
 }
@@ -1309,6 +1409,65 @@ void ChartWindow::DrawAutoZones() {
 }
 
 // ============================================================================
+// DrawVolumeProfile — Phase 15 horizontal volume-by-price histogram.
+// Called from DrawCandleChart() inside BeginPlot/EndPlot, after candlesticks
+// and before overlays. Reads the visible Y-range from ImPlot::GetPlotLimits()
+// and rebuckets every frame; bars are drawn via the plot drawlist anchored to
+// the right plot edge so they don't interact with the X-axis or auto-fit.
+// ============================================================================
+void ChartWindow::DrawVolumeProfile() {
+    if (m_closes.empty() || m_highs.empty() || m_lows.empty() || m_volumes.empty())
+        return;
+
+    ImPlotRect lim     = ImPlot::GetPlotLimits();
+    double     priceLo = lim.Y.Min, priceHi = lim.Y.Max;
+    if (priceHi <= priceLo) return;
+
+    m_vp = core::services::ComputeVolumeProfile(m_highs, m_lows, m_volumes,
+                                                priceLo, priceHi, m_ind.vpBins);
+    if (m_vp.bins.empty() || m_vp.maxVolume <= 0.0) return;
+
+    ImDrawList* dl   = ImPlot::GetPlotDrawList();
+    ImVec2      pMin = ImPlot::GetPlotPos();
+    ImVec2      pMax = ImVec2(pMin.x + ImPlot::GetPlotSize().x,
+                              pMin.y + ImPlot::GetPlotSize().y);
+
+    // Histogram occupies the rightmost ~25% of the plot width at the POC
+    // (max-volume bin). Other bins scale proportionally.
+    const float maxBarPx = (pMax.x - pMin.x) * 0.25f;
+
+    // Standard bins — translucent gold so they read as a backdrop, not an overlay.
+    const ImU32 colNormal = IM_COL32(255, 200,  50,  46);     // ~18% alpha
+    const ImU32 colVA     = IM_COL32(255, 200,  50,  74);     // ~29% alpha
+    const ImU32 colPoc    = IM_COL32(255, 215,  90, 110);     // ~43% alpha
+    const ImU32 colPocOL  = IM_COL32(255, 230, 130, 200);     // POC border
+
+    int nb = static_cast<int>(m_vp.bins.size());
+    for (int b = 0; b < nb; ++b) {
+        const auto& bin = m_vp.bins[b];
+        if (bin.volume <= 0.0) continue;
+        double  frac = bin.volume / m_vp.maxVolume;
+        if (frac > 1.0) frac = 1.0;
+        float   wPx  = static_cast<float>(maxBarPx * frac);
+        ImVec2  topL = ImPlot::PlotToPixels(lim.X.Max, bin.priceHi);
+        ImVec2  botR = ImPlot::PlotToPixels(lim.X.Max, bin.priceLo);
+        topL.x = pMax.x - wPx;
+        botR.x = pMax.x;
+        // Clamp to plot rect (defensive — PlotToPixels may overshoot at edges).
+        if (topL.y < pMin.y) topL.y = pMin.y;
+        if (botR.y > pMax.y) botR.y = pMax.y;
+
+        bool inVA = (m_vp.valueAreaLoIdx >= 0 &&
+                     b >= m_vp.valueAreaLoIdx && b <= m_vp.valueAreaHiIdx);
+        bool isPoc = (b == m_vp.pocIdx);
+        ImU32 fill = isPoc ? colPoc : (inVA ? colVA : colNormal);
+
+        dl->AddRectFilled(topL, botR, fill);
+        if (isPoc) dl->AddRect(topL, botR, colPocOL, 0.f, 0, 1.f);
+    }
+}
+
+// ============================================================================
 // DrawSetupOverlay — three dashed h-lines (entry / stop / target) plus an
 // optional faint stop-limit companion line. Right-edge label tags stay flush to
 // the plot's right edge (S/R uses the left edge, so the two label families
@@ -1384,6 +1543,15 @@ void ChartWindow::DrawSetupOverlay() {
     std::snprintf(tgtBuf, sizeof(tgtBuf),
                   " TGT %.2f (R:R %.1f) ", m_setup.target, m_setup.rr);
     drawLine(m_setup.target, kTgtCol, tgtBuf);
+
+    // T2 — second target at the next opposing level, with split %.
+    if (m_setup.t2Target > 0.0) {
+        static constexpr ImU32 kT2Col = IM_COL32(200, 120, 230, 180);   // magenta
+        char t2Buf[56];
+        std::snprintf(t2Buf, sizeof(t2Buf),
+                      " T2 %.2f (%.0f%%) ", m_setup.t2Target, m_setup.t2SplitPct);
+        drawLine(m_setup.t2Target, kT2Col, t2Buf);
+    }
 }
 
 // ============================================================================
@@ -1565,11 +1733,12 @@ void ChartWindow::DrawTradePanel() {
         for (int i = 0; i < kNumOrderTypes; i++) {
             bool sel = (i == m_orderTypeIdx);
             if (ImGui::Selectable(kOrderTypes[i].label, sel)) {
-                m_orderTypeIdx     = i;
-                m_limitArmed       = false;
-                m_firstPricePlaced = false;
-                m_limitPlaced      = false;
-                m_placedDragging   = false;
+                m_orderTypeIdx      = i;
+                m_limitArmed        = false;
+                m_firstPricePlaced  = false;
+                m_secondPricePlaced = false;
+                m_limitPlaced       = false;
+                m_placedDragging    = false;
             }
             if (sel) ImGui::SetItemDefaultFocus();
         }
@@ -1723,17 +1892,27 @@ void ChartWindow::DrawTradePanel() {
         ImVec4 hintCol = (m_limitSide == "BUY")
                          ? ImVec4(0.4f, 0.7f, 1.f, 1.f)
                          : ImVec4(1.f, 0.4f, 0.4f, 1.f);
-        const char* hint = m_firstPricePlaced
-            ? (kOrderTypes[m_orderTypeIdx].firstIsAux
-                ? "Trigger set — click chart for limit price | Esc=cancel"
-                : "Stop set — click chart for limit price | Esc=cancel")
-            : kOrderTypes[m_orderTypeIdx].isDualPrice
-                ? (kOrderTypes[m_orderTypeIdx].firstIsAux
-                    ? "Click chart to set TRIGGER price | Esc=cancel"
-                    : "Click chart to set STOP price | Esc=cancel")
-                : m_transmitInstantly
-                    ? "Click to send | Ctrl+click for confirmation | Esc=cancel"
-                    : "Click to preview & confirm | Esc=cancel";
+        const auto& oth = kOrderTypes[m_orderTypeIdx];
+        const char* hint;
+        if (oth.isBracket) {
+            hint = m_secondPricePlaced
+                ? "Entry + STP set — click chart to set TAKE-PROFIT price | Esc=cancel"
+                : (m_firstPricePlaced
+                    ? "Entry set — click chart to set STOP-LOSS price | Esc=cancel"
+                    : "Click chart to set ENTRY (LMT) price | Esc=cancel");
+        } else {
+            hint = m_firstPricePlaced
+                ? (oth.firstIsAux
+                    ? "Trigger set — click chart for limit price | Esc=cancel"
+                    : "Stop set — click chart for limit price | Esc=cancel")
+                : oth.isDualPrice
+                    ? (oth.firstIsAux
+                        ? "Click chart to set TRIGGER price | Esc=cancel"
+                        : "Click chart to set STOP price | Esc=cancel")
+                    : m_transmitInstantly
+                        ? "Click to send | Ctrl+click for confirmation | Esc=cancel"
+                        : "Click to preview & confirm | Esc=cancel";
+        }
         row.item(FlexRow::textW(hint), 12);
         ImGui::TextColored(hintCol, "%s", hint);
     }
@@ -1798,10 +1977,12 @@ void ChartWindow::DrawTradePanel() {
             // Reset dual-price phase state so a re-arm (e.g. user clicked BUY,
             // placed the stop, then clicked SELL or BUY again) starts fresh
             // instead of inheriting the previous arming's stop/trigger price.
-            m_limitArmed       = true;
-            m_limitSide        = side;
-            m_firstPricePlaced = false;
-            m_firstPrice       = 0.0;
+            m_limitArmed        = true;
+            m_limitSide         = side;
+            m_firstPricePlaced  = false;
+            m_firstPrice        = 0.0;
+            m_secondPricePlaced = false;
+            m_secondPrice       = 0.0;
         }
     };
 
@@ -1814,10 +1995,11 @@ void ChartWindow::DrawTradePanel() {
         // table). Adopt the suggested share count when available.
         m_orderTypeIdx = 1;
         if (m_setup.shares > 0) m_orderQty = m_setup.shares;
-        m_limitArmed       = false;
-        m_firstPricePlaced = false;
-        m_limitPlaced      = false;
-        m_placedDragging   = false;
+        m_limitArmed        = false;
+        m_firstPricePlaced  = false;
+        m_secondPricePlaced = false;
+        m_limitPlaced       = false;
+        m_placedDragging    = false;
 
         const std::string side = (m_setup.side == 1) ? "BUY" : "SELL";
         core::Order o   = buildOrder(side);
@@ -1833,8 +2015,9 @@ void ChartWindow::DrawTradePanel() {
 
     // Escape cancels armed state (both phases)
     if (m_limitArmed && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-        m_limitArmed       = false;
-        m_firstPricePlaced = false;
+        m_limitArmed        = false;
+        m_firstPricePlaced  = false;
+        m_secondPricePlaced = false;
     }
 }
 
@@ -1869,13 +2052,34 @@ void ChartWindow::DrawConfirmPopup() {
 
     // ── Order fields (read-only) ─────────────────────────────────────────────
     ImGui::Text("Symbol:     %s",  o.symbol.c_str());
-    ImGui::Text("Type:       %s",  core::OrderTypeStr(o.type));
+    if (m_isBracketConfirm) {
+        ImGui::Text("Type:       BRACKET (LMT entry + STP%s)",
+                    m_bracketTpPrice > 0.0 ? " + TP" : "");
+    } else {
+        ImGui::Text("Type:       %s", core::OrderTypeStr(o.type));
+    }
     ImGui::Text("Quantity:   %.0f shares", o.quantity);
 
     ImGui::Spacing();
 
-    // Per-type price display
-    switch (o.type) {
+    // Bracket: show all three legs (entry / stop / take-profit) up front.
+    // The staged order's type is Limit (entry leg); STP/TP submit on fill.
+    if (m_isBracketConfirm) {
+        ImGui::Text("Entry LMT:  $%.4f", o.limitPrice);
+        ImGui::Text("Stop Loss:  $%.4f", m_bracketStopPrice);
+        if (m_bracketTpPrice > 0.0) {
+            ImGui::Text("Take Profit:$%.4f", m_bracketTpPrice);
+            double risk   = std::abs(o.limitPrice - m_bracketStopPrice);
+            double reward = std::abs(m_bracketTpPrice - o.limitPrice);
+            if (risk > 0.0)
+                ImGui::Text("R:R         %.2f", reward / risk);
+        }
+        ImGui::TextDisabled("(Stop + TP submitted as OCA pair on entry fill)");
+        ImGui::Spacing();
+    }
+
+    // Per-type price display (skipped for bracket — already shown above)
+    if (!m_isBracketConfirm) switch (o.type) {
         case core::OrderType::Limit:
         case core::OrderType::LOC:
             ImGui::Text("Limit:      $%.4f", o.limitPrice);
@@ -2202,7 +2406,7 @@ void ChartWindow::DrawInfoBar() {
         ImGui::TextDisabled("%s", commBuf);
     }
 
-    // ── Futures market health (/ES, /NQ) ──────────────────────────────────
+    // ── Futures market health (/ES, /NQ — front-month + Dec) ────────────
     auto DrawFuturesItem = [&](const char* label, double price,
                                 double prevClose, bool hasData) {
         row.item(em(130), 12);
@@ -2221,20 +2425,19 @@ void ChartWindow::DrawInfoBar() {
         ImGui::TextColored(col, "%s", buf);
     };
 
-    // December contract of the current year: "ES 202612", "NQ 202612"
-    static char s_esFutLabel[16], s_nqFutLabel[16];
-    static bool s_futLabelsInit = false;
-    if (!s_futLabelsInit) {
-        int year = []{
-            auto t = std::time(nullptr);
-            return std::gmtime(&t)->tm_year + 1900;
-        }();
-        std::snprintf(s_esFutLabel, sizeof(s_esFutLabel), "ES %04d12", year);
-        std::snprintf(s_nqFutLabel, sizeof(s_nqFutLabel), "NQ %04d12", year);
-        s_futLabelsInit = true;
-    }
-    DrawFuturesItem(s_esFutLabel, m_esPrice, m_esPrevClose, m_esHasData);
-    DrawFuturesItem(s_nqFutLabel, m_nqPrice, m_nqPrevClose, m_nqHasData);
+    // Dynamic labels — front-month from FuturesFrontMonth, Dec = current year
+    int  nowYear  = []{ auto t = std::time(nullptr); return std::gmtime(&t)->tm_year + 1900; }();
+    auto frontMth = core::services::FuturesFrontMonth();
+    char esFm[14], nqFm[14], esDec[14], nqDec[14];
+    std::snprintf(esFm,  sizeof(esFm),  "ES %s",   frontMth.c_str());
+    std::snprintf(nqFm,  sizeof(nqFm),  "NQ %s",   frontMth.c_str());
+    std::snprintf(esDec, sizeof(esDec), "ES %04d12", nowYear);
+    std::snprintf(nqDec, sizeof(nqDec), "NQ %04d12", nowYear);
+
+    DrawFuturesItem(esFm,  m_esPrice,     m_esPrevClose,     m_esHasData);
+    DrawFuturesItem(esDec, m_esDecPrice,  m_esDecPrevClose,  m_esDecHasData);
+    DrawFuturesItem(nqFm,  m_nqPrice,     m_nqPrevClose,     m_nqHasData);
+    DrawFuturesItem(nqDec, m_nqDecPrice,  m_nqDecPrevClose,  m_nqDecHasData);
 }
 
 // ============================================================================
@@ -2732,29 +2935,37 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         m_liveCursorPrice  = cursorPrice;   // feed the order-impact badge
 
         // Helper: draw a floating dashed line with a price bubble at the cursor.
-        // pnl=NaN → no P&L annotation.
+        // pnl=NaN → cost-only annotation. pct provides optional %; extra appends
+        // a free-form trailing string (e.g. "R:R 2.34") to both bubble and label.
         auto drawArmedLine = [&](double linePrice, ImU32 lineCol, ImU32 bubBg,
                                   const char* tag, bool followsCursor,
-                                  double pnl = std::numeric_limits<double>::quiet_NaN()) {
+                                  double pnl = std::numeric_limits<double>::quiet_NaN(),
+                                  double pct = std::numeric_limits<double>::quiet_NaN(),
+                                  const char* extra = nullptr) {
             ImVec2 lp0 = ImPlot::PlotToPixels(m_xMin, linePrice);
             ImVec2 lp1 = ImPlot::PlotToPixels(m_xMax, linePrice);
             DrawDashedHLine(dl, lp0.x, lp1.x, lp0.y, lineCol,
                             followsCursor ? 2.0f : 2.5f, 8.f, 5.f);
 
-            // Floating price bubble at cursor X (or center for fixed line).
-            // Closing paths show P&L; opening/add paths show estimated cost.
-            char bubBuf[80];
+            // Compose bubble & edge labels.
+            const char* tagStr = tag[0] ? tag : m_limitSide.c_str();
+            char pnlSeg[64] = "";
             if (!std::isnan(pnl)) {
-                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f   P&L %+.2f",
-                              tag[0] ? tag : m_limitSide.c_str(), linePrice, pnl);
+                if (!std::isnan(pct))
+                    std::snprintf(pnlSeg, sizeof(pnlSeg), "  %+.2f (%+.2f%%)", pnl, pct);
+                else
+                    std::snprintf(pnlSeg, sizeof(pnlSeg), "  P&L %+.2f", pnl);
             } else if (m_orderQty > 0) {
-                double cost = linePrice * (double)m_orderQty;
-                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f  ~ $%'.0f",
-                              tag[0] ? tag : m_limitSide.c_str(), linePrice, cost);
-            } else {
-                std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f",
-                              tag[0] ? tag : m_limitSide.c_str(), linePrice);
+                std::snprintf(pnlSeg, sizeof(pnlSeg), "  ~ $%'.0f",
+                              linePrice * (double)m_orderQty);
             }
+            char extraSeg[32] = "";
+            if (extra && extra[0]) std::snprintf(extraSeg, sizeof(extraSeg), "  %s", extra);
+
+            char bubBuf[128];
+            std::snprintf(bubBuf, sizeof(bubBuf), "%s $%.2f%s%s",
+                          tagStr, linePrice, pnlSeg, extraSeg);
+
             ImVec2 bubSz  = ImGui::CalcTextSize(bubBuf);
             float  mouseX = followsCursor
                             ? ImGui::GetIO().MousePos.x
@@ -2770,19 +2981,10 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                                   ImVec2(midX+4, by+bubSz.y+4),
                                   ImVec2(midX,   lp0.y), bubBg);
 
-            // Right-edge label (P&L for closing, cost for opening/add)
-            char edgeBuf[80];
-            if (!std::isnan(pnl)) {
-                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f   %+.2f ",
-                              m_limitSide.c_str(), tag, linePrice, pnl);
-            } else if (m_orderQty > 0) {
-                double cost = linePrice * (double)m_orderQty;
-                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f  ~ $%'.0f ",
-                              m_limitSide.c_str(), tag, linePrice, cost);
-            } else {
-                std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f ",
-                              m_limitSide.c_str(), tag, linePrice);
-            }
+            // Right-edge label
+            char edgeBuf[128];
+            std::snprintf(edgeBuf, sizeof(edgeBuf), " %s  %s $%.2f%s%s ",
+                          m_limitSide.c_str(), tag, linePrice, pnlSeg, extraSeg);
             ImVec2 eSz = ImGui::CalcTextSize(edgeBuf);
             dl->AddRectFilled(ImVec2(lp1.x, lp0.y-9),
                               ImVec2(lp1.x+eSz.x+4, lp0.y+9), bubBg, 2.f);
@@ -2808,18 +3010,65 @@ void ChartWindow::DrawOverlays(double /*step*/) {
         ImU32 stopBg  = isBuy ? IM_COL32( 15, 55,130,255) : IM_COL32(130, 25, 25,255);
         ImU32 lmtCol  = IM_COL32(220,140, 30,220);
         ImU32 lmtBg   = IM_COL32(100, 55,  5,255);
+        ImU32 tpCol   = IM_COL32( 60,200, 90,220);
+        ImU32 tpBg    = IM_COL32( 15, 75, 25,255);
 
-        if (isDual && m_firstPricePlaced) {
-            // Phase 2: fixed first line + moving limit line
-            // P&L shown on the limit leg (the fill price that determines profit)
-            bool firstIsAux = kOrderTypes[m_orderTypeIdx].firstIsAux;
-            const char* firstTag = firstIsAux ? "TRIG" : "STOP";
-            drawArmedLine(m_firstPrice, stopCol, stopBg, firstTag, false);
-            drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
-                          calcArmedPnL(cursorPrice));
+        const auto& otCur = kOrderTypes[m_orderTypeIdx];
 
-            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && m_firstPrice > 0.0) {
-                const auto& ot = kOrderTypes[m_orderTypeIdx];
+        // ── Bracket-leg P&L helpers: projected dollar / percent return at
+        // `price` if the entry fills at `entry` for a position of m_orderQty
+        // shares. Sign convention: loss negative, gain positive on both sides.
+        auto bracketLegPnL = [&](double price, double entry) -> double {
+            if (entry <= 0.0 || m_orderQty <= 0)
+                return std::numeric_limits<double>::quiet_NaN();
+            double sign = (m_limitSide == "BUY") ? 1.0 : -1.0;
+            return sign * (price - entry) * (double)m_orderQty;
+        };
+        auto bracketLegPct = [&](double price, double entry) -> double {
+            if (entry <= 0.0)
+                return std::numeric_limits<double>::quiet_NaN();
+            double sign = (m_limitSide == "BUY") ? 1.0 : -1.0;
+            return sign * (price - entry) / entry * 100.0;
+        };
+
+        // ── Phase 3 (Bracket only): ENTRY + STP locked, cursor = TP ──────────
+        if (otCur.isBracket && isDual && m_secondPricePlaced) {
+            // Locked legs — show projected $ / % impact at each.
+            double entry  = m_firstPrice;
+            double stop   = m_secondPrice;
+            double tp     = cursorPrice;
+            double stopPnL = bracketLegPnL(stop, entry);
+            double stopPct = bracketLegPct(stop, entry);
+            double tpPnL   = bracketLegPnL(tp,   entry);
+            double tpPct   = bracketLegPct(tp,   entry);
+
+            // R:R from locked entry/stop → live TP cursor.
+            double risk    = std::abs(entry - stop);
+            double reward  = std::abs(tp    - entry);
+            char rrBuf[24] = "";
+            if (risk > 0.0)
+                std::snprintf(rrBuf, sizeof(rrBuf), "R:R %.2f", reward / risk);
+
+            char entryCost[24] = "";
+            if (m_orderQty > 0)
+                std::snprintf(entryCost, sizeof(entryCost), "~ $%'.0f",
+                              entry * (double)m_orderQty);
+
+            drawArmedLine(entry, lmtCol,  lmtBg,  "ENTRY", false,
+                          std::numeric_limits<double>::quiet_NaN(),
+                          std::numeric_limits<double>::quiet_NaN(),
+                          entryCost);
+            drawArmedLine(stop,  stopCol, stopBg, "STOP",  false,
+                          stopPnL, stopPct);
+            drawArmedLine(tp,    tpCol,   tpBg,   "TP",    true,
+                          tpPnL,  tpPct,  rrBuf);
+
+            // TP must be on the profit side of entry.
+            bool isBuyEntry = (m_limitSide == "BUY");
+            bool tpValid    = isBuyEntry ? (tp > entry) : (tp < entry);
+
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && tpValid &&
+                entry > 0.0 && stop > 0.0) {
                 static constexpr core::TimeInForce kTIFEnum[] = {
                     core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
                     core::TimeInForce::OPG, core::TimeInForce::Overnight
@@ -2827,69 +3076,125 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                 core::Order o;
                 o.symbol     = m_symbol;
                 o.side       = (m_limitSide == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
-                o.type       = ot.coreType;
+                o.type       = core::OrderType::Limit;   // entry leg
                 o.quantity   = static_cast<double>(m_orderQty);
-                o.tif        = ot.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
-                o.outsideRth = !ot.noRth && (m_sessionIdx != 0);
-                if (firstIsAux) {
-                    // LIT: first click = trigger (auxPrice), second = limit
-                    o.auxPrice   = m_firstPrice;
-                    o.limitPrice = cursorPrice;
-                } else {
-                    // STP LMT: first click = stop, second = limit
-                    o.stopPrice  = m_firstPrice;
-                    o.limitPrice = cursorPrice;
-                }
+                o.tif        = otCur.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
+                o.outsideRth = !otCur.noRth && (m_sessionIdx != 0);
+                o.limitPrice = entry;                    // first click = entry LMT
+
                 if (m_transmitInstantly) {
                     if (OnOrderSubmit) {
-                        if (ot.isBracket) {
-                            // Bracket: first click = STP (stop-loss), second click = LMT (entry).
-                            // LMT submitted now; STP placed on fill at the first-click price.
-                            o.type       = core::OrderType::Limit;
-                            o.limitPrice = cursorPrice;   // second click = LMT entry
-                            o.stopPrice  = 0.0;
-                            int entryId = OnOrderSubmit(o);
-                            if (OnBracketEntry) {
-                                OnBracketEntry(entryId, {
-                                    m_symbol,
-                                    (m_limitSide == "BUY") ? core::OrderSide::Sell
-                                                           : core::OrderSide::Buy,
-                                    static_cast<double>(m_orderQty),
-                                    m_firstPrice          // first click = STP price
-                                });
-                            }
-                        } else {
-                            OnOrderSubmit(o);
+                        int entryId = OnOrderSubmit(o);
+                        if (OnBracketEntry) {
+                            OnBracketEntry(entryId, {
+                                m_symbol,
+                                (m_limitSide == "BUY") ? core::OrderSide::Sell
+                                                       : core::OrderSide::Buy,
+                                static_cast<double>(m_orderQty),
+                                stop,    // STP (second click)
+                                tp       // TP  (third click)
+                            });
                         }
                     }
-                    m_limitArmed       = false;
-                    m_firstPricePlaced = false;
+                    m_limitArmed        = false;
+                    m_firstPricePlaced  = false;
+                    m_secondPricePlaced = false;
                 } else {
-                    if (ot.isBracket) {
-                        o.type       = core::OrderType::Limit;
-                        o.limitPrice = cursorPrice;   // second click = LMT entry
-                        o.stopPrice  = 0.0;
-                        m_isBracketConfirm = true;
-                        m_bracketStopPrice = m_firstPrice;  // first click = STP
-                    }
+                    m_isBracketConfirm    = true;
+                    m_bracketStopPrice    = stop;
+                    m_bracketTpPrice      = tp;
                     m_pendingConfirmOrder = o;
                     m_showConfirmPopup    = true;
-                    // leave m_limitArmed / m_firstPricePlaced — reset in popup confirm/cancel
+                    // leave armed state — reset in popup confirm/cancel
+                }
+            }
+        }
+        // ── Phase 2 ──
+        //   Bracket: ENTRY locked, cursor = STP — show projected loss.
+        //   Non-bracket dual (STP LMT / LIT): first leg locked, cursor = LMT.
+        else if (isDual && m_firstPricePlaced) {
+            if (otCur.isBracket) {
+                double entry   = m_firstPrice;
+                double stopCur = cursorPrice;
+                double stopPnL = bracketLegPnL(stopCur, entry);
+                double stopPct = bracketLegPct(stopCur, entry);
+
+                char entryCost[24] = "";
+                if (m_orderQty > 0)
+                    std::snprintf(entryCost, sizeof(entryCost), "~ $%'.0f",
+                                  entry * (double)m_orderQty);
+
+                drawArmedLine(entry,   lmtCol,  lmtBg,  "ENTRY", false,
+                              std::numeric_limits<double>::quiet_NaN(),
+                              std::numeric_limits<double>::quiet_NaN(),
+                              entryCost);
+                drawArmedLine(stopCur, stopCol, stopBg, "STOP",  true,
+                              stopPnL, stopPct);
+
+                bool isBuyEntry = (m_limitSide == "BUY");
+                bool stopValid  = isBuyEntry ? (stopCur < entry) : (stopCur > entry);
+
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && stopValid &&
+                    entry > 0.0) {
+                    m_secondPrice       = stopCur;
+                    m_secondPricePlaced = true;
+                    // m_limitArmed stays true for phase 3 (TP)
+                }
+            } else {
+                bool firstIsAux = otCur.firstIsAux;
+                const char* firstTag = firstIsAux ? "TRIG" : "STOP";
+                drawArmedLine(m_firstPrice, stopCol, stopBg, firstTag, false);
+                drawArmedLine(cursorPrice,  lmtCol,  lmtBg,  "LMT",  true,
+                              calcArmedPnL(cursorPrice));
+
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                    m_firstPrice > 0.0) {
+                    static constexpr core::TimeInForce kTIFEnum[] = {
+                        core::TimeInForce::Day, core::TimeInForce::GTC, core::TimeInForce::GTC,
+                        core::TimeInForce::OPG, core::TimeInForce::Overnight
+                    };
+                    core::Order o;
+                    o.symbol     = m_symbol;
+                    o.side       = (m_limitSide == "BUY") ? core::OrderSide::Buy : core::OrderSide::Sell;
+                    o.type       = otCur.coreType;
+                    o.quantity   = static_cast<double>(m_orderQty);
+                    o.tif        = otCur.tifLocked ? core::TimeInForce::Day : kTIFEnum[m_tifIdx];
+                    o.outsideRth = !otCur.noRth && (m_sessionIdx != 0);
+                    if (firstIsAux) {
+                        o.auxPrice   = m_firstPrice;
+                        o.limitPrice = cursorPrice;
+                    } else {
+                        o.stopPrice  = m_firstPrice;
+                        o.limitPrice = cursorPrice;
+                    }
+                    if (m_transmitInstantly) {
+                        if (OnOrderSubmit) OnOrderSubmit(o);
+                        m_limitArmed       = false;
+                        m_firstPricePlaced = false;
+                    } else {
+                        m_pendingConfirmOrder = o;
+                        m_showConfirmPopup    = true;
+                        // leave armed state — reset in popup confirm/cancel
+                    }
                 }
             }
         } else {
-            // Phase 1: single moving line (stop/trigger for dual, price for single).
-            // For dual-price types the cursor IS the stop/trigger leg. Showing P&L
-            // at this price gives a worst-case estimate — Phase 2 refines it to
-            // the limit fill price.
-            const char* tag = isDual ? "STOP" : "";
-            double armedPnL = calcArmedPnL(cursorPrice);
-            drawArmedLine(cursorPrice, stopCol, stopBg, tag, true, armedPnL);
-
+            // Phase 1.
+            //   Bracket: cursor = ENTRY (cost label only — no P&L computable yet).
+            //   Non-bracket dual: cursor = stop/trigger (existing P&L preview).
+            //   Single-price: cursor = price.
             bool ctrlHeld = ImGui::GetIO().KeyCtrl;
+            if (otCur.isBracket) {
+                drawArmedLine(cursorPrice, lmtCol, lmtBg, "ENTRY", true);
+            } else {
+                const char* tag = isDual ? "STOP" : "";
+                double armedPnL = calcArmedPnL(cursorPrice);
+                drawArmedLine(cursorPrice, stopCol, stopBg, tag, true, armedPnL);
+            }
+
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
                 if (isDual) {
-                    // Dual-price: lock first price, arm second-click line
+                    // Dual-price: lock first price, arm next-click line
                     m_firstPrice       = cursorPrice;
                     m_firstPricePlaced = true;
                     // m_limitArmed stays true for phase 2
@@ -2959,8 +3264,16 @@ void ChartWindow::DrawOrderImpactBadge() {
         // on the chart (updated each frame from DrawOverlays). This makes
         // the badge track the cursor in real-time. For dual-price types
         // (STP LMT / LIT), when m_firstPricePlaced the cursor IS the
-        // limit leg — exactly the fill price we want.
-        if (m_liveCursorPrice > 0.0) {
+        // limit leg — exactly the fill price we want. For Bracket in
+        // phase 3 the cursor is the TP leg (a future closing fill, not
+        // the entry), so use the locked entry price instead.
+        if (ot.isBracket && m_firstPricePlaced && m_firstPrice > 0.0) {
+            // Bracket: m_firstPrice IS the locked entry. Use it once placed
+            // even if cursor is now over the STP/TP leg, so the badge
+            // reflects the open-position impact of the entry, not a future
+            // closing fill.
+            fillPrice = m_firstPrice;
+        } else if (m_liveCursorPrice > 0.0) {
             fillPrice = m_liveCursorPrice;
         } else if (ot.isDualPrice) {
             if (m_firstPricePlaced && m_firstPrice > 0.0)
@@ -3334,8 +3647,20 @@ void ChartWindow::DrawPositionStrip() {
         row.item(FlexRow::textW("Order:"), 12);
         ImGui::TextDisabled("Order:");
 
-        char orderBuf[64];
-        if (ot.isDualPrice && m_firstPricePlaced) {
+        char orderBuf[80];
+        if (ot.isBracket && m_secondPricePlaced) {
+            std::snprintf(orderBuf, sizeof(orderBuf),
+                          "%s BRK  ENTRY $%.2f  STP $%.2f  TP $%.2f",
+                          isBuy ? "BUY" : "SELL",
+                          m_firstPrice, m_secondPrice,
+                          price > 0.0 ? price : m_placedPrice);
+        } else if (ot.isBracket && m_firstPricePlaced) {
+            std::snprintf(orderBuf, sizeof(orderBuf),
+                          "%s BRK  ENTRY $%.2f  STP $%.2f",
+                          isBuy ? "BUY" : "SELL",
+                          m_firstPrice,
+                          price > 0.0 ? price : m_placedPrice);
+        } else if (ot.isDualPrice && m_firstPricePlaced) {
             std::snprintf(orderBuf, sizeof(orderBuf), "%s %s  STP $%.2f  LMT $%.2f",
                           isBuy ? "BUY" : "SELL",
                           ot.label, m_firstPrice,
@@ -3461,6 +3786,7 @@ void ChartWindow::DrawCandleChart() {
     if (m_auto.keltner)  DrawKeltner();
 
     DrawCandlesticks(halfBarW);
+    if (m_ind.volumeProfile) DrawVolumeProfile();
     DrawOverlays(1.0);
     if (m_auto.breakouts) DrawBreakoutMarks();
     DrawHoverTooltip();
@@ -4143,11 +4469,79 @@ void ChartWindow::ComputeBreakoutSignal() {
     bool bullish = (diff >  0.1 * atr);
     bool bearish = (diff < -0.1 * atr);
 
+    int side = -1;
     double midZone = 0.5 * (m_breakoutZoneTop + m_breakoutZoneBot);
-    if (last > midZone && bullish)
+    if (last > midZone && bullish)      side = 1;
+    else if (last < midZone && bearish)  side = 0;
+    if (side == -1) return;
+
+    // Confluence gates — each returns true if disabled or passing.
+    if (!PassTrendGate(side))          return;
+    if (!PassVwapGate(side))           return;
+    if (!PassMarketHealthGate(side))   return;
+    if (!PassRsiGate(side))            return;
+    if (!PassVolumeConfluenceGate())   return;
+
+    if (side == 1)
         m_breakoutSignal = BreakoutDirection::LongSetup;
-    else if (last < midZone && bearish)
+    else
         m_breakoutSignal = BreakoutDirection::ShortSetup;
+}
+
+// ============================================================================
+// Confluence gate methods (Phase 15b).
+// Each returns true if the gate is disabled in m_setupSettings, or if the
+// condition is met. Called from ComputeBreakoutSignal().
+// ============================================================================
+
+bool ChartWindow::PassTrendGate(int side) const {
+    if (!m_setupSettings.trendAlign) return true;
+    if (!m_autoTrend.valid)          return true;  // no trend data → pass
+    double eps = 0.05 * std::abs(m_autoTrend.sigma) /
+                 std::max(1.0, (double)(m_autoTrend.lastIdx - m_autoTrend.firstIdx));
+    return core::services::TrendSupportsSide(m_autoTrend.slope, side, eps);
+}
+
+bool ChartWindow::PassVwapGate(int side) const {
+    if (!m_setupSettings.vwapContext) return true;
+    int n = (int)m_vwap.size();
+    if (n == 0 || (int)m_closes.size() != n) return true;  // no VWAP → pass
+    return core::services::VwapSupportsSide(m_closes[n - 1], m_vwap[n - 1], side);
+}
+
+bool ChartWindow::PassMarketHealthGate(int side) const {
+    if (!m_setupSettings.marketHealth) return true;
+    auto chgPct = [](double price, double prevClose) {
+        if (price <= 0.0 || prevClose <= 0.0) return 0.0;
+        return (price - prevClose) / prevClose * 100.0;
+    };
+    double esChg    = m_esHasData    ? chgPct(m_esPrice,    m_esPrevClose)    : 0.0;
+    double nqChg    = m_nqHasData    ? chgPct(m_nqPrice,    m_nqPrevClose)    : 0.0;
+    double esDecChg = m_esDecHasData ? chgPct(m_esDecPrice, m_esDecPrevClose) : 0.0;
+    double nqDecChg = m_nqDecHasData ? chgPct(m_nqDecPrice, m_nqDecPrevClose) : 0.0;
+    return core::services::FuturesSupportDirection(esChg, nqChg, esDecChg, nqDecChg,
+                                                    m_setupSettings.mhMaxCounterPct, side);
+}
+
+bool ChartWindow::PassRsiGate(int side) const {
+    if (!m_setupSettings.rsiFilter) return true;
+    int n = (int)m_rsi.size();
+    if (n == 0) return true;
+    return core::services::RsiSupportsSide(m_rsi[n - 1], side);
+}
+
+bool ChartWindow::PassVolumeConfluenceGate() const {
+    if (!m_setupSettings.volumeConfluence) return true;
+    if (m_vp.bins.empty() || m_vp.maxVolume <= 0.0) return true;  // VP not computed → pass
+    if (m_breakoutZoneTop <= m_breakoutZoneBot)      return true;
+    double threshold = 0.30 * m_vp.maxVolume;
+    for (const auto& bin : m_vp.bins) {
+        if (bin.volume < threshold) continue;
+        // Check if this high-volume bin overlaps the active zone's buffered range.
+        if (bin.priceLo < m_breakoutZoneTop && bin.priceHi > m_breakoutZoneBot)
+            return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -4215,6 +4609,23 @@ void ChartWindow::ComputeSetupPlan() {
         m_setupSettings.stopOffset,
         m_setupSettings.rrMin,
         equity, m_setupSettings.riskPct);
+
+    // Multi-target: find the next opposing level beyond T1.
+    if (m_setupSettings.multiTarget && m_setup.valid) {
+        double t1 = m_setup.target;
+        double t2 = 0.0;
+        if (side == 1) {
+            for (const auto& r : m_autoResistances)
+                if (r.price > t1 && (t2 == 0.0 || r.price < t2)) t2 = r.price;
+        } else {
+            for (const auto& s : m_autoSupports)
+                if (s.price < t1 && (t2 == 0.0 || s.price > t2)) t2 = s.price;
+        }
+        if (t2 > 0.0) {
+            m_setup.t2Target   = t2;
+            m_setup.t2SplitPct = m_setupSettings.t2SplitPct;
+        }
+    }
 }
 
 // ============================================================================

@@ -130,6 +130,13 @@ private:
     bool m_savePopupOpen = false;
     char m_saveNameBuf[48] = {};
 
+    // ---- Export / import UI state --------------------------------------------
+    bool m_exportPopupOpen = false;
+    bool m_importPopupOpen = false;
+    int  m_importNewTab    = 1;    // 1 = new tab, 0 = append (for ImGui::RadioButton)
+    char m_exportNameBuf[48] = {};
+    char m_importNameBuf[48] = {};
+
     // ---- Static preset store ------------------------------------------------
     static std::vector<SavedPreset> s_presets;
     static bool                     s_presetsLoaded;
@@ -150,6 +157,9 @@ private:
     static void PushRowTint(double changePct);
     static void PopRowTint();
     static void EnsureDefaultPreset();
+
+    void ExportCurrentTab(const std::string& filename);
+    void ImportFromFile(const std::string& filename, int newTab);
 };
 
 }  // namespace ui

@@ -62,12 +62,15 @@ public:
         double      pctRisk  = 0.0;   // |entry-stop|/entry × 100
     };
 
-    // ---- Bracket: pending STP stop-loss, submitted when the LMT entry fills ----
+    // ---- Bracket: pending STP stop-loss + optional TP take-profit, both
+    // submitted as an OCA pair when the LMT entry fills. tpPrice == 0 means
+    // no take-profit leg (legacy stop-only bracket).
     struct PendingBracketStop {
         std::string  symbol;
         core::OrderSide stopSide;
         double       qty       = 0.0;
         double       stopPrice = 0.0;
+        double       tpPrice   = 0.0;   // take-profit limit; 0 = no TP leg
     };
 
     ChartWindow();
@@ -125,7 +128,7 @@ public:
     // Synthesises today's bar automatically when the first tick arrives.
     void OnDayTick(int field, double price);
 
-    // Futures market health tick (reqIds 140/141 for /ES, /NQ).
+    // Futures market health tick (reqIds 140-143 for /ES, /NQ front-month + Dec).
     // field 4=LAST, 1=BID, 2=ASK → update last price; field 9=CLOSE → prev close.
     void OnFuturesTick(int reqId, int field, double price);
 
@@ -186,14 +189,15 @@ public:
 private:
     // ---- Indicator settings -------------------------------------------------
     struct IndicatorSettings {
-        bool sma20      = true;
-        bool sma50      = true;
-        bool ema20      = false;
-        bool bbands     = true;
-        bool vwap       = true;
-        bool vwapBands  = false;   // ±1σ / ±2σ volume-weighted bands around VWAP
-        bool volume     = true;
-        bool rsi        = true;
+        bool sma20         = true;
+        bool sma50         = true;
+        bool ema20         = false;
+        bool bbands        = true;
+        bool vwap          = true;
+        bool vwapBands     = false;   // ±1σ / ±2σ volume-weighted bands around VWAP
+        bool volume        = true;
+        bool rsi           = true;
+        bool volumeProfile = false;   // Phase 15 — horizontal volume-by-price histogram
 
         int   smaPeriod1 = 20;
         int   smaPeriod2 = 50;
@@ -201,6 +205,7 @@ private:
         int   bbPeriod   = 20;
         float bbSigma    = 2.0f;
         int   rsiPeriod  = 14;
+        int   vpBins     = 50;        // Phase 15 — clamped to [10, 200]
     };
 
     // ---- Auto technical-analysis settings -----------------------------------
@@ -226,12 +231,13 @@ private:
 
     enum class BreakoutDirection { None, LongSetup, ShortSetup };
 
-    using AutoLevel    = core::services::Level;
-    using AutoTrend    = core::services::TrendFit;
-    using AutoFibSpan  = core::services::AutoFibSpan;
-    using DailyPivot   = core::services::DailyPivot;
-    using BreakoutMark = core::services::BreakoutMark;
-    using SetupPlan    = core::services::SetupPlan;
+    using AutoLevel     = core::services::Level;
+    using AutoTrend     = core::services::TrendFit;
+    using AutoFibSpan   = core::services::AutoFibSpan;
+    using DailyPivot    = core::services::DailyPivot;
+    using BreakoutMark  = core::services::BreakoutMark;
+    using SetupPlan     = core::services::SetupPlan;
+    using VolumeProfile = core::services::VolumeProfile;
 
     // ---- Setup-suggestion settings ------------------------------------------
     // Reference-only trade plan derived from the active supply/demand signal.
@@ -246,6 +252,16 @@ private:
         double stopOffset  = 0.10;
         double riskPct     = 1.0;
         bool   useStopLmt  = true;
+
+        // Confluence gates — each must pass (when enabled) for a setup to fire.
+        bool   trendAlign       = false;   // auto-trend slope must agree with side
+        bool   vwapContext      = false;   // long only above VWAP, short only below
+        bool   marketHealth     = false;   // /ES + /NQ must not strongly contradict
+        bool   rsiFilter        = false;   // long RSI<70, short RSI>30
+        bool   volumeConfluence = false;   // active zone must overlap a VP high-volume node
+        bool   multiTarget      = false;   // surface a second target level (T2)
+        double mhMaxCounterPct  = 0.5;     // max % futures can move against setup
+        double t2SplitPct       = 50.0;    // % of position for T1 (remainder → T2)
     };
 
 public:
@@ -331,6 +347,7 @@ private:
     int                    m_pivotsTodayStart = -1;  // bar idx of today's first bar (intraday only)
     int                    m_pivotsTodayEnd   = -1;  // bar idx of today's last bar
     std::vector<BreakoutMark> m_breakouts;   // ▲/▼ marks on bars that closed through S/R
+    VolumeProfile          m_vp;             // Phase 15 — recomputed every frame from visible Y-range
 
     // Imminent-breakout signal (populated by ComputeBreakoutSignal)
     BreakoutDirection      m_breakoutSignal     = BreakoutDirection::None;
@@ -385,8 +402,9 @@ private:
     bool        m_transmitInstantly = true; // false = always show confirmation before sending
     core::Order m_pendingConfirmOrder;      // order staged for the confirmation popup
     bool        m_showConfirmPopup  = false; // set true to open the modal next frame
-    bool        m_isBracketConfirm  = false; // pending confirm is a Bracket (LMT+STP)
+    bool        m_isBracketConfirm  = false; // pending confirm is a Bracket (LMT+STP[+TP])
     double      m_bracketStopPrice  = 0.0;  // STP price for the pending bracket
+    double      m_bracketTpPrice    = 0.0;  // TP limit for the pending bracket (0 = none)
 
     // ---- Placed order line (drag-and-send mode) ------------------------------
     bool        m_limitPlaced    = false;  // line dropped on chart, awaiting send
@@ -407,6 +425,15 @@ private:
     bool        m_firstPricePlaced  = false; // stop price has been clicked, limit line active
     double      m_firstPrice        = 0.0;  // the placed stop/trigger price
 
+    // ---- Triple-price placement (Bracket: STP, then entry LMT, then TP) ------
+    // Only used when kOrderTypes[m_orderTypeIdx].isBracket. After the second
+    // click the LMT entry is locked into m_secondPrice and the cursor arms
+    // the TP take-profit leg; the third click fires the bracket and the
+    // submitted entry's id is mapped in main.cpp's g_pendingBracketStops to
+    // submit STP + TP as an OCA pair on fill.
+    bool        m_secondPricePlaced = false;
+    double      m_secondPrice       = 0.0;
+
     // ---- WSH corporate event markers ----------------------------------------
     std::vector<WshData::WshEvent> m_wshEvents;
 
@@ -421,6 +448,14 @@ private:
     double m_nqPrevClose = 0.0;
     bool   m_esHasData   = false;
     bool   m_nqHasData   = false;
+
+    // ---- Futures market health — Dec contracts (/ES YYYY12, /NQ YYYY12) -----
+    double m_esDecPrice     = 0.0;
+    double m_esDecPrevClose = 0.0;
+    double m_nqDecPrice     = 0.0;
+    double m_nqDecPrevClose = 0.0;
+    bool   m_esDecHasData   = false;
+    bool   m_nqDecHasData   = false;
 
     // ---- Private helpers ----------------------------------------------------
     // Creates today's partial bar if it doesn't exist yet (D1/W1/MN only).
@@ -459,6 +494,7 @@ private:
     void DrawAutoSupportResistance();
     void DrawAutoTrend();
     void DrawAutoZones();
+    void DrawVolumeProfile();    // Phase 15 — right-edge volume-by-price histogram
     void DrawAutoFib();
     void DrawAutoPivots();
     void DrawDonchian();
@@ -470,6 +506,13 @@ private:
     void ComputeSetupPlan();      // populates m_setup from active breakout signal
     void DrawSetupOverlay();      // dashed entry / stop / target lines + R:R tag
     void DrawSetupSettingsPopup();// section appended inside DrawAutoSettingsPopup
+
+    // Confluence gates — each returns true if disabled or condition met (Phase 15b).
+    bool PassTrendGate(int side) const;
+    bool PassVwapGate(int side) const;
+    bool PassMarketHealthGate(int side) const;
+    bool PassRsiGate(int side) const;
+    bool PassVolumeConfluenceGate() const;
     void DrawUnguardedStrip();    // yellow protective-stop warning above the chart
     void DrawOrderImpactBadge();  // side-intent + P&L preview below BUY/SELL row
 

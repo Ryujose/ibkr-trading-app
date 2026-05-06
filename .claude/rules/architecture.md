@@ -64,8 +64,9 @@ Vectors: `g_chartEntries`, `g_tradingEntries`, `g_scannerEntries`, `g_newsEntrie
 Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScannerWindow(idx)`, `SpawnNewsWindow(idx)` — create the window, wire all callbacks with `idx` capture, push to the vector.
 
 **ReqId layout (no overlaps, 10 instances each):**
-- Chart hist: 1,3,5,7,9,11,13,15,17,19 · ext: 2,4,6,8,10,12,14,16,18,20 · mkt: 100-109
-- Trading mkt: 110-119 · depth: 120-129
+- Chart hist: 1,3,5,7,9,11,13,15,17,19 · ext: 2,4,6,8,10,12,14,16,18,20 · mkt: 100-109 (initial slot; rotates through 10000-10999 on each symbol change — see "Chart mktId rotation" below)
+- Trading mkt: 110-119 · depth: 120-129 · tick-by-tick: 130-139
+- Futures /ES,/NQ (front-month): 140-141 · /ES,/NQ (Dec): 142-143 (market health)
 - Scanner scan: 1000,1100,...,1900 (+99 each) · mkt: 800,812,...,908 (+12 each)
 - News stock conId: 2000-2009 · port conId: 2010-2199 · hist stock: 2210-2219 · hist port: 2220-2399
 - News articles: 2500-3499 (100 per instance) · hist market: 3500-3599 · market conId: 3600-3699
@@ -181,6 +182,18 @@ The `###` triple-hash gives ImGui a stable identity while the display label chan
 
 **Equity accessor**: `main.cpp` exposes free function `double GetSelectedAccountEquity()` returning `g_PortfolioWindow ? g_PortfolioWindow->netLiquidation() : 0.0`; `ChartWindow.cpp` forward-declares it (`extern double GetSelectedAccountEquity();`) so `ComputeSetupPlan` can size the suggested share count without including main.cpp internals. Returns 0 before `accountSummary()` fires on fresh connect — `PositionSizeShares` returns 0 and the entry label simply omits the `× N sh` suffix.
 
+**Confluence gates (Phase 15b)**: Five optional boolean filters run inside `ComputeBreakoutSignal()` after the BB-compression + momentum checks and before the final `LongSetup`/`ShortSetup` assignment. Each gate returns `true` if disabled in `m_setupSettings`, or if the condition is met. The gates are:
+
+1. **Trend align** (`trendAlign`, default OFF) — auto-trend slope must agree with trade direction (`TrendSupportsSide`).
+2. **VWAP context** (`vwapContext`, default OFF) — long only above VWAP, short only below (`VwapSupportsSide`).
+3. **Market health** (`marketHealth`, default OFF) — /ES and /NQ (front-month + Dec) must not move strongly against the setup (`FuturesSupportDirection`). Configured per trading-style preset; Dec futures are subscribed on reqIds 142/143 and fanned out to all charts via `OnFuturesTick`.
+4. **RSI filter** (`rsiFilter`, default OFF) — long RSI ≤ 70, short RSI ≥ 30 (`RsiSupportsSide`).
+5. **Volume confluence** (`volumeConfluence`, default OFF) — the active supply/demand zone's buffered range must overlap at least one high-volume bin (≥30% of POC volume) in `m_vp`.
+
+The four pure helpers (`TrendSupportsSide`, `VwapSupportsSide`, `RsiSupportsSide`, `FuturesSupportDirection`) live in `core::services::ChartAnalysis.h` with full Catch2 coverage under the `[setup]` tag. Gate controls appear in `DrawSetupSettingsPopup()` with per-style defaults in `TradingStyle.h`.
+
+**Multi-target exits**: When `m_setupSettings.multiTarget` is on, `ComputeSetupPlan` walks the remaining KeepTopN levels beyond T1 to find a second take-profit level (T2), rendered as a magenta dashed h-line in `DrawSetupOverlay()`. `SetupPlan` gains `t2Target` / `t2SplitPct` fields.
+
 ## Unguarded-Position Guard (Phase 12 — Task C)
 
 A position is "unguarded" if non-zero quantity exists with **no** active protective `Stop` / `StopLimit` / `Trail` / `TrailLimit` order on the same symbol on the opposite side. When detected, both the matching `ChartWindow` and the matching `TradingWindow` show a yellow warning strip with `Place stop` and `Dismiss` buttons. The check is global (one per app instance), the rendering is per-window.
@@ -271,6 +284,12 @@ TF:6             (optional; only written when STYLE==Free. Integer Timeframe enu
 
 `ChartWindow::IndicatorSettings::vwap` (default true on intraday-flavoured presets, false on Swing/Investment) and `::vwapBands` (default false everywhere except Day Trading) toggle the VWAP centre line and its volume-weighted ±1σ / ±2σ bands. `m_vwap` (centre) and four band vectors `m_vwapSd1Up`/`m_vwapSd1Dn`/`m_vwapSd2Up`/`m_vwapSd2Dn` are populated by `ComputeIndicators()` calling `core::services::SessionVwap(m_highs, m_lows, m_closes, m_volumes, sessionStarts)`. `sessionStarts` is built from `m_xs` using `localtime` ET-day boundary detection on intraday TFs; for D1/W1/MN it stays empty (single cumulative run from index 0). `DrawCandleChart()` plots the centre line in solid gold (`1.0, 0.85, 0.0, 1.0`, width 1.5) and, when `m_ind.vwapBands`, renders four extra `ImPlot::PlotLine` entries: `VWAP+1σ`, `VWAP-1σ` at alpha 0.30; `VWAP+2σ`, `VWAP-2σ` at alpha 0.18 — same gold hue. Toolbar gains a compact `±σ` checkbox right after the existing `VWAP` checkbox, gated on `m_ind.vwap` (only renders when VWAP is on). The previous `ChartWindow::CalcVWAP` static is removed; tests-core now covers the math directly under the `[vwap]` tag (6 cases / 84 assertions).
 
+## Volume Profile (Phase 15 — CW-1)
+
+`core::services::ChartAnalysis.h` gains `VolumeBin` / `VolumeProfile` structs and `ComputeVolumeProfile(highs, lows, volumes, priceLo, priceHi, numBins=50) → VolumeProfile{bins, pocIdx, maxVolume, totalVol, valueAreaLoIdx, valueAreaHiIdx}` as a pure inline free function. Each bar's volume is distributed *uniformly across the bar's [low, high] range*, normalised against the bar's *full* range — so a partially-clipped bar contributes only `visibleRng / fullRng` of its volume. Matches TradingView / IB convention; avoids the "POC sits at one big bar's close" artefact of pure-typical-price profiles. POC = `argmax(bins.volume)`. Value Area (~70% of total volume) computed by expanding outward from POC, picking whichever side has the larger neighbouring bin (right-bias on ties). `numBins` clamped to `[10, 200]`; degenerate inputs (`priceHi <= priceLo`, mismatched lengths, empty bars) yield empty profile / `pocIdx = -1`.
+
+`ChartWindow::IndicatorSettings::volumeProfile` (default false; per-mode defaults driven by `StylePreset.indVolumeProfile` — Day Trading and Swing ON, others OFF) and `::vpBins` (default 50) drive the histogram. `m_vp` is recomputed every frame inside `DrawVolumeProfile()` from `ImPlot::GetPlotLimits()` Y-range, so panning / zooming re-buckets to the visible price band. `DrawVolumeProfile()` is invoked from `DrawCandleChart()` between `DrawCandlesticks()` and `DrawOverlays()`; renders translucent right-anchored horizontal bars via the plot drawlist (not `PlotBarsH`, so it doesn't interact with the X-axis or auto-fit). Histogram occupies the rightmost ~25% of the plot at the POC; bins scale proportionally against `m_vp.maxVolume`. Three alphas: ~18% normal, ~29% value-area bins, ~43% POC + thin gold POC border. Toolbar `VP` checkbox lives in the Auto: row right after `Setup`; `DrawAutoSettingsPopup()` exposes `VP bins` `InputInt` (10–200). Tests under `[volume-profile]` tag in `tests/test_chart_analysis.cpp` (12 cases / 72 assertions) cover single-bar uniform distribution, POC concentration, out-of-range bars (above + below), partial overlap proportional contribution, empty / mismatched / degenerate input, `numBins` clamping, zero-volume bars skipped, and value-area expansion (synthetic profile [10,20,50,20,10] → POC=4, VA=[3,5]).
+
 ## Symbol Search
 
 `src/ui/SymbolSearch.h` — reusable autocomplete widget, no IB API dependency (takes a callback):
@@ -329,6 +348,26 @@ Midprice, Relative                 // smart / pegged-to-primary
 - `lmtPriceOffset` — limit offset from trail stop price for TRAIL LIMIT
 - `outsideRth` — allow pre/after-hours fills (was a separate callback param, now on struct)
 - `account` — IB account code; stamped from `g_selectedAccount` at submit time in `main.cpp`
+- `parentId` — non-zero links an order as an IB-native bracket child of the parent order
+- `ocaGroup` / `ocaType` — One-Cancels-All linkage. Siblings sharing the same `ocaGroup` are mutually-OCA; `ocaType=1` is cancel-with-block (most common). Used by ChartWindow's Bracket order to OCA-pair the STP stop-loss and TP take-profit legs submitted on entry fill.
+
+## Bracket Orders (ChartWindow)
+
+ChartWindow's "Bracket" order type (entry LMT + STP stop-loss + optional TP take-profit) is **synthesized client-side**, not submitted as an IB-native bracket-with-`parentId`. The click order is **Entry → STP → TP** (not the more-conventional STP first) so that once the entry leg is locked, the cursor bubbles for the STP and TP placements can show projected $ loss / gain, % move from entry, and live R:R against the locked entry. The flow:
+
+1. User picks `Bracket` from the order-type combo, clicks BUY/SELL → enters chart-click arming.
+2. **Click 1** — entry LMT price (stored in `m_firstPrice`; `m_firstPricePlaced=true`). The cursor bubble for this phase shows only estimated cost (`~ $N`) since no risk leg exists yet.
+3. **Click 2** — STP stop-loss price (stored in `m_secondPrice`; `m_secondPricePlaced=true`). Side-validated: BUY rejects STP at-or-above entry; SELL rejects STP at-or-below entry. While positioning, the cursor bubble shows ` STOP $X  -$Y (-Z%) ` — projected loss in dollars and percent vs the locked entry.
+4. **Click 3** — TP take-profit price; fires the entry LMT and stuffs `PendingBracketStop{symbol, stopSide=opposite, qty, stopPrice, tpPrice}` into `g_pendingBracketStops` keyed by the entry order id. Side-validated: BUY rejects TP at-or-below entry; SELL rejects TP at-or-above entry. The cursor bubble shows ` TP $X  +$Y (+Z%)  R:R W ` — projected gain plus risk:reward computed from the locked entry/STP and the live TP cursor. The locked STP line additionally shows its frozen ` STOP $X  -$Y (-Z%) ` label.
+5. On entry fill (`onFillReceived` in main.cpp): the map is consulted. STP and TP are submitted as a pair with shared `ocaGroup = "BRK_<entryId>"` and `ocaType = 1`. IB auto-cancels the survivor when one fills.
+
+`drawArmedLine` accepts optional `pct` and `extra` (free-form trailing string) parameters used to compose the bracket-leg labels: `pct` formats as ` (+%.2f%%)` after the dollar P&L, and `extra` appends a trailing token like `R:R 2.34`. Bubble and right-edge labels share the same composer so they stay consistent.
+
+The `DrawOrderImpactBadge` uses `m_firstPrice` (locked entry) as the fill-price proxy from phase 2 onward, so the position-impact strip below the trade panel reflects the open-position impact at the entry — not a future closing leg's price.
+
+`tpPrice == 0.0` in the pending struct is treated as a legacy stop-only bracket — only the STP leg is submitted on fill, with no `ocaGroup`. Reserved for backward compatibility; new bracket orders always include TP.
+
+The confirmation popup (when `Transmit Instantly` is off or Ctrl+click) renders all three legs with computed R:R; the Confirm button fires the entry and the on-fill handler then dispatches STP+TP. Cancel/Escape clears `m_isBracketConfirm` / `m_bracketStopPrice` / `m_bracketTpPrice` and the dual-price phase state.
 
 `core::OrderStatus` enum: `Pending, Working, PartialFill, Filled, Cancelled, Rejected, PendingCancel`
 - `PendingCancel` maps to IB string `"PendingCancel"` and renders as `"CANCELLING"` in the UI

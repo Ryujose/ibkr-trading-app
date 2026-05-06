@@ -491,7 +491,7 @@ static std::vector<std::string> g_portfolioSymbols;  // known held symbols
 // Per-instance helpers: each window type has its own slot.
 //   Chart   hist:  1,3,5,...,19  ext: 2,4,6,...,20  mkt: 100-109
 //   Trading mkt:   110-119       depth: 120-129
-//   Futures /ES,/NQ: 140-141    (market health indicators)
+//   Futures /ES,/NQ (front): 140-141  · /ES,/NQ (Dec): 142-143  (market health)
 //   Scanner scan:  1000,1100,...,1900 (+99 ea)  mkt: 800,812,...,908 (+12 ea, 12 slots each)
 //   News:          201(RT), 400-420(conId), 500-520(hist), 600-699(art), 700-759(mkt)
 //   Account:       900
@@ -500,7 +500,20 @@ static constexpr int NEWS_RT_REQID       = 201;  // real-time news subscription 
 // Inline helpers — idx is 0-based instance index
 inline int ChartHistId   (int idx) { return 1    + idx * 2; }   // 1,3,5,...,19
 inline int ChartExtId    (int idx) { return 2    + idx * 2; }   // 2,4,6,...,20
-inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-109
+inline int ChartMktId    (int idx) { return 100  + idx; }       // 100-109 (initial slot only)
+
+// Rotating pool for chart market-data reqIds. On every symbol change we
+// allocate a fresh id from this pool so stale ticks from the just-cancelled
+// subscription (IB keeps streaming for a few ms after CancelMarketData)
+// arrive with a reqId no chart owns and are silently dropped at the
+// dispatcher — instead of landing on the new symbol's bar series and
+// corrupting OHLC (e.g. a stale TSLA 398.55 high leaking onto a $268 stock).
+inline int AllocChartMktId() {
+    static int s_next = 10000;
+    int id = s_next++;
+    if (s_next > 10999) s_next = 10000;
+    return id;
+}
 inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119
 inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
 inline int TradingTickId (int idx) { return 130  + idx; }       // 130-139
@@ -871,29 +884,36 @@ static std::unordered_map<int, double> g_lastReplayCursorBroadcast;
 // `durationOverride` is empty for the default-per-timeframe path; the
 // trading-style queue passes the preset's `historyDuration` (e.g. "2 D" / "5 Y")
 // so the prefetch covers the right horizon for the chosen mode.
-static void ReqChartData(int histId, int mktId,
-                         const std::string& sym, core::Timeframe tf, bool useRTH,
-                         core::BarSeries& pendingBars,
+//
+// On a symbol change we allocate a fresh `ce.mktId` from `AllocChartMktId()`
+// so in-flight ticks from the just-cancelled subscription land with a reqId
+// no chart owns and are dropped by the dispatcher rather than corrupting
+// the new symbol's OHLC.
+static void ReqChartData(ChartEntry& ce, const std::string& sym, core::Timeframe tf,
+                         bool useRTH, core::BarSeries& pendingBars,
                          const std::string& durationOverride = "") {
     if (!g_IBClient) return;
-    g_IBClient->CancelHistoricalData(histId);
+    g_IBClient->CancelHistoricalData(ce.histId);
     pendingBars         = core::BarSeries{};
     pendingBars.symbol  = sym;
     pendingBars.timeframe = tf;
     const char* duration = durationOverride.empty()
                                ? core::TimeframeIBDuration(tf)
                                : durationOverride.c_str();
-    g_IBClient->ReqHistoricalData(histId, sym,
+    g_IBClient->ReqHistoricalData(ce.histId, sym,
                                   duration,
                                   core::TimeframeIBBarSize(tf),
                                   useRTH);
-    if (g_tickerSymbols[mktId] != sym) {
-        g_IBClient->CancelMarketData(mktId);
-        g_tickerSymbols[mktId] = sym;
-        g_IBClient->ReqMarketData(mktId, sym, MktDataTicks());
-        // Reset exchange list; tickReqParams will repopulate once the new sub is live.
-        for (auto& ce : g_chartEntries)
-            if (ce.mktId == mktId) { ce.bboExchange.clear(); if (ce.win) ce.win->SetExchangeList({"SMART"}); }
+    auto it = g_tickerSymbols.find(ce.mktId);
+    bool symbolChanged = (it == g_tickerSymbols.end()) || (it->second != sym);
+    if (symbolChanged) {
+        g_IBClient->CancelMarketData(ce.mktId);
+        g_tickerSymbols.erase(ce.mktId);
+        ce.mktId = AllocChartMktId();
+        g_tickerSymbols[ce.mktId] = sym;
+        g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
+        ce.bboExchange.clear();
+        if (ce.win) ce.win->SetExchangeList({"SMART"});
     }
 }
 
@@ -930,7 +950,7 @@ static void DrainStyleSwitchQueue() {
     if (p.style == core::services::TradingStyle::Free)
         duration = core::TimeframeIBDuration(ce.win->getTimeframe());
 
-    ReqChartData(ce.histId, ce.mktId, sym, ce.win->getTimeframe(),
+    ReqChartData(ce, sym, ce.win->getTimeframe(),
                  p.useRTH, ce.pendingBars, duration);
 
     g_nextStyleSwitchAllowed = now + kStyleSwitchThrottleSec;
@@ -949,7 +969,7 @@ static void SpawnChartWindow(int idx) {
     // Capture idx (not pointer — vector may reallocate)
     e.win->OnDataRequest = [idx](const std::string& sym, core::Timeframe tf, bool useRTH) {
         auto& ce = g_chartEntries[idx];
-        ReqChartData(ce.histId, ce.mktId, sym, tf, useRTH, ce.pendingBars);
+        ReqChartData(ce, sym, tf, useRTH, ce.pendingBars);
         UpdateChartPendingOrders(ce.win);
         UpdateChartPosition(ce.win);
         BroadcastGroupSymbol(ce.win->groupId(), sym);
@@ -1023,28 +1043,29 @@ static void SpawnChartWindow(int idx) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         auto it = g_liveOrders.find(orderId);
         if (it == g_liveOrders.end()) return;
-        const core::Order old = it->second;
-        g_IBClient->CancelOrder(orderId);
-        g_liveOrders.erase(it);
-        int newId = g_nextOrderId++;
-        for (auto& te : g_tradingEntries)
-            if (te.win) te.win->SetNextOrderId(g_nextOrderId);
-        core::Order rep       = old;
-        rep.orderId           = newId;
-        rep.account           = g_selectedAccount;
-        rep.status            = core::OrderStatus::Pending;
-        rep.submittedAt       = std::time(nullptr);
-        rep.updatedAt         = rep.submittedAt;
-        rep.filledQty         = 0.0;
-        rep.avgFillPrice      = 0.0;
-        if (old.type == core::OrderType::Limit)     { rep.limitPrice = newPrice;  rep.stopPrice  = 0.0; }
-        else if (old.type == core::OrderType::Stop) { rep.stopPrice  = newPrice;  rep.limitPrice = 0.0; }
-        else if (old.type == core::OrderType::StopLimit) {
+        // Modify in place by re-issuing PlaceOrder with the same orderId.
+        // IB treats this as an order modification and preserves any OCA
+        // pairing — critical for bracket STP/TP legs sharing
+        // ocaGroup="BRK_<entryId>". Cancel+re-place would break the pairing
+        // (IB may cancel the OCA survivor or refuse to re-pair the new leg).
+        core::Order rep = it->second;
+        rep.account     = g_selectedAccount;
+        rep.updatedAt   = std::time(nullptr);
+        if (rep.type == core::OrderType::Limit)     { rep.limitPrice = newPrice;  rep.stopPrice  = 0.0; }
+        else if (rep.type == core::OrderType::Stop) { rep.stopPrice  = newPrice;  rep.limitPrice = 0.0; }
+        else if (rep.type == core::OrderType::StopLimit) {
             rep.stopPrice = newPrice; rep.limitPrice = newAuxPrice;
         }
-        g_liveOrders[newId] = rep;
+        it->second = rep;
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(rep);
         UpdateAllChartPendingOrders();
+        // Re-send the full order including ocaGroup / ocaType. IB error
+        // 10327 ("OCA group type revision is not allowed") fires when the
+        // resent values *differ* from the server-side group membership,
+        // not from re-sending matching values. As long as
+        // IBKRClient::openOrder propagates ocaGroup / ocaType into
+        // g_liveOrders correctly, the resend matches and IB accepts the
+        // price update without breaking the OCA pairing.
         g_IBClient->PlaceOrder(rep);
     };
 
@@ -1106,7 +1127,7 @@ static void SpawnScannerWindow(int idx) {
         // Also update any chart windows not in a group (default behavior)
         for (auto& ce : g_chartEntries)
             if (ce.win && ce.win->groupId() == 0) {
-                ReqChartData(ce.histId, ce.mktId, sym, core::Timeframe::D1, true, ce.pendingBars);
+                ReqChartData(ce, sym, core::Timeframe::D1, true, ce.pendingBars);
                 ce.win->SetSymbol(sym);
                 UpdateChartPendingOrders(ce.win);
                 UpdateChartPosition(ce.win);
@@ -1714,6 +1735,10 @@ static void DestroyTradingWindows() {
         g_chartModesDirty = false;
     }
 
+    // Drop ticker-symbol slots before clearing entries — chart mktIds rotate
+    // through AllocChartMktId(), so a static-range loop wouldn't catch them.
+    for (auto& e : g_chartEntries)   g_tickerSymbols.erase(e.mktId);
+    for (auto& e : g_tradingEntries) g_tickerSymbols.erase(e.mktId);
     for (auto& e : g_chartEntries)   { delete e.win; e.win = nullptr; }
     for (auto& e : g_tradingEntries) { delete e.win; e.win = nullptr; }
     for (auto& e : g_scannerEntries) { delete e.win; e.win = nullptr; }
@@ -1827,7 +1852,7 @@ static void FinishConnect(bool isReconnect) {
                 bool isIntra = (tf != core::Timeframe::D1 &&
                                 tf != core::Timeframe::W1 &&
                                 tf != core::Timeframe::MN);
-                ReqChartData(ce.histId, ce.mktId, b.symbol, tf,
+                ReqChartData(ce, b.symbol, tf,
                              /*useRTH=*/!isIntra,
                              ce.pendingBars, duration);
                 restoredCharts[b.instanceIdx] = true;
@@ -1865,9 +1890,16 @@ static void FinishConnect(bool isReconnect) {
             for (int i = 0; i < kMktSeedCount; ++i)
                 g_IBClient->ReqContractDetails(NewsConIdMkt(ni) + i, kMktSeedSymbols[i]);
 
-        // Futures market health (/ES and /NQ) — reqIds 140, 141
+        // Futures market health — reqIds 140-143
         g_IBClient->ReqFuturesMarketData(140, "/ES");
         g_IBClient->ReqFuturesMarketData(141, "/NQ");
+        auto t = std::time(nullptr);
+        int decYear = std::gmtime(&t)->tm_year + 1900;
+        char esDec[20], nqDec[20];
+        std::snprintf(esDec, sizeof(esDec), "/ES %04d12", decYear);
+        std::snprintf(nqDec, sizeof(nqDec), "/NQ %04d12", decYear);
+        g_IBClient->ReqFuturesMarketData(142, esDec);
+        g_IBClient->ReqFuturesMarketData(143, nqDec);
     } else {
         printf("[IB] Reconnected — re-subscribing all windows.\n");
         g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
@@ -1907,6 +1939,13 @@ static void FinishConnect(bool isReconnect) {
         // Futures market health
         g_IBClient->ReqFuturesMarketData(140, "/ES");
         g_IBClient->ReqFuturesMarketData(141, "/NQ");
+        auto t2 = std::time(nullptr);
+        int decYear2 = std::gmtime(&t2)->tm_year + 1900;
+        char esDec2[20], nqDec2[20];
+        std::snprintf(esDec2, sizeof(esDec2), "/ES %04d12", decYear2);
+        std::snprintf(nqDec2, sizeof(nqDec2), "/NQ %04d12", decYear2);
+        g_IBClient->ReqFuturesMarketData(142, esDec2);
+        g_IBClient->ReqFuturesMarketData(143, nqDec2);
     }
 
     // Re-subscribe to TWS display groups if sync was already enabled before (re)connect.
@@ -2071,8 +2110,8 @@ static void WireIBCallbacks() {
             default: break;
         }
 
-        // Futures market health (reqIds 140 /ES, 141 /NQ) — fan out to all charts
-        if (tickerId == 140 || tickerId == 141) {
+        // Futures market health (reqIds 140-143 /ES, /NQ front+Dec) — fan out to all charts
+        if (tickerId >= 140 && tickerId <= 143) {
             for (auto& ce : g_chartEntries)
                 if (ce.win) ce.win->OnFuturesTick(tickerId, field, price);
             return;
@@ -2382,27 +2421,60 @@ static void WireIBCallbacks() {
         }
         UpdateAllChartPositions();
 
-        // Bracket: LMT filled → submit the pending STP stop-loss
+        // Bracket: LMT filled → submit the pending STP stop-loss (and TP take-profit
+        // when present) as an OCA pair. ocaType=1 = cancel-with-block: when one
+        // leg fills, IB cancels the survivor.
         auto bit = g_pendingBracketStops.find(fill.orderId);
         if (bit != g_pendingBracketStops.end()) {
+            const auto& p = bit->second;
+            std::string ocaTag = p.tpPrice > 0.0
+                ? ("BRK_" + std::to_string(fill.orderId))
+                : std::string{};
+            std::time_t now = std::time(nullptr);
+
             int stopId = g_nextOrderId++;
             core::Order stop;
             stop.orderId    = stopId;
-            stop.symbol     = bit->second.symbol;
-            stop.side       = bit->second.stopSide;
+            stop.symbol     = p.symbol;
+            stop.side       = p.stopSide;
             stop.type       = core::OrderType::Stop;
-            stop.quantity   = bit->second.qty;
-            stop.stopPrice  = bit->second.stopPrice;
+            stop.quantity   = p.qty;
+            stop.stopPrice  = p.stopPrice;
             stop.tif        = core::TimeInForce::GTC;
             stop.outsideRth = false;
             stop.account    = g_selectedAccount;
+            stop.ocaGroup   = ocaTag;
+            stop.ocaType    = ocaTag.empty() ? 0 : 1;
             stop.status     = core::OrderStatus::Pending;
-            stop.submittedAt = std::time(nullptr);
-            stop.updatedAt  = stop.submittedAt;
+            stop.submittedAt = now;
+            stop.updatedAt   = now;
             g_liveOrders[stopId] = stop;
             if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(stop);
-            UpdateAllChartPendingOrders();
             g_IBClient->PlaceOrder(stop);
+
+            if (p.tpPrice > 0.0) {
+                int tpId = g_nextOrderId++;
+                core::Order tp;
+                tp.orderId    = tpId;
+                tp.symbol     = p.symbol;
+                tp.side       = p.stopSide;             // same side as stop (close leg)
+                tp.type       = core::OrderType::Limit;
+                tp.quantity   = p.qty;
+                tp.limitPrice = p.tpPrice;
+                tp.tif        = core::TimeInForce::GTC;
+                tp.outsideRth = false;
+                tp.account    = g_selectedAccount;
+                tp.ocaGroup   = ocaTag;
+                tp.ocaType    = 1;
+                tp.status     = core::OrderStatus::Pending;
+                tp.submittedAt = now;
+                tp.updatedAt   = now;
+                g_liveOrders[tpId] = tp;
+                if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(tp);
+                g_IBClient->PlaceOrder(tp);
+            }
+
+            UpdateAllChartPendingOrders();
             g_pendingBracketStops.erase(bit);
         }
     };
