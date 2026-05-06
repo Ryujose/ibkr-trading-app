@@ -530,6 +530,8 @@ struct SetupPlan {
     double target  = 0.0;
     double rr      = 0.0;
     int    shares  = 0;
+    double t2Target   = 0.0;   // second take-profit level (0 = none)
+    double t2SplitPct = 50.0;  // % of position allocated to T1 (remainder → T2)
 };
 
 inline SetupPlan SuggestSetup(int side,
@@ -649,6 +651,56 @@ inline PositionStop SuggestStopForPosition(bool isLong,
         r.pctRisk = (r.stop - entry) / entry * 100.0;
     }
     return r;
+}
+
+// ─── Confluence gate helpers (Phase 15b) ─────────────────────────────────────
+// Each returns true when the condition is favourable for the given trade side.
+// Pure math — testable from tests-core, no IB / ImGui / ImPlot dependency.
+
+// Trend slope must agree with trade direction.
+// side=1 (long) expects slope > +epsilon; side=0 (short) expects slope < -epsilon.
+// Flat slope (|slope| <= epsilon) returns false for both sides.
+inline bool TrendSupportsSide(double slope, int side, double epsilon = 0.0) {
+    if (side == 1) return slope >  epsilon;
+    if (side == 0) return slope < -epsilon;
+    return false;
+}
+
+// Price must be on the correct side of the VWAP anchor.
+// side=1 (long)  → price >= vwap
+// side=0 (short) → price <= vwap
+inline bool VwapSupportsSide(double price, double vwap, int side) {
+    if (side == 1) return price >= vwap;
+    if (side == 0) return price <= vwap;
+    return false;
+}
+
+// RSI reading must not conflict with the trade direction.
+// Long:  RSI must be <= overbought threshold (default 70).
+// Short: RSI must be >= oversold threshold  (default 30).
+// rsi <= 0 means "no data" → passes (degrade gracefully).
+inline bool RsiSupportsSide(double rsi, int side,
+                            double overbought = 70.0,
+                            double oversold  = 30.0) {
+    if (rsi <= 0.0) return true;
+    if (side == 1) return rsi <= overbought;
+    if (side == 0) return rsi >= oversold;
+    return false;
+}
+
+// Futures must NOT be moving strongly against the trade direction.
+// Each futures chgPct is (price - prevClose) / prevClose * 100.
+// A chgPct of 0 (no data) is treated as neutral (pass).
+// side=1 (long):  each known chgPct must be >= -threshold
+// side=0 (short): each known chgPct must be <= +threshold
+inline bool FuturesSupportDirection(double esChgPct,   double nqChgPct,
+                                     double esDecChgPct, double nqDecChgPct,
+                                     double threshold, int side) {
+    auto ok = [&](double chg) {
+        if (side == 1) return chg >= -threshold;
+        else           return chg <=  threshold;
+    };
+    return ok(esChgPct) && ok(nqChgPct) && ok(esDecChgPct) && ok(nqDecChgPct);
 }
 
 // ─── Session-anchored VWAP + volume-weighted ±σ bands ──────────────────────
@@ -890,6 +942,127 @@ inline StopTargetPreview PreviewStopTarget(const OrderImpact& target,
     p.stopPnL   = stop.closePnL;
     p.rrRatio   = reward / risk;
     return p;
+}
+
+// ============================================================================
+// Volume Profile (Phase 15 — CW-1)
+//
+// Horizontal histogram of volume-by-price across a vertical price range. Each
+// bar's volume is distributed *uniformly* across the bins it overlaps in
+// [low_i, high_i] — bars whose range is entirely outside [priceLo, priceHi]
+// contribute zero, partial overlaps contribute pro-rata. This matches the
+// TradingView / IB convention and avoids the "POC sits at one big bar's
+// close" artefact of pure-typical-price profiles.
+//
+// Caller passes `priceLo` / `priceHi` (typically from the chart's visible
+// Y-axis) — re-bucketing per frame is cheap (O(n_bars × n_bins)).
+// ============================================================================
+struct VolumeBin {
+    double priceLo = 0.0;   // bin lower edge
+    double priceHi = 0.0;   // bin upper edge
+    double volume  = 0.0;   // total volume that traded inside [priceLo, priceHi]
+};
+
+struct VolumeProfile {
+    std::vector<VolumeBin> bins;
+    int    pocIdx         = -1;    // index of max-volume bin (Point of Control)
+    double maxVolume      = 0.0;   // bins[pocIdx].volume — used to normalise widths
+    double totalVol       = 0.0;
+    int    valueAreaLoIdx = -1;    // ~70% volume range, lower bound (-1 if not meaningful)
+    int    valueAreaHiIdx = -1;    // ~70% volume range, upper bound (-1 if not meaningful)
+};
+
+inline VolumeProfile ComputeVolumeProfile(const std::vector<double>& highs,
+                                          const std::vector<double>& lows,
+                                          const std::vector<double>& volumes,
+                                          double priceLo, double priceHi,
+                                          int    numBins = 50) {
+    VolumeProfile out;
+    if (numBins < 10)  numBins = 10;
+    if (numBins > 200) numBins = 200;
+    if (priceHi <= priceLo) return out;
+    int n = static_cast<int>(highs.size());
+    if (n == 0 ||
+        static_cast<int>(lows.size())    != n ||
+        static_cast<int>(volumes.size()) != n) return out;
+
+    out.bins.resize(numBins);
+    double binW = (priceHi - priceLo) / numBins;
+    for (int b = 0; b < numBins; ++b) {
+        out.bins[b].priceLo = priceLo + b * binW;
+        out.bins[b].priceHi = out.bins[b].priceLo + binW;
+        out.bins[b].volume  = 0.0;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        double h = highs[i], l = lows[i], v = volumes[i];
+        if (v <= 0.0) continue;
+        if (h < priceLo || l > priceHi) continue;       // bar entirely out of range
+        double fullRng = h - l;
+        if (fullRng < 1e-9) {
+            // Degenerate / single-price bar — drop full volume into the bin
+            // containing its price.
+            double price = l;
+            if (price < priceLo || price > priceHi) continue;
+            int b = static_cast<int>((price - priceLo) / binW);
+            if (b < 0) b = 0;
+            if (b >= numBins) b = numBins - 1;
+            out.bins[b].volume += v;
+            continue;
+        }
+        // Clip bar to the visible price range, then distribute pro-rata using
+        // the *full* bar range — so a partially-clipped bar contributes only
+        // the visible fraction of its volume (visibleRng / fullRng).
+        double barLo = l > priceLo ? l : priceLo;
+        double barHi = h < priceHi ? h : priceHi;
+        int firstBin = static_cast<int>((barLo - priceLo) / binW);
+        int lastBin  = static_cast<int>((barHi - priceLo) / binW);
+        if (firstBin < 0) firstBin = 0;
+        if (lastBin  >= numBins) lastBin = numBins - 1;
+        for (int b = firstBin; b <= lastBin; ++b) {
+            double binLo = out.bins[b].priceLo;
+            double binHi = out.bins[b].priceHi;
+            double overlapLo = barLo > binLo ? barLo : binLo;
+            double overlapHi = barHi < binHi ? barHi : binHi;
+            double overlap   = overlapHi - overlapLo;
+            if (overlap <= 0.0) continue;
+            out.bins[b].volume += v * (overlap / fullRng);
+        }
+    }
+
+    out.totalVol  = 0.0;
+    out.maxVolume = 0.0;
+    out.pocIdx    = -1;
+    for (int b = 0; b < numBins; ++b) {
+        out.totalVol += out.bins[b].volume;
+        if (out.bins[b].volume > out.maxVolume) {
+            out.maxVolume = out.bins[b].volume;
+            out.pocIdx    = b;
+        }
+    }
+
+    // Value Area — expand outward from POC until cumulative volume hits 70%.
+    if (numBins >= 5 && out.pocIdx >= 0 && out.totalVol > 0.0) {
+        const double target = 0.70 * out.totalVol;
+        int lo = out.pocIdx, hi = out.pocIdx;
+        double acc = out.bins[out.pocIdx].volume;
+        while (acc < target && (lo > 0 || hi < numBins - 1)) {
+            double leftV  = (lo > 0)            ? out.bins[lo - 1].volume : -1.0;
+            double rightV = (hi < numBins - 1)  ? out.bins[hi + 1].volume : -1.0;
+            if (rightV >= leftV) {
+                if (hi < numBins - 1) { ++hi; acc += out.bins[hi].volume; }
+                else if (lo > 0)      { --lo; acc += out.bins[lo].volume; }
+                else break;
+            } else {
+                if (lo > 0)           { --lo; acc += out.bins[lo].volume; }
+                else if (hi < numBins - 1) { ++hi; acc += out.bins[hi].volume; }
+                else break;
+            }
+        }
+        out.valueAreaLoIdx = lo;
+        out.valueAreaHiIdx = hi;
+    }
+    return out;
 }
 
 } // namespace core::services

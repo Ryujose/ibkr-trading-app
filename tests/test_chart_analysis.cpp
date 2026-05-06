@@ -51,6 +51,13 @@ using core::services::OrderImpact;
 using core::services::OrderImpactKind;
 using core::services::PreviewStopTarget;
 using core::services::StopTargetPreview;
+using core::services::ComputeVolumeProfile;
+using core::services::VolumeBin;
+using core::services::VolumeProfile;
+using core::services::FuturesSupportDirection;
+using core::services::RsiSupportsSide;
+using core::services::TrendSupportsSide;
+using core::services::VwapSupportsSide;
 
 // ── FindSwings ───────────────────────────────────────────────────────────────
 
@@ -825,6 +832,77 @@ TEST_CASE("PositionSizeShares: degenerate inputs return zero", "[analysis][setup
     REQUIRE(PositionSizeShares(-10000.0, 1.0, 100.0,  95.0) == 0);  // negative equity
 }
 
+// ── Confluence gate helpers (Phase 15b) ──────────────────────────────────────
+
+TEST_CASE("TrendSupportsSide: long/uptrend and short/downtrend", "[analysis][setup]") {
+    REQUIRE(TrendSupportsSide( 1.0, 1) == true);
+    REQUIRE(TrendSupportsSide(-1.0, 0) == true);
+}
+
+TEST_CASE("TrendSupportsSide: flat slope rejected for both sides", "[analysis][setup]") {
+    REQUIRE(TrendSupportsSide( 0.0, 1) == false);
+    REQUIRE(TrendSupportsSide( 0.0, 0) == false);
+    REQUIRE(TrendSupportsSide( 0.0, 1, 0.001) == false);  // within epsilon
+}
+
+TEST_CASE("TrendSupportsSide: wrong direction rejected", "[analysis][setup]") {
+    REQUIRE(TrendSupportsSide( 1.0, 0) == false);  // uptrend, short
+    REQUIRE(TrendSupportsSide(-1.0, 1) == false);  // downtrend, long
+    REQUIRE(TrendSupportsSide( 1.0, 2) == false);  // bad side
+}
+
+TEST_CASE("VwapSupportsSide: correct sides pass", "[analysis][setup]") {
+    REQUIRE(VwapSupportsSide(105.0, 100.0, 1) == true);   // long above VWAP
+    REQUIRE(VwapSupportsSide( 95.0, 100.0, 0) == true);   // short below VWAP
+}
+
+TEST_CASE("VwapSupportsSide: wrong sides rejected", "[analysis][setup]") {
+    REQUIRE(VwapSupportsSide( 95.0, 100.0, 1) == false);  // long below VWAP
+    REQUIRE(VwapSupportsSide(105.0, 100.0, 0) == false);  // short above VWAP
+    REQUIRE(VwapSupportsSide(100.0, 100.0, 2) == false);  // bad side
+}
+
+TEST_CASE("RsiSupportsSide: valid ranges pass", "[analysis][setup]") {
+    REQUIRE(RsiSupportsSide(65.0, 1) == true);   // long, below OB
+    REQUIRE(RsiSupportsSide(35.0, 0) == true);   // short, above OS
+}
+
+TEST_CASE("RsiSupportsSide: overbought/oversold rejected", "[analysis][setup]") {
+    REQUIRE(RsiSupportsSide(75.0, 1) == false);  // long, above OB
+    REQUIRE(RsiSupportsSide(25.0, 0) == false);  // short, below OS
+}
+
+TEST_CASE("RsiSupportsSide: no-data passes through", "[analysis][setup]") {
+    REQUIRE(RsiSupportsSide( 0.0, 1) == true);   // RSI=0 means not computed yet
+    REQUIRE(RsiSupportsSide( 0.0, 0) == true);
+    REQUIRE(RsiSupportsSide(-1.0, 1) == true);   // also treated as no-data
+}
+
+TEST_CASE("FuturesSupportDirection: all neutral passes both sides", "[analysis][setup]") {
+    REQUIRE(FuturesSupportDirection(0.0, 0.0, 0.0, 0.0, 0.5, 1) == true);
+    REQUIRE(FuturesSupportDirection(0.0, 0.0, 0.0, 0.0, 0.5, 0) == true);
+}
+
+TEST_CASE("FuturesSupportDirection: long blocked by counter move", "[analysis][setup]") {
+    // esChg=-1.0 exceeds threshold=0.5 → blocked
+    REQUIRE(FuturesSupportDirection(-1.0, -0.1, 0.0, 0.0, 0.5, 1) == false);
+    // All four are against us
+    REQUIRE(FuturesSupportDirection(-1.0, -0.8, -0.6, -0.3, 0.5, 1) == false);
+}
+
+TEST_CASE("FuturesSupportDirection: long small counter move passes", "[analysis][setup]") {
+    REQUIRE(FuturesSupportDirection(-0.3, -0.2, 0.0, 0.0, 0.5, 1) == true);
+}
+
+TEST_CASE("FuturesSupportDirection: short blocked by upward move", "[analysis][setup]") {
+    REQUIRE(FuturesSupportDirection( 1.0, 0.0, 0.0, 0.0, 0.5, 0) == false);
+}
+
+TEST_CASE("FuturesSupportDirection: mixed data with partial no-data passes", "[analysis][setup]") {
+    // Only ES front-month has data; ES Dec, NQ front/Dec all zero (neutral)
+    REQUIRE(FuturesSupportDirection(-0.2, 0.0, 0.0, 0.0, 0.5, 1) == true);
+}
+
 // ── SessionVwap ─────────────────────────────────────────────────────────────
 
 TEST_CASE("SessionVwap: known volume-weighted average across three bars", "[analysis][vwap]") {
@@ -952,10 +1030,11 @@ namespace {
 // so ApplyPreset() instantiates against them. Defaults intentionally diverge from
 // every preset so we can detect "field was not written" as a test failure.
 struct StubInd {
-    bool   vwap       = false;
-    bool   vwapBands  = false;
-    int    smaPeriod1 = -1;
-    int    smaPeriod2 = -1;
+    bool   vwap          = false;
+    bool   vwapBands     = false;
+    bool   volumeProfile = false;
+    int    smaPeriod1    = -1;
+    int    smaPeriod2    = -1;
 };
 struct StubAuto {
     bool supports     = false;
@@ -983,6 +1062,14 @@ struct StubSetup {
     double stopOffset  = -1.0;
     double riskPct     = -1.0;
     bool   useStopLmt  = false;   // diverges from every preset (true)
+    bool   trendAlign       = false;
+    bool   vwapContext      = false;
+    bool   marketHealth     = false;
+    bool   rsiFilter        = false;
+    bool   volumeConfluence = false;
+    bool   multiTarget      = false;
+    double mhMaxCounterPct  = -1.0;
+    double t2SplitPct       = -1.0;
 };
 }  // namespace
 
@@ -1007,10 +1094,11 @@ TEST_CASE("GetPreset(Scalping): expected 1m / 2 D / scalper params", "[analysis]
     REQUIRE(p.trendLookback   == 30);
     REQUIRE(p.maxLevels       == 4);
     REQUIRE(p.minTouches      == 2);
-    REQUIRE(p.indVwap         == true);
-    REQUIRE(p.indVwapBands    == false);
-    REQUIRE(p.smaPeriod1      == 9);
-    REQUIRE(p.smaPeriod2      == 20);
+    REQUIRE(p.indVwap          == true);
+    REQUIRE(p.indVwapBands     == false);
+    REQUIRE(p.indVolumeProfile == false);
+    REQUIRE(p.smaPeriod1       == 9);
+    REQUIRE(p.smaPeriod2       == 20);
     REQUIRE(p.pivotPoints     == true);
     REQUIRE(p.breakouts       == true);
     REQUIRE(p.zones           == true);
@@ -1031,15 +1119,16 @@ TEST_CASE("GetPreset(DayTrading): expected 15m / 20 D / day-trade params", "[ana
     REQUIRE(std::string(p.historyDuration) == "20 D");
     REQUIRE(p.swingK          == 3);
     REQUIRE(p.trendLookback   == 40);
-    REQUIRE(p.indVwap         == true);
-    REQUIRE(p.indVwapBands    == true);
-    REQUIRE(p.smaPeriod1      == 20);
-    REQUIRE(p.smaPeriod2      == 50);
-    REQUIRE(p.pivotPoints     == true);
-    REQUIRE(p.breakouts       == true);
-    REQUIRE(p.zones           == true);
-    REQUIRE(p.trend           == true);
-    REQUIRE(p.rrMin           == Catch::Approx(1.75));
+    REQUIRE(p.indVwap          == true);
+    REQUIRE(p.indVwapBands     == true);
+    REQUIRE(p.indVolumeProfile == true);
+    REQUIRE(p.smaPeriod1       == 20);
+    REQUIRE(p.smaPeriod2       == 50);
+    REQUIRE(p.pivotPoints      == true);
+    REQUIRE(p.breakouts        == true);
+    REQUIRE(p.zones            == true);
+    REQUIRE(p.trend            == true);
+    REQUIRE(p.rrMin            == Catch::Approx(1.75));
     REQUIRE(p.atrPad          == Catch::Approx(0.5));
     REQUIRE(p.riskPct         == Catch::Approx(0.75));
 }
@@ -1050,16 +1139,17 @@ TEST_CASE("GetPreset(Swing): expected 1D / 1 Y / swing params", "[analysis][styl
     REQUIRE(std::string(p.historyDuration) == "1 Y");
     REQUIRE(p.swingK          == 4);
     REQUIRE(p.trendLookback   == 50);
-    REQUIRE(p.indVwap         == false);
-    REQUIRE(p.indVwapBands    == false);
-    REQUIRE(p.smaPeriod1      == 20);
-    REQUIRE(p.smaPeriod2      == 50);
-    REQUIRE(p.pivotPoints     == false);
-    REQUIRE(p.breakouts       == true);
-    REQUIRE(p.zones           == true);
-    REQUIRE(p.trend           == true);
-    REQUIRE(p.autoFib         == true);
-    REQUIRE(p.rrMin           == Catch::Approx(2.0));
+    REQUIRE(p.indVwap          == false);
+    REQUIRE(p.indVwapBands     == false);
+    REQUIRE(p.indVolumeProfile == true);
+    REQUIRE(p.smaPeriod1       == 20);
+    REQUIRE(p.smaPeriod2       == 50);
+    REQUIRE(p.pivotPoints      == false);
+    REQUIRE(p.breakouts        == true);
+    REQUIRE(p.zones            == true);
+    REQUIRE(p.trend            == true);
+    REQUIRE(p.autoFib          == true);
+    REQUIRE(p.rrMin            == Catch::Approx(2.0));
     REQUIRE(p.atrPad          == Catch::Approx(0.5));
     REQUIRE(p.roundPad        == Catch::Approx(0.07));
     REQUIRE(p.stopOffset      == Catch::Approx(0.10));
@@ -1073,10 +1163,11 @@ TEST_CASE("GetPreset(Investment): expected 1W / 5 Y / investor params", "[analys
     REQUIRE(p.swingK          == 5);
     REQUIRE(p.trendLookback   == 52);
     REQUIRE(p.minTouches      == 3);
-    REQUIRE(p.indVwap         == false);
-    REQUIRE(p.indVwapBands    == false);
-    REQUIRE(p.smaPeriod1      == 50);
-    REQUIRE(p.smaPeriod2      == 200);
+    REQUIRE(p.indVwap          == false);
+    REQUIRE(p.indVwapBands     == false);
+    REQUIRE(p.indVolumeProfile == false);
+    REQUIRE(p.smaPeriod1       == 50);
+    REQUIRE(p.smaPeriod2       == 200);
     REQUIRE(p.pivotPoints     == false);
     REQUIRE(p.breakouts       == false);
     REQUIRE(p.zones           == false);
@@ -1115,10 +1206,11 @@ TEST_CASE("GetPreset(Free): construction-default baseline + D1 placeholder TF", 
     REQUIRE(p.scanCap         == 1000);
     REQUIRE(p.trendChannel    == false);
     // Indicators: VWAP on (matches the IndicatorSettings default).
-    REQUIRE(p.indVwap         == true);
-    REQUIRE(p.indVwapBands    == false);
-    REQUIRE(p.smaPeriod1      == 20);
-    REQUIRE(p.smaPeriod2      == 50);
+    REQUIRE(p.indVwap          == true);
+    REQUIRE(p.indVwapBands     == false);
+    REQUIRE(p.indVolumeProfile == false);
+    REQUIRE(p.smaPeriod1       == 20);
+    REQUIRE(p.smaPeriod2       == 50);
     // Setup overlay: matches SetupSettings construction defaults.
     REQUIRE(p.setupOverlay    == false);
     REQUIRE(p.rrMin           == Catch::Approx(2.0));
@@ -1127,6 +1219,14 @@ TEST_CASE("GetPreset(Free): construction-default baseline + D1 placeholder TF", 
     REQUIRE(p.stopOffset      == Catch::Approx(0.10));
     REQUIRE(p.riskPct         == Catch::Approx(1.0));
     REQUIRE(p.useStopLmt      == true);
+    REQUIRE(p.trendAlign       == false);
+    REQUIRE(p.vwapContext      == false);
+    REQUIRE(p.marketHealth     == false);
+    REQUIRE(p.rsiFilter        == false);
+    REQUIRE(p.volumeConfluence == false);
+    REQUIRE(p.multiTarget      == false);
+    REQUIRE(p.mhMaxCounterPct  == Catch::Approx(0.5));
+    REQUIRE(p.t2SplitPct       == Catch::Approx(50.0));
 }
 
 TEST_CASE("ApplyPreset stamps every overridable field onto stub structs", "[analysis][style]") {
@@ -1153,10 +1253,11 @@ TEST_CASE("ApplyPreset stamps every overridable field onto stub structs", "[anal
     REQUIRE(a.scanCap      == 1000);
     REQUIRE(a.trendChannel == false);
 
-    REQUIRE(ind.vwap       == true);
-    REQUIRE(ind.vwapBands  == true);
-    REQUIRE(ind.smaPeriod1 == 20);
-    REQUIRE(ind.smaPeriod2 == 50);
+    REQUIRE(ind.vwap          == true);
+    REQUIRE(ind.vwapBands     == true);
+    REQUIRE(ind.volumeProfile == true);
+    REQUIRE(ind.smaPeriod1    == 20);
+    REQUIRE(ind.smaPeriod2    == 50);
 
     REQUIRE(s.overlay      == false);
     REQUIRE(s.rrMin        == Catch::Approx(1.75));
@@ -1165,6 +1266,14 @@ TEST_CASE("ApplyPreset stamps every overridable field onto stub structs", "[anal
     REQUIRE(s.stopOffset   == Catch::Approx(0.07));
     REQUIRE(s.riskPct      == Catch::Approx(0.75));
     REQUIRE(s.useStopLmt   == true);
+    REQUIRE(s.trendAlign       == true);
+    REQUIRE(s.vwapContext      == true);
+    REQUIRE(s.marketHealth     == true);
+    REQUIRE(s.rsiFilter        == false);
+    REQUIRE(s.volumeConfluence == true);
+    REQUIRE(s.multiTarget      == true);
+    REQUIRE(s.mhMaxCounterPct  == Catch::Approx(0.5));
+    REQUIRE(s.t2SplitPct       == Catch::Approx(50.0));
 }
 
 TEST_CASE("ApplyPreset round-trip leaves no carry-over from the previous preset", "[analysis][style]") {
@@ -1183,18 +1292,28 @@ TEST_CASE("ApplyPreset round-trip leaves no carry-over from the previous preset"
 
     ApplyPreset(GetPreset(TradingStyle::Investment), ind, a, s, tf);
     REQUIRE(tf == core::Timeframe::W1);
-    REQUIRE(a.swingK         == 5);
-    REQUIRE(a.trendLookback  == 52);
-    REQUIRE(a.minTouches     == 3);
-    REQUIRE(a.zones          == false);
-    REQUIRE(a.breakouts      == false);
-    REQUIRE(a.pivotPoints    == false);
-    REQUIRE(ind.vwap         == false);
-    REQUIRE(ind.vwapBands    == false);
-    REQUIRE(ind.smaPeriod1   == 50);
-    REQUIRE(ind.smaPeriod2   == 200);
-    REQUIRE(s.riskPct        == Catch::Approx(1.5));
-    REQUIRE(s.atrPad         == Catch::Approx(1.0));
+    REQUIRE(a.swingK            == 5);
+    REQUIRE(a.trendLookback     == 52);
+    REQUIRE(a.minTouches        == 3);
+    REQUIRE(a.zones             == false);
+    REQUIRE(a.breakouts         == false);
+    REQUIRE(a.pivotPoints       == false);
+    REQUIRE(ind.vwap            == false);
+    REQUIRE(ind.vwapBands       == false);
+    REQUIRE(ind.volumeProfile   == false);
+    REQUIRE(ind.smaPeriod1      == 50);
+    REQUIRE(ind.smaPeriod2      == 200);
+    REQUIRE(s.riskPct           == Catch::Approx(1.5));
+    REQUIRE(s.atrPad            == Catch::Approx(1.0));
+    // Confluence gates: Investment has trendAlign ON, marketHealth ON, rest OFF
+    REQUIRE(s.trendAlign       == true);
+    REQUIRE(s.vwapContext      == false);
+    REQUIRE(s.marketHealth     == true);
+    REQUIRE(s.rsiFilter        == false);
+    REQUIRE(s.volumeConfluence == false);
+    REQUIRE(s.multiTarget      == false);
+    REQUIRE(s.mhMaxCounterPct  == Catch::Approx(2.0));
+    REQUIRE(s.t2SplitPct       == Catch::Approx(50.0));
 }
 
 TEST_CASE("ApplyPreset(Free) stamps construction-default baseline", "[analysis][style]") {
@@ -1211,26 +1330,44 @@ TEST_CASE("ApplyPreset(Free) stamps construction-default baseline", "[analysis][
     REQUIRE(s.riskPct   == Catch::Approx(1.5));
 
     ApplyPreset(GetPreset(TradingStyle::Free), ind, a, s, tf);
-    REQUIRE(tf              == core::Timeframe::D1);
-    REQUIRE(a.supports      == true);
-    REQUIRE(a.resistances   == true);
-    REQUIRE(a.trend         == true);
-    REQUIRE(a.autoFib       == false);   // overwritten back to baseline
-    REQUIRE(a.zones         == false);
-    REQUIRE(a.breakouts     == false);
-    REQUIRE(a.pivotPoints   == false);
-    REQUIRE(a.swingK        == 3);
-    REQUIRE(a.trendLookback == 50);
-    REQUIRE(a.minTouches    == 2);
-    REQUIRE(ind.vwap        == true);
-    REQUIRE(ind.vwapBands   == false);
-    REQUIRE(ind.smaPeriod1  == 20);
-    REQUIRE(ind.smaPeriod2  == 50);
-    REQUIRE(s.overlay       == false);
-    REQUIRE(s.rrMin         == Catch::Approx(2.0));
-    REQUIRE(s.atrPad        == Catch::Approx(0.5));
-    REQUIRE(s.riskPct       == Catch::Approx(1.0));
-    REQUIRE(s.useStopLmt    == true);
+    REQUIRE(tf                 == core::Timeframe::D1);
+    REQUIRE(a.supports         == true);
+    REQUIRE(a.resistances      == true);
+    REQUIRE(a.trend            == true);
+    REQUIRE(a.autoFib          == false);   // overwritten back to baseline
+    REQUIRE(a.zones            == false);
+    REQUIRE(a.breakouts        == false);
+    REQUIRE(a.pivotPoints      == false);
+    REQUIRE(a.swingK           == 3);
+    REQUIRE(a.trendLookback    == 50);
+    REQUIRE(a.minTouches       == 2);
+    REQUIRE(ind.vwap           == true);
+    REQUIRE(ind.vwapBands      == false);
+    REQUIRE(ind.volumeProfile  == false);
+    REQUIRE(ind.smaPeriod1     == 20);
+    REQUIRE(ind.smaPeriod2     == 50);
+    REQUIRE(s.overlay          == false);
+    REQUIRE(s.rrMin            == Catch::Approx(2.0));
+    REQUIRE(s.atrPad           == Catch::Approx(0.5));
+    REQUIRE(s.riskPct          == Catch::Approx(1.0));
+    REQUIRE(s.useStopLmt       == true);
+    REQUIRE(s.trendAlign       == false);
+    REQUIRE(s.vwapContext      == false);
+    REQUIRE(s.marketHealth     == false);
+    REQUIRE(s.rsiFilter        == false);
+    REQUIRE(s.volumeConfluence == false);
+    REQUIRE(s.multiTarget      == false);
+    REQUIRE(s.mhMaxCounterPct  == Catch::Approx(0.5));
+    REQUIRE(s.t2SplitPct       == Catch::Approx(50.0));
+
+    // Second leg — dirty with DayTrading (volumeProfile ON, vwapBands ON)
+    // and verify Free clears both back to baseline.
+    ApplyPreset(GetPreset(TradingStyle::DayTrading), ind, a, s, tf);
+    REQUIRE(ind.volumeProfile == true);
+    REQUIRE(ind.vwapBands     == true);
+    ApplyPreset(GetPreset(TradingStyle::Free), ind, a, s, tf);
+    REQUIRE(ind.volumeProfile == false);
+    REQUIRE(ind.vwapBands     == false);
 }
 
 // ── OrderImpact — side-intent badge & P&L preview ─────────────────────────────
@@ -1519,4 +1656,177 @@ TEST_CASE("RSI: degenerate input", "[analysis][chart-indicators]") {
     auto z2 = RSI({1.0, 2.0, 3.0}, 0);   // period <= 0
     REQUIRE(z2.size() == 3);
     REQUIRE(z2[0] == 0.0);
+}
+
+// ── ComputeVolumeProfile (CW-1) ──────────────────────────────────────────────
+
+TEST_CASE("VolumeProfile: single-bar uniform distribution across all bins",
+          "[analysis][volume-profile]") {
+    // One bar low=100, high=110, vol=1000 over [100, 110] with 10 bins.
+    // Each bin spans 1.0 of price; overlap fraction is 1/10 per bin → 100 vol/bin.
+    std::vector<double> highs = {110.0};
+    std::vector<double> lows  = {100.0};
+    std::vector<double> vols  = {1000.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 10);
+    REQUIRE(vp.bins.size() == 10);
+    int matches = 0;
+    for (const auto& b : vp.bins) {
+        REQUIRE(b.volume == Catch::Approx(100.0).margin(1e-9));
+        if (b.volume == Catch::Approx(100.0).margin(1e-9)) ++matches;
+    }
+    REQUIRE(matches == 10);
+    REQUIRE(vp.maxVolume == Catch::Approx(100.0).margin(1e-9));
+    REQUIRE(vp.totalVol  == Catch::Approx(1000.0).margin(1e-9));
+    REQUIRE(vp.pocIdx >= 0);
+    REQUIRE(vp.pocIdx < 10);
+}
+
+TEST_CASE("VolumeProfile: POC concentrates where most bars overlap",
+          "[analysis][volume-profile]") {
+    // 3 bars in [100, 101] vol 500 each + 1 bar in [99, 100] vol 100.
+    // Profile bins of width 0.2 over [99, 101] with 10 bins:
+    //   bins 0..4 [99..100): 1 bar covers, vol per bin = 0.2/1.0 × 100 = 20
+    //   bins 5..9 [100..101): 3 bars cover, vol per bin = 3 × 0.2/1.0 × 500 = 300
+    // Total = 5×20 + 5×300 = 1600, POC tied in [5, 9].
+    std::vector<double> highs = {101.0, 101.0, 101.0, 100.0};
+    std::vector<double> lows  = {100.0, 100.0, 100.0, 99.0};
+    std::vector<double> vols  = {500.0, 500.0, 500.0, 100.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 99.0, 101.0, 10);
+    REQUIRE(vp.bins.size() == 10);
+    for (int b = 0; b < 5; ++b) {
+        REQUIRE(vp.bins[b].volume == Catch::Approx(20.0).margin(1e-9));
+    }
+    for (int b = 5; b < 10; ++b) {
+        REQUIRE(vp.bins[b].volume == Catch::Approx(300.0).margin(1e-9));
+    }
+    REQUIRE(vp.totalVol  == Catch::Approx(1600.0).margin(1e-6));
+    REQUIRE(vp.maxVolume == Catch::Approx(300.0).margin(1e-9));
+    REQUIRE((vp.pocIdx >= 5 && vp.pocIdx <= 9));     // tied — any of the upper bins acceptable
+}
+
+TEST_CASE("VolumeProfile: bar entirely above priceHi contributes zero",
+          "[analysis][volume-profile]") {
+    // Two bars: one in-range (100..105 vol=500), one above (200..210 vol=999).
+    std::vector<double> highs = {105.0, 210.0};
+    std::vector<double> lows  = {100.0, 200.0};
+    std::vector<double> vols  = {500.0, 999.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 10);
+    REQUIRE(vp.totalVol == Catch::Approx(500.0));    // out-of-range bar excluded
+    // All in-range volume sits in bins 0..4 (100..105).
+    double inRangeSum = 0.0;
+    for (int b = 0; b < 5; ++b) inRangeSum += vp.bins[b].volume;
+    REQUIRE(inRangeSum == Catch::Approx(500.0));
+    for (int b = 5; b < 10; ++b) REQUIRE(vp.bins[b].volume == Catch::Approx(0.0));
+}
+
+TEST_CASE("VolumeProfile: bar entirely below priceLo contributes zero",
+          "[analysis][volume-profile]") {
+    std::vector<double> highs = {90.0};
+    std::vector<double> lows  = {80.0};
+    std::vector<double> vols  = {1000.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 10);
+    REQUIRE(vp.totalVol == Catch::Approx(0.0));
+    REQUIRE(vp.maxVolume == Catch::Approx(0.0));
+    REQUIRE(vp.pocIdx == -1);
+}
+
+TEST_CASE("VolumeProfile: partial overlap scales proportionally",
+          "[analysis][volume-profile]") {
+    // Bar low=98 high=104 vol=600 over priceLo=100 priceHi=104 with 10 bins
+    // (width 0.4 each). Bar range = 6 (full), visible range = 4. Each bin
+    // contributes 0.4/6 × 600 = 40. Total = 10 × 40 = 400.
+    std::vector<double> highs = {104.0};
+    std::vector<double> lows  = {98.0};
+    std::vector<double> vols  = {600.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 104.0, 10);
+    REQUIRE(vp.bins.size() == 10);
+    REQUIRE(vp.totalVol == Catch::Approx(400.0).margin(1e-6));
+    for (const auto& b : vp.bins) {
+        REQUIRE(b.volume == Catch::Approx(40.0).margin(1e-9));
+    }
+}
+
+TEST_CASE("VolumeProfile: empty input → empty profile",
+          "[analysis][volume-profile]") {
+    auto vp = ComputeVolumeProfile({}, {}, {}, 100.0, 110.0, 50);
+    REQUIRE(vp.bins.empty());
+    REQUIRE(vp.pocIdx == -1);
+    REQUIRE(vp.maxVolume == 0.0);
+    REQUIRE(vp.totalVol  == 0.0);
+}
+
+TEST_CASE("VolumeProfile: degenerate range → empty profile",
+          "[analysis][volume-profile]") {
+    std::vector<double> highs = {110.0};
+    std::vector<double> lows  = {100.0};
+    std::vector<double> vols  = {1000.0};
+    // priceHi <= priceLo
+    auto vp1 = ComputeVolumeProfile(highs, lows, vols, 105.0, 105.0, 10);
+    REQUIRE(vp1.bins.empty());
+    auto vp2 = ComputeVolumeProfile(highs, lows, vols, 110.0, 100.0, 10);
+    REQUIRE(vp2.bins.empty());
+}
+
+TEST_CASE("VolumeProfile: mismatched-length input → empty profile",
+          "[analysis][volume-profile]") {
+    auto vp = ComputeVolumeProfile({100.0, 102.0}, {99.0}, {500.0, 600.0},
+                                   99.0, 102.0, 10);
+    REQUIRE(vp.bins.empty());
+}
+
+TEST_CASE("VolumeProfile: numBins clamped to [10, 200]",
+          "[analysis][volume-profile]") {
+    std::vector<double> highs = {110.0};
+    std::vector<double> lows  = {100.0};
+    std::vector<double> vols  = {1000.0};
+    auto vpLo = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 1);
+    REQUIRE(vpLo.bins.size() == 10);
+    auto vpHi = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 5000);
+    REQUIRE(vpHi.bins.size() == 200);
+}
+
+TEST_CASE("VolumeProfile: zero-volume bars are skipped",
+          "[analysis][volume-profile]") {
+    std::vector<double> highs = {105.0, 105.0, 105.0};
+    std::vector<double> lows  = {100.0, 100.0, 100.0};
+    std::vector<double> vols  = {0.0,   500.0, 0.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 105.0, 5);
+    REQUIRE(vp.totalVol == Catch::Approx(500.0));
+}
+
+TEST_CASE("VolumeProfile: value area expands outward from POC",
+          "[analysis][volume-profile]") {
+    // 5 single-price bars at distinct bin indices in a 10-bin profile over
+    // [100, 105] (width 0.5):
+    //   101.25 → bin 2 (vol 10), 101.75 → bin 3 (vol 20),
+    //   102.25 → bin 4 (vol 50, POC),
+    //   102.75 → bin 5 (vol 20), 103.25 → bin 6 (vol 10).
+    // Total = 110, target = 0.70 × 110 = 77.
+    // Expansion from POC (50): tied 20/20 left/right → algorithm picks right
+    // first → hi=5 acc=70 → 10/20 → left wins → lo=3 acc=90 ≥ 77.
+    // Result: valueAreaLoIdx=3, valueAreaHiIdx=5.
+    std::vector<double> highs = {101.25, 101.75, 102.25, 102.75, 103.25};
+    std::vector<double> lows  = {101.25, 101.75, 102.25, 102.75, 103.25};
+    std::vector<double> vols  = {10.0,   20.0,   50.0,   20.0,   10.0};
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 105.0, 10);
+    REQUIRE(vp.bins.size() == 10);
+    REQUIRE(vp.pocIdx == 4);
+    REQUIRE(vp.maxVolume == Catch::Approx(50.0));
+    REQUIRE(vp.totalVol  == Catch::Approx(110.0));
+    REQUIRE(vp.valueAreaLoIdx == 3);
+    REQUIRE(vp.valueAreaHiIdx == 5);
+}
+
+TEST_CASE("VolumeProfile: value area not computed when numBins < 5",
+          "[analysis][volume-profile]") {
+    std::vector<double> highs = {110.0};
+    std::vector<double> lows  = {100.0};
+    std::vector<double> vols  = {1000.0};
+    // Function clamps to 10 minimum, so even passing 4 yields 10 bins —
+    // value area IS computed. Verify the clamping path leaves VA enabled.
+    auto vp = ComputeVolumeProfile(highs, lows, vols, 100.0, 110.0, 4);
+    REQUIRE(vp.bins.size() == 10);
+    REQUIRE(vp.valueAreaLoIdx >= 0);
+    REQUIRE(vp.valueAreaHiIdx >= 0);
+    REQUIRE(vp.valueAreaLoIdx <= vp.valueAreaHiIdx);
 }

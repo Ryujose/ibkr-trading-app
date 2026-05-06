@@ -395,6 +395,10 @@ void IBKRClient::PlaceOrder(const ::core::Order& o) {
 
         if (o.parentId != 0)
             ibOrder.parentId = o.parentId;
+        if (!o.ocaGroup.empty()) {
+            ibOrder.ocaGroup = o.ocaGroup;
+            ibOrder.ocaType  = o.ocaType > 0 ? o.ocaType : 1;
+        }
         ibOrder.transmit = o.transmit;
 
         m_client->placeOrder(o.orderId, c, ibOrder);
@@ -980,6 +984,18 @@ void IBKRClient::openOrder(OrderId orderId, const Contract& c,
     order.trailStopPrice  = (o.trailStopPrice  != UNSET_DOUBLE) ? o.trailStopPrice  : 0.0;
     order.lmtPriceOffset  = (o.lmtPriceOffset  != UNSET_DOUBLE) ? o.lmtPriceOffset  : 0.0;
     order.outsideRth      = o.outsideRth;
+
+    // Preserve OCA / parent / routing fields so g_liveOrders stays accurate
+    // for in-place modifications. Without these, modifying a bracket STP/TP
+    // resends ocaGroup="" and IB rejects with 10327 ("OCA group type
+    // revision is not allowed") because dropping group membership counts as
+    // a revision.
+    order.ocaGroup = o.ocaGroup;
+    order.ocaType  = o.ocaType;
+    order.parentId = static_cast<int>(o.parentId);
+    order.account  = o.account;
+    order.exchange = c.exchange;
+    order.transmit = o.transmit;
 
     order.commission  = (s.commissionAndFees != UNSET_DOUBLE) ? s.commissionAndFees : 0.0;
     order.status      = ParseStatus(s.status);

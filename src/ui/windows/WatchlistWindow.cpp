@@ -260,6 +260,104 @@ void WatchlistWindow::DeletePreset(int idx) {
 }
 
 // ============================================================================
+// Export / Import
+// ============================================================================
+
+static std::string exportsDirPath() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    return std::string(home) + "/.config/ibkr-trading-app/exports";
+}
+
+void WatchlistWindow::ExportCurrentTab(const std::string& filename) {
+    if (m_activeTab < 0 || m_activeTab >= (int)m_watchlists.size()) return;
+    const auto& wl = m_watchlists[m_activeTab];
+    std::string dir = exportsDirPath();
+    std::filesystem::create_directories(dir);
+    std::string fullPath = dir + "/" + filename;
+    if (fullPath.size() < 4 || fullPath.substr(fullPath.size() - 4) != ".csv")
+        fullPath += ".csv";
+    std::ofstream f(fullPath);
+    if (!f.is_open()) return;
+    for (const auto& it : wl.items)
+        f << it.symbol << ',' << it.secType << ','
+          << it.primaryExch << ',' << it.currency << ','
+          << it.conId << ',' << it.description << '\n';
+}
+
+void WatchlistWindow::ImportFromFile(const std::string& filename, int newTab) {
+    std::string dir = exportsDirPath();
+    std::string fullPath = dir + "/" + filename;
+    if (fullPath.size() < 4 || fullPath.substr(fullPath.size() - 4) != ".csv")
+        fullPath += ".csv";
+    std::ifstream f(fullPath);
+    if (!f.is_open()) return;
+
+    core::Watchlist newWl;
+    newWl.name = filename;
+    // Strip .csv suffix for the tab name
+    if (newWl.name.size() > 4 &&
+        newWl.name.substr(newWl.name.size() - 4) == ".csv")
+        newWl.name.resize(newWl.name.size() - 4);
+    if (newWl.name.empty()) newWl.name = "Imported";
+
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        core::WatchlistItem item;
+        if (line.find(',') != std::string::npos) {
+            // Full CSV: symbol,secType,primaryExch,currency,conId,description
+            std::istringstream is(line);
+            std::string field;
+            auto next = [&]() -> std::string {
+                std::string v;
+                if (!std::getline(is, v, ',')) v.clear();
+                return v;
+            };
+            item.symbol       = next();
+            item.secType      = next();
+            item.primaryExch  = next();
+            item.currency     = next();
+            item.conId        = std::stoi(next());
+            item.description  = next();
+        } else {
+            // Plain symbol per line
+            item.symbol = line;
+            // Remove trailing \r (Windows line endings)
+            if (!item.symbol.empty() && item.symbol.back() == '\r')
+                item.symbol.pop_back();
+        }
+        if (item.symbol.empty()) continue;
+        if (item.currency.empty()) item.currency = "USD";
+        newWl.items.push_back(std::move(item));
+    }
+
+    if (newWl.items.empty()) return;
+
+    if (newTab) {
+        m_watchlists.push_back(std::move(newWl));
+        m_activeTab = (int)m_watchlists.size() - 1;
+    } else {
+        auto& cur = m_watchlists[m_activeTab];
+        for (auto& it : newWl.items)
+            cur.items.push_back(std::move(it));
+    }
+
+    // Subscribe all new items and queue contract-detail enrichment for
+    // items missing a conId or description.
+    auto& target = newTab ? m_watchlists.back() : m_watchlists[m_activeTab];
+    int startIdx = newTab ? 0 : (int)target.items.size() - (int)newWl.items.size();
+    for (int i = startIdx; i < (int)target.items.size(); ++i) {
+        auto& it = target.items[i];
+        int slot = AllocSlot();
+        if (slot < 0) break;
+        SubscribeItem(it, slot);
+        if (it.conId == 0 || it.description.empty())
+            m_cdQueue.push_back(it.symbol);
+    }
+}
+
+// ============================================================================
 // Tick callbacks
 // ============================================================================
 void WatchlistWindow::OnTickPrice(int reqId, int field, double price) {
@@ -683,6 +781,23 @@ void WatchlistWindow::DrawToolbar() {
             if (ImGui::Button("Delete##wldel", ImVec2(em(56), 0)))
                 DeletePreset(m_activePreset);
         }
+
+        prow.item(em(62));
+        if (ImGui::Button("Export##wlexp", ImVec2(em(62), 0))) {
+            std::strncpy(m_exportNameBuf, m_watchlists[m_activeTab].name.c_str(),
+                         sizeof(m_exportNameBuf) - 1);
+            m_exportNameBuf[sizeof(m_exportNameBuf) - 1] = '\0';
+            m_exportPopupOpen = true;
+        }
+        ImGui::SetItemTooltip("Export the active tab to a CSV file.");
+
+        prow.item(em(62));
+        if (ImGui::Button("Import##wlimp", ImVec2(em(62), 0))) {
+            std::memset(m_importNameBuf, 0, sizeof(m_importNameBuf));
+            m_importNewTab = 1;
+            m_importPopupOpen = true;
+        }
+        ImGui::SetItemTooltip("Import symbols from a CSV file into a new or current tab.");
     }
 
     // Save As modal
@@ -713,6 +828,71 @@ void WatchlistWindow::DrawToolbar() {
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel##wlcancelbtn"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // Export modal
+    if (m_exportPopupOpen) {
+        ImGui::OpenPopup("Export##wlexppop");
+        m_exportPopupOpen = false;
+    }
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(em(280), 0), ImGuiCond_Always);
+    if (ImGui::BeginPopupModal("Export##wlexppop", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Export active tab to CSV");
+        ImGui::TextDisabled("Saved to ~/.config/ibkr-trading-app/exports/");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Filename:");
+        ImGui::SetNextItemWidth(em(200));
+        bool confirm = ImGui::InputText("##wlexpname", m_exportNameBuf,
+                                        sizeof(m_exportNameBuf),
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        if (confirm || ImGui::Button("Export##wlexpbtn")) {
+            if (m_exportNameBuf[0] != '\0') {
+                ExportCurrentTab(m_exportNameBuf);
+                std::memset(m_exportNameBuf, 0, sizeof(m_exportNameBuf));
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##wlexpcancel"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // Import modal
+    if (m_importPopupOpen) {
+        ImGui::OpenPopup("Import##wlimppop");
+        m_importPopupOpen = false;
+    }
+    ImGui::SetNextWindowPos(center, ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(em(280), 0), ImGuiCond_Always);
+    if (ImGui::BeginPopupModal("Import##wlimppop", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Import symbols from CSV");
+        ImGui::TextDisabled("Reads from ~/.config/ibkr-trading-app/exports/");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Filename:");
+        ImGui::SetNextItemWidth(em(200));
+        bool confirm = ImGui::InputText("##wlimpname", m_importNameBuf,
+                                        sizeof(m_importNameBuf),
+                                        ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::Spacing();
+        ImGui::RadioButton("New tab", &m_importNewTab, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("Append to current", &m_importNewTab, 0);
+        ImGui::Spacing();
+        if (confirm || ImGui::Button("Import##wlimpbtn")) {
+            if (m_importNameBuf[0] != '\0') {
+                ImportFromFile(m_importNameBuf, m_importNewTab);
+                std::memset(m_importNameBuf, 0, sizeof(m_importNameBuf));
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##wlimpcancel"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }

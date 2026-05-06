@@ -74,6 +74,7 @@ struct StylePreset {
     // IndicatorSettings overrides (only VWAP-related differ across modes today)
     bool indVwap;
     bool indVwapBands;
+    bool indVolumeProfile;   // Phase 15 — horizontal volume-by-price histogram
     int  smaPeriod1;    // fast SMA
     int  smaPeriod2;    // slow SMA
 
@@ -85,6 +86,16 @@ struct StylePreset {
     double stopOffset;
     double riskPct;
     bool   useStopLmt;
+
+    // Setup confluence gates (Phase 15b)
+    bool   trendAlign;
+    bool   vwapContext;
+    bool   marketHealth;
+    bool   rsiFilter;
+    bool   volumeConfluence;
+    bool   multiTarget;
+    double mhMaxCounterPct;
+    double t2SplitPct;
 };
 
 // The four canonical presets. Pure data — no allocation.
@@ -112,6 +123,7 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     false,
+                /*indVolumeProfile*/ false,
                 /*smaPeriod1*/       9,
                 /*smaPeriod2*/       20,
                 /*setupOverlay*/     false,
@@ -121,6 +133,14 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*stopOffset*/       0.05,
                 /*riskPct*/          0.5,
                 /*useStopLmt*/       true,
+                /*trendAlign*/       true,
+                /*vwapContext*/      false,
+                /*marketHealth*/     true,
+                /*rsiFilter*/        false,
+                /*volumeConfluence*/ false,
+                /*multiTarget*/      false,
+                /*mhMaxCounterPct*/  0.3,
+                /*t2SplitPct*/       50.0,
             };
         case TradingStyle::DayTrading:
             return StylePreset{
@@ -144,6 +164,7 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     true,
+                /*indVolumeProfile*/ true,
                 /*smaPeriod1*/       20,
                 /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
@@ -153,6 +174,14 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*stopOffset*/       0.07,
                 /*riskPct*/          0.75,
                 /*useStopLmt*/       true,
+                /*trendAlign*/       true,
+                /*vwapContext*/      true,
+                /*marketHealth*/     true,
+                /*rsiFilter*/        false,
+                /*volumeConfluence*/ true,
+                /*multiTarget*/      true,
+                /*mhMaxCounterPct*/  0.5,
+                /*t2SplitPct*/       50.0,
             };
         case TradingStyle::Swing:
             return StylePreset{
@@ -176,6 +205,7 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          false,
                 /*indVwapBands*/     false,
+                /*indVolumeProfile*/ true,
                 /*smaPeriod1*/       20,
                 /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
@@ -185,6 +215,14 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*stopOffset*/       0.10,
                 /*riskPct*/          1.0,
                 /*useStopLmt*/       true,
+                /*trendAlign*/       true,
+                /*vwapContext*/      false,
+                /*marketHealth*/     true,
+                /*rsiFilter*/        true,
+                /*volumeConfluence*/ true,
+                /*multiTarget*/      true,
+                /*mhMaxCounterPct*/  1.0,
+                /*t2SplitPct*/       50.0,
             };
         case TradingStyle::Investment:
             return StylePreset{
@@ -208,6 +246,7 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          false,
                 /*indVwapBands*/     false,
+                /*indVolumeProfile*/ false,
                 /*smaPeriod1*/       50,
                 /*smaPeriod2*/       200,
                 /*setupOverlay*/     false,
@@ -217,6 +256,14 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*stopOffset*/       0.25,
                 /*riskPct*/          1.5,
                 /*useStopLmt*/       true,
+                /*trendAlign*/       true,
+                /*vwapContext*/      false,
+                /*marketHealth*/     true,
+                /*rsiFilter*/        false,
+                /*volumeConfluence*/ false,
+                /*multiTarget*/      false,
+                /*mhMaxCounterPct*/  2.0,
+                /*t2SplitPct*/       50.0,
             };
         case TradingStyle::Free:
             // Construction-default baseline. Switching INTO Free preserves
@@ -247,6 +294,7 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*trendChannel*/     false,
                 /*indVwap*/          true,
                 /*indVwapBands*/     false,
+                /*indVolumeProfile*/ false,
                 /*smaPeriod1*/       20,
                 /*smaPeriod2*/       50,
                 /*setupOverlay*/     false,
@@ -256,6 +304,14 @@ inline StylePreset GetPreset(TradingStyle s) {
                 /*stopOffset*/       0.10,
                 /*riskPct*/          1.0,
                 /*useStopLmt*/       true,
+                /*trendAlign*/       false,
+                /*vwapContext*/      false,
+                /*marketHealth*/     false,
+                /*rsiFilter*/        false,
+                /*volumeConfluence*/ false,
+                /*multiTarget*/      false,
+                /*mhMaxCounterPct*/  0.5,
+                /*t2SplitPct*/       50.0,
             };
     }
     return GetPreset(TradingStyle::Swing);  // unreachable, keeps compilers quiet
@@ -290,10 +346,11 @@ inline void ApplyPreset(const StylePreset& p,
     a.scanCap      = p.scanCap;
     a.trendChannel = p.trendChannel;
 
-    ind.vwap       = p.indVwap;
-    ind.vwapBands  = p.indVwapBands;
-    ind.smaPeriod1 = p.smaPeriod1;
-    ind.smaPeriod2 = p.smaPeriod2;
+    ind.vwap          = p.indVwap;
+    ind.vwapBands     = p.indVwapBands;
+    ind.volumeProfile = p.indVolumeProfile;
+    ind.smaPeriod1    = p.smaPeriod1;
+    ind.smaPeriod2    = p.smaPeriod2;
 
     s.overlay     = p.setupOverlay;
     s.rrMin       = p.rrMin;
@@ -302,6 +359,15 @@ inline void ApplyPreset(const StylePreset& p,
     s.stopOffset  = p.stopOffset;
     s.riskPct     = p.riskPct;
     s.useStopLmt  = p.useStopLmt;
+
+    s.trendAlign       = p.trendAlign;
+    s.vwapContext      = p.vwapContext;
+    s.marketHealth     = p.marketHealth;
+    s.rsiFilter        = p.rsiFilter;
+    s.volumeConfluence = p.volumeConfluence;
+    s.multiTarget      = p.multiTarget;
+    s.mhMaxCounterPct  = p.mhMaxCounterPct;
+    s.t2SplitPct       = p.t2SplitPct;
 }
 
 }  // namespace core::services
