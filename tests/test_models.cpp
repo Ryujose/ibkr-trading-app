@@ -191,3 +191,16 @@ TEST_CASE("Bar struct fields are zero-initialised by default", "[bar][defaults]"
     REQUIRE(b.close     == 0.0);
     REQUIRE(b.volume    == 0.0);
 }
+
+// ── PendingBracketStop defaults ──────────────────────────────────────────────
+
+TEST_CASE("PendingBracketStop struct has sane defaults", "[bracket][defaults]") {
+    core::PendingBracketStop p;
+    REQUIRE(p.symbol.empty());
+    REQUIRE(p.stopSide   == core::OrderSide::Buy);
+    REQUIRE(p.qty        == 0.0);
+    REQUIRE(p.stopPrice  == 0.0);
+    REQUIRE(p.tpPrice    == 0.0);
+    REQUIRE(p.outsideRth == false);
+    REQUIRE(p.useStopLmt == false);
+}

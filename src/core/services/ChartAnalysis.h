@@ -465,6 +465,29 @@ inline double RoundToTick(double price, double tick = 0.01) {
     return std::round(price / tick) * tick;
 }
 
+// ─── Historical-data ratchet ─────────────────────────────────────────────────
+// Safety check: should a new BarSeries replace the existing in-memory series?
+// Rejects three obviously-broken replacements:
+//   1. Empty completion on a chart that already has bars (keepUpToDate reset)
+//   2. Symbol mismatch (stale response from a previous subscription)
+//   3. Tiny replacement (≤5 bars) when the chart has substantial data (≥50 bars)
+//      — catches IB keepUpToDate mid-session resets that deliver a 1-bar stub.
+inline bool ShouldReplaceHistoricalBars(std::size_t existingCount,
+                                         const std::string& existingSymbol,
+                                         const std::string& newSymbol,
+                                         std::size_t newCount) {
+    // Empty completion on existing data
+    if (newCount == 0 && existingCount > 0) return false;
+    // Symbol mismatch (but only when the chart already owns real data — a fresh
+    // chart with an empty existing symbol accepts any incoming symbol)
+    if (newCount > 0 && !existingSymbol.empty() && !newSymbol.empty() &&
+        newSymbol != existingSymbol)
+        return false;
+    // Data-loss ratchet: existing ≥ 50, new ≤ 5
+    if (existingCount >= 50 && newCount <= 5) return false;
+    return true;
+}
+
 // ─── Round-number avoidance (SL-hunter defense) ─────────────────────────────
 // Stops cluster at .00 / .25 / .50 / .75 marks because retail stops do too.
 // Adjust `price` so it is at least `pad` dollars away from the nearest mark.

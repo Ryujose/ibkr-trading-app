@@ -65,13 +65,7 @@ public:
     // ---- Bracket: pending STP stop-loss + optional TP take-profit, both
     // submitted as an OCA pair when the LMT entry fills. tpPrice == 0 means
     // no take-profit leg (legacy stop-only bracket).
-    struct PendingBracketStop {
-        std::string  symbol;
-        core::OrderSide stopSide;
-        double       qty       = 0.0;
-        double       stopPrice = 0.0;
-        double       tpPrice   = 0.0;   // take-profit limit; 0 = no TP leg
-    };
+    using PendingBracketStop = core::PendingBracketStop;
 
     ChartWindow();
 
@@ -294,6 +288,7 @@ private:
     bool              m_useRTH          = false;  // false = include extended hours
     bool              m_showOvernight   = false;  // show overnight bars (separate toggle)
     bool              m_showSessions    = true;   // draw session background bands
+    bool              m_showLegend      = true;   // show ImPlot legend (toggleable for visibility)
 
     core::services::TradingStyle m_tradingStyle = core::services::TradingStyle::Swing;
 
@@ -360,9 +355,12 @@ private:
     SetupSettings          m_setupSettings;
     SetupPlan              m_setup;
 
-    int   m_hoverIdx          = -1;
-    float m_chartHeightRatio  = 0.60f;
-    float m_volumeHeightRatio = 0.20f;
+    int   m_hoverIdx           = -1;
+    float m_chartHeightRatio   = 0.60f;
+    float m_volumeHeightRatio  = 0.20f;
+    float m_rsiHeightRatio     = 0.20f;  // draggable RSI sub-plot height
+    float m_cachedVolumeH      = 0.0f;   // pixel height allocated for volume this frame
+    float m_cachedRsiH         = 0.0f;   // pixel height allocated for RSI this frame
 
     // ---- Extend-history state -----------------------------------------------
     bool  m_loadingMore    = false;   // extend request in flight
