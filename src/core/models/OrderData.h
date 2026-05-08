@@ -133,4 +133,18 @@ inline const char* OrderStatusStr(OrderStatus s) {
     }
 }
 
+// ============================================================================
+// PendingBracketStop — bracket stop-loss / take-profit parameters staged at
+// entry-fill time.  Moved here from ChartWindow.h so it can be unit-tested.
+// ============================================================================
+struct PendingBracketStop {
+    std::string  symbol;
+    OrderSide    stopSide    = OrderSide::Buy;
+    double       qty         = 0.0;
+    double       stopPrice   = 0.0;
+    double       tpPrice     = 0.0;   // take-profit limit; 0 = no TP leg
+    bool         outsideRth  = false; // allow fill outside RTH once stop triggers
+    bool         useStopLmt  = false; // STP LMT instead of STP (safer outside RTH)
+};
+
 }  // namespace core

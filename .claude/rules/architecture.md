@@ -64,7 +64,7 @@ Vectors: `g_chartEntries`, `g_tradingEntries`, `g_scannerEntries`, `g_newsEntrie
 Spawn helpers: `SpawnChartWindow(idx)`, `SpawnTradingWindow(idx)`, `SpawnScannerWindow(idx)`, `SpawnNewsWindow(idx)` — create the window, wire all callbacks with `idx` capture, push to the vector.
 
 **ReqId layout (no overlaps, 10 instances each):**
-- Chart hist: 1,3,5,7,9,11,13,15,17,19 · ext: 2,4,6,8,10,12,14,16,18,20 · mkt: 100-109 (initial slot; rotates through 10000-10999 on each symbol change — see "Chart mktId rotation" below)
+- Chart hist: 1,3,5,7,9,11,13,15,17,19 (initial slot; rotates through 12000-12999 on every cancel→reissue cycle) · ext: 2,4,6,8,10,12,14,16,18,20 (initial slot; rotates through 13000-13999) · mkt: 100-109 (initial slot; rotates through 10000-10999 on each symbol change — see "Chart mktId/histId/extId rotation" below)
 - Trading mkt: 110-119 · depth: 120-129 · tick-by-tick: 130-139
 - Futures /ES,/NQ (front-month): 140-141 · /ES,/NQ (Dec): 142-143 (market health)
 - Scanner scan: 1000,1100,...,1900 (+99 each) · mkt: 800,812,...,908 (+12 each)
@@ -404,18 +404,23 @@ The confirmation popup (when `Transmit Instantly` is off or Ctrl+click) renders 
 ## Window Groups & Symbol Sync
 
 `src/core/models/WindowGroup.h` provides:
-- `GroupState { int id; std::string symbol; }` — active symbol per group (4 slots)
+- `kNumGroups = 10` — number of sync groups (matches `kMaxMultiWin`)
+- `GroupState { int id; std::string symbol; }` — active symbol per group (10 slots)
 - `WindowPreset` — visibility + group snapshot for all windows
-- `DrawGroupPicker(int& groupId, const char* popupId)` — renders the `G1`/`G-` button + popup
+- `DrawGroupPicker(int& groupId, const char* popupId)` — renders the `G1`/`G-` button + popup with G1–G10 options
+- Group ids are clamped to `[1, kNumGroups]` in all `Spawn*` functions via `(idx % kNumGroups) + 1`
 
 `BroadcastGroupSymbol(int groupId, const std::string& sym)` in `main.cpp`:
+- Guard: `groupId > kNumGroups` upper-bound check prevents out-of-bounds access to `g_groups[]`
 - Guard: `g_groupSyncInProgress` prevents re-entrant loops
 - For chart entries: calls `win->SetSymbol(sym)` → fires `OnDataRequest` → `ReqChartData`
 - For trading entries: calls `ApplyTradingSymbol(te, sym)` — updates display AND re-subscribes IB mkt data + depth
 - For news entries: calls `win->SetSymbol(sym)` → switches to Stock tab
+- TWS display group sync only covers G1–G4 (IB's fixed limit); G5–G10 are app-local only
 
-Default group assignment: instance N → group N (e.g. Chart 1 / Order Book 1 / Scanner 1 / News 1 all start in G1).
-Group picker button (`G1`–`G4` / `G-`) is the leftmost item in every window's toolbar.
+Default group assignment: instance N → group `(N % 10) + 1`.
+Group picker button (`G1`–`G10` / `G-`) is the leftmost item in every window's toolbar.
+`OnDataRequest` callback is suppressed during `FinishConnect` chart-modes restore to prevent cascading group broadcasts during initial load.
 
 ## TradingWindow Layout
 
@@ -496,3 +501,52 @@ Per instance N (0–9): base = 11000 + N×100
 - **Group-time-sync**: `BroadcastReplayCursor()` with 100ms throttle per group, `g_replayCursorSyncInProgress` guard
 - **Persistence**: `~/.config/ibkr-trading-app/replay-windows.cfg` — atomic `.tmp`+`rename`, per-second flush, restore on `FinishConnect`
 - **Safety**: `ReplayWindow` holds no `IBKRClient` pointer; all orders go through `OnPaperOrderSubmit` → engine
+
+## Bracket After-Hours Guard
+
+When a bracket order (entry LMT + STP stop-loss + TP take-profit) is placed outside regular trading hours (09:30–16:00 ET), IB does not trigger the stop condition. The position would be unguarded until the next RTH open.
+
+**Detection**: `core::BarSession(std::time(nullptr))` checks current session at bracket fire time (both confirmation popup and transmit-instantly paths).
+
+**Behavior outside RTH**:
+1. Confirmation popup shows an orange warning: *"IB does not trigger stop orders outside regular trading hours..."*
+2. Stop type auto-switches from `STP` to `STP LMT` (`useStopLmt = true` in `core::PendingBracketStop`)
+3. Stop limit offset = `stopPrice * 0.001` rounded via `core::services::RoundToTick(raw, 0.01)` to the penny grid (prevents IB error 110)
+4. `outsideRth = false` on the stop leg (stop condition only triggers during RTH regardless)
+5. `outsideRth = true` on the TP leg (limit orders can fill outside RTH)
+6. During regular hours — behavior is unchanged (plain STP with `outsideRth = false`)
+
+`core::PendingBracketStop` struct moved from `ChartWindow.h` to `core/models/OrderData.h` with 7 fields including `outsideRth` and `useStopLmt` (both default `false`). Unit-tested in `test_models.cpp`.
+
+## Historical Data Safety Net
+
+`core::services::ShouldReplaceHistoricalBars(existingCount, existingSymbol, newSymbol, newCount) → bool` in `ChartAnalysis.h` — pure function used by `ChartWindow::SetHistoricalData` to reject three classes of broken replacement:
+
+1. **Empty completion on existing data** — keepUpToDate reset sends `done=true` with no bars
+2. **Symbol mismatch** — stale response from a previous subscription (backstops histId rotation)
+3. **Data-loss ratchet** — existing ≥ 50 bars, new ≤ 5 bars → rejected (catches keepUpToDate mid-session resets delivering a 1-bar stub)
+
+Full Catch2 coverage in `test_chart_analysis.cpp` (6 cases / 16 assertions).
+
+## Chart Sub-Plot Splitters
+
+Two draggable splitter bars (same style as TradingWindow's panel splitters) between:
+- **Price chart ↔ Volume** — adjusts `m_volumeHeightRatio` (clamped 5%–50%)
+- **Volume ↔ RSI** — adjusts `m_rsiHeightRatio` (clamped 5%–40%)
+
+5px `InvisibleButton` with `ImGuiButtonFlags_MouseButtonLeft`, background rect (grey → white-grey on hover/drag), `ImGuiMouseCursor_ResizeNS` cursor. Heights are pre-computed in `DrawCandleChart()` and stored in `m_cachedVolumeH` / `m_cachedRsiH` for consistent sub-plot sizing.
+
+**Legend toggle**: `m_showLegend` checkbox in toolbar (next to "Sessions") — hides the ImPlot legend box without removing indicators. Uses `ImPlotFlags_NoLegend`.
+
+## TradingWindow DOM — Click-to-Trade, Last-Price Highlight, Legend
+
+**Click-to-trade**: Moved from full-row `MouseClicked[0]` hack to a proper `InvisibleButton` overlaid on the price text in column 2. `PushID(rowSeq++)` / `PopID()` per row prevents ID conflicts with multi-venue L2 data. Clicking an ask price places a BUY limit, clicking a bid price places a SELL limit.
+
+**Last-price highlight**: `m_lastPrice` updated from `OnTick()` and `OnTickByTick()`, cleared on `SetSymbol()`. Any DOM row within ±$0.005 of the last traded price renders in gold with a ` *` suffix.
+
+**Ladder legend**: Compact color-coded legend below the submit button showing:
+- Green = Bid depth (resting buy orders)
+- Red = Ask depth (resting sell orders)
+- Blue = Executed volume (actual trades today)
+
+**Futures health fix**: `OnFuturesTick` now only accepts LAST (field 4) for the displayed price — BID (1) and ASK (2) no longer contaminate the value. `DrawFuturesItem` shows price-only when prevClose hasn't arrived yet, avoiding bogus `+29158.75 (0.00%)` reads.

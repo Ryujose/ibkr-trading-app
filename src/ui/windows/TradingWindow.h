@@ -117,6 +117,7 @@ private:
     char   m_symbol[32]   = "AAPL";
     double m_midPrice     = 0.0;
     double m_prevMidPrice = 0.0;
+    double m_lastPrice    = 0.0;   // last traded price (for DOM row highlight)
 
     // ── Position tracking (updated from OnFill) ──────────────────────────────
     double m_positionQty   = 0.0;   // + = long, - = short, 0 = flat

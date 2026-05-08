@@ -221,6 +221,7 @@ void TradingWindow::OnDepthError(int code) {
 }
 
 void TradingWindow::OnTick(double price, double size, bool isUptick) {
+    if (price > 0.0) m_lastPrice = price;
     core::Tick t;
     t.price     = price;
     t.size      = size;
@@ -239,6 +240,7 @@ void TradingWindow::OnTick(double price, double size, bool isUptick) {
 }
 
 void TradingWindow::OnTickByTick(const core::Tick& tick) {
+    if (tick.price > 0.0) m_lastPrice = tick.price;
     m_ticks.push_front(tick);
     if ((int)m_ticks.size() > kMaxTicks) m_ticks.pop_back();
     if (tick.size > m_maxTickSize) m_maxTickSize = tick.size;
@@ -261,6 +263,7 @@ void TradingWindow::SetSymbol(const std::string& symbol, double midPrice) {
     m_symbol[sizeof(m_symbol) - 1] = '\0';
     m_prevMidPrice    = midPrice;
     m_midPrice        = midPrice;
+    m_lastPrice       = 0.0;
     m_bids.clear();
     m_asks.clear();
     m_askBuckets.clear();
@@ -717,39 +720,28 @@ void TradingWindow::DrawOrderBook() {
         ImGui::Dummy(ImVec2(cw, bh));
     };
 
-    // ── Per-row overlay: hover highlight, click-to-trade, DOM order tint ──────
+    // ── Per-row overlay: hover highlight, DOM order tint, volume tooltip ─────
     // Call at column 0 before rendering any text in that row.
-    auto RowOverlay = [&](double rowPrice, bool isAskRow) {
+    //  tag: 'a' = ask-side row, 'b' = bid-side row, 'm' = mid/spread row
+    // Click-to-trade is handled separately in the Price column so only a click
+    // on the price itself fires an order (not on the BidSz / AskSz columns).
+    auto RowOverlay = [&](double rowPrice, char tag) {
+        bool isAskRow = (tag == 'a');
         ImDrawList* ldl = ImGui::GetWindowDrawList();
         float ry = ImGui::GetCursorScreenPos().y;
         ImVec2 wMin = ImGui::GetWindowPos();
         float  wW   = ImGui::GetWindowSize().x;
-        // IsMouseHoveringRect respects the current clip rect, so rows that have
-        // scrolled outside the ##dom table viewport correctly return false even
-        // when their absolute Y happens to coincide with a header widget (e.g.
-        // the Click-to-Trade checkbox).  The raw-coordinate check that was here
-        // before had no knowledge of the scroll clip rect and caused an accidental
-        // PlaceDomOrder when the checkbox was pressed while the table was scrolled.
-        // clip=false: ignore the current column clip rect so the rect test spans
-        // the full row width, not just column 0 (where RowOverlay is called from).
+
         bool hovered = panelHovered &&
                        ImGui::IsMouseHoveringRect(ImVec2(wMin.x, ry),
                                                   ImVec2(wMin.x + wW, ry + rowH),
                                                   false);
 
-        if (m_clickToTrade && rowPrice > 0.0) {
-            if (hovered) {
-                ImU32 hCol = isAskRow ? IM_COL32(80, 20, 20, 70)
-                                       : IM_COL32(20, 80, 30, 70);
-                ldl->AddRectFilled(ImVec2(wMin.x, ry),
-                                   ImVec2(wMin.x + wW, ry + rowH), hCol);
-                // Guard with !IsAnyItemActive(): the Checkbox widget sets ActiveId on
-                // mouse-PRESS but toggles its bool on mouse-RELEASE (one frame later).
-                // Without this guard, unchecking the checkbox while the table is
-                // scrolled fires PlaceDomOrder on the same frame as the press.
-                if (ImGui::GetIO().MouseClicked[0] && !ImGui::IsAnyItemActive())
-                    PlaceDomOrder(isAskRow, rowPrice);  // ask row → BUY, bid row → SELL
-            }
+        if (m_clickToTrade && rowPrice > 0.0 && hovered) {
+            ImU32 hCol = isAskRow ? IM_COL32(80, 20, 20, 70)
+                                   : IM_COL32(20, 80, 30, 70);
+            ldl->AddRectFilled(ImVec2(wMin.x, ry),
+                               ImVec2(wMin.x + wW, ry + rowH), hCol);
         }
 
         // DOM order tint (amber = working, green/red fade = filled)
@@ -800,6 +792,24 @@ void TradingWindow::DrawOrderBook() {
         return nullptr;
     };
 
+    // ── Price-column click-to-trade ───────────────────────────────────────────
+    // Renders an invisible button at the current cursor position without
+    // disrupting subsequent text layout (saves/restores cursor Y).
+    int priceClickSeq = 0;
+    auto PriceClickCell = [&](double price, bool isBuy) {
+        if (m_clickToTrade && price > 0.0) {
+            ImVec2 savePos = ImGui::GetCursorPos();
+            float  colW    = ImGui::GetContentRegionAvail().x;
+            ImGui::PushID(priceClickSeq++);
+            ImGui::InvisibleButton("##priceclick", ImVec2(colW, rowH),
+                                   ImGuiButtonFlags_MouseButtonLeft);
+            ImGui::PopID();
+            ImGui::SetCursorPos(savePos);  // restore so text renders on top
+            if (ImGui::IsItemClicked(0))
+                PlaceDomOrder(isBuy, price);
+        }
+    };
+
     // ── DOM table ─────────────────────────────────────────────────────────────
     ImGuiTableFlags tflags =
         ImGuiTableFlags_BordersInnerV |
@@ -835,9 +845,10 @@ void TradingWindow::DrawOrderBook() {
             best ? IM_COL32(100, 22, 22, 110) : IM_COL32(70, 18, 18, 70));
 
         ImGui::TableSetColumnIndex(0);
-        RowOverlay(lvl.price, true);  // Col 0: empty on ask side; use for overlay
+        RowOverlay(lvl.price, 'a');  // ask row
 
         ImGui::TableSetColumnIndex(2);
+        PriceClickCell(lvl.price, true);  // click ask price → BUY
         {
             const char* sr = srTag(lvl.price);
             if (sr) {
@@ -849,11 +860,13 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::PopStyleColor();
                 ImGui::SameLine(0.f, 2.f);
             }
-            ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+            bool isLast = (m_lastPrice > 0.0 && std::abs(lvl.price - m_lastPrice) < 0.005);
+            ImGui::PushStyleColor(ImGuiCol_Text, isLast ? ImVec4(1.0f, 0.85f, 0.2f, 1.f)
+                                  : best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
             if (m_useL2 && !lvl.exchange.empty())
-                ImGui::Text("%.2f [%s]", lvl.price, lvl.exchange.c_str());
+                ImGui::Text("%.2f [%s]%s", lvl.price, lvl.exchange.c_str(), isLast ? " *" : "");
             else
-                ImGui::Text("%.2f", lvl.price);
+                ImGui::Text("%.2f%s", lvl.price, isLast ? " *" : "");
             ImGui::PopStyleColor();
         }
 
@@ -892,7 +905,7 @@ void TradingWindow::DrawOrderBook() {
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                     ImGui::TableSetColumnIndex(0);
-                    RowOverlay(price, m_sideIdx == 0);
+                    RowOverlay(price, 'm');
                     ImGui::TableSetColumnIndex(2);
                     {
                         const char* sr = srTag(price);
@@ -931,7 +944,7 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::TableNextRow();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                 ImGui::TableSetColumnIndex(0);
-                RowOverlay(midP, m_sideIdx == 0);
+                RowOverlay(midP, 'm');
                 ImGui::TableSetColumnIndex(2);
                 ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
                 ImGui::Text("spread $%.2f (%d ticks)", spreadVal, nSpread + 1);
@@ -956,7 +969,7 @@ void TradingWindow::DrawOrderBook() {
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(50, 15, 15, 50));
             ImGui::TableSetColumnIndex(0);
-            RowOverlay(price, true);
+            RowOverlay(price, 'a');
             ImGui::TableSetColumnIndex(2);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.35f, 0.35f, 1.f));
             ImGui::Text("%.2f", price);
@@ -977,7 +990,7 @@ void TradingWindow::DrawOrderBook() {
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(100, 22, 22, 110));
             ImGui::TableSetColumnIndex(0);
-            RowOverlay(m_nbboAsk, true);
+            RowOverlay(m_nbboAsk, 'a');
             ImGui::TableSetColumnIndex(2);
             ImGui::PushStyleColor(ImGuiCol_Text, kSellRed);
             ImGui::Text("%.2f *", m_nbboAsk);
@@ -1008,7 +1021,7 @@ void TradingWindow::DrawOrderBook() {
                     ImGui::TableNextRow();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                     ImGui::TableSetColumnIndex(0);
-                    RowOverlay(price, m_sideIdx == 0);
+                    RowOverlay(price, 'm');
                     ImGui::TableSetColumnIndex(2);
                     {
                         const char* sr = srTag(price);
@@ -1046,7 +1059,7 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::TableNextRow();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                 ImGui::TableSetColumnIndex(0);
-                RowOverlay(midP, m_sideIdx == 0);
+                RowOverlay(midP, 'm');
                 ImGui::TableSetColumnIndex(2);
                 ImGui::PushStyleColor(ImGuiCol_Text, kNeutral);
                 ImGui::Text("spread $%.2f (%d ticks)", spreadVal, nSpread + 1);
@@ -1062,7 +1075,7 @@ void TradingWindow::DrawOrderBook() {
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(18, 90, 32, 110));
             ImGui::TableSetColumnIndex(0);
-            RowOverlay(m_nbboBid, false);
+            RowOverlay(m_nbboBid, 'b');
             ImGui::PushStyleColor(ImGuiCol_Text, kBuyGreen);
             ImGui::Text("%.0f", m_nbboBidSz);
             ImGui::PopStyleColor();
@@ -1099,7 +1112,7 @@ void TradingWindow::DrawOrderBook() {
             ImGui::TableNextRow();
             ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(15, 50, 18, 50));
             ImGui::TableSetColumnIndex(0);
-            RowOverlay(price, false);
+            RowOverlay(price, 'b');
             ImGui::TableSetColumnIndex(2);
             {
                 const char* sr = srTag(price);
@@ -1155,7 +1168,7 @@ void TradingWindow::DrawOrderBook() {
             best ? IM_COL32(18, 90, 32, 110) : IM_COL32(15, 60, 22, 70));
 
         ImGui::TableSetColumnIndex(0);
-        RowOverlay(lvl.price, false);
+        RowOverlay(lvl.price, 'b');
         ImGui::PushStyleColor(ImGuiCol_Text, col);
         ImGui::Text("%.0f", lvl.size);
         ImGui::PopStyleColor();
@@ -1166,6 +1179,7 @@ void TradingWindow::DrawOrderBook() {
         ImGui::PopStyleColor();
 
         ImGui::TableSetColumnIndex(2);
+        PriceClickCell(lvl.price, false);  // click bid price → SELL
         {
             const char* sr = srTag(lvl.price);
             if (sr) {
@@ -1177,11 +1191,13 @@ void TradingWindow::DrawOrderBook() {
                 ImGui::PopStyleColor();
                 ImGui::SameLine(0.f, 2.f);
             }
-            ImGui::PushStyleColor(ImGuiCol_Text, best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
+            bool isLast = (m_lastPrice > 0.0 && std::abs(lvl.price - m_lastPrice) < 0.005);
+            ImGui::PushStyleColor(ImGuiCol_Text, isLast ? ImVec4(1.0f, 0.85f, 0.2f, 1.f)
+                                  : best ? col : ImVec4(0.82f, 0.82f, 0.85f, 1.f));
             if (m_useL2 && !lvl.exchange.empty())
-                ImGui::Text("%.2f [%s]", lvl.price, lvl.exchange.c_str());
+                ImGui::Text("%.2f [%s]%s", lvl.price, lvl.exchange.c_str(), isLast ? " *" : "");
             else
-                ImGui::Text("%.2f", lvl.price);
+                ImGui::Text("%.2f%s", lvl.price, isLast ? " *" : "");
             ImGui::PopStyleColor();
         }
 
@@ -1576,6 +1592,25 @@ void TradingWindow::DrawOrderEntry() {
             ImGui::PopStyleColor();
         }
     }
+
+    // DOM ladder legend
+    ImGui::Spacing();
+    ImGui::SeparatorText("Ladder");
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 1));
+    auto LegendDot = [](ImU32 col, const char* label) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float  h = ImGui::GetTextLineHeight();
+        dl->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + h - 4, p.y + h - 2), col);
+        ImGui::Dummy(ImVec2(h, 0)); ImGui::SameLine(0, 4);
+        ImGui::TextUnformatted(label);
+    };
+    LegendDot(IM_COL32(35,  170, 65,  220), "Bid depth");
+    LegendDot(IM_COL32(190, 45,  45,  220), "Ask depth");
+    LegendDot(IM_COL32(55,  130, 210, 220), "Executed volume");
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 }
 
 // ============================================================================

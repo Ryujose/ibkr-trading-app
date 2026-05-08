@@ -480,6 +480,7 @@ void IBKRClient::ProcessMessages() {
     // 5 ms time budget per frame: prevents a Level-II depth flood from stalling
     // the render loop. Unprocessed messages are re-queued at the front for the
     // next frame so no data is lost.
+    fprintf(stderr, "[IBKR] ProcessMessages start batch=%zu\n", batch.size()); fflush(stderr);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5);
     std::size_t processed = 0;
 
@@ -638,6 +639,7 @@ void IBKRClient::ProcessMessages() {
                          std::make_move_iterator(m_queue.end()));
         m_queue = std::move(remaining);
     }
+    fprintf(stderr, "[IBKR] ProcessMessages done processed=%zu/%zu\n", processed, batch.size()); fflush(stderr);
 }
 
 // ============================================================================

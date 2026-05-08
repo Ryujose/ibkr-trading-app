@@ -283,6 +283,23 @@ void ChartWindow::AddBar(const core::Bar& bar, bool done) {
 }
 
 void ChartWindow::SetHistoricalData(const core::BarSeries& series) {
+    if (!core::services::ShouldReplaceHistoricalBars(
+            m_series.bars.size(), std::string(m_symbol),
+            series.symbol, series.bars.size())) {
+        if (m_series.bars.size() >= 50 && series.bars.size() <= 5) {
+            fprintf(stderr, "[ChartWindow] SetHistoricalData RATCHET: %s bars=%zu→%zu (rejected)\n",
+                    m_symbol, m_series.bars.size(), series.bars.size());
+            fflush(stderr);
+        }
+        return;
+    }
+    // Diagnostic: log unexpected bar-count drops (still accept the data,
+    // but surface the event so we can trace the root cause live).
+    if (m_series.bars.size() >= 50 && series.bars.size() < m_series.bars.size() / 2) {
+        fprintf(stderr, "[ChartWindow] SetHistoricalData SHRINK: %s bars=%zu→%zu\n",
+                m_symbol, m_series.bars.size(), series.bars.size());
+        fflush(stderr);
+    }
     m_series          = series;
     m_hasRealData     = true;
     m_needsRefresh    = false;
@@ -510,21 +527,49 @@ void ChartWindow::OnFuturesTick(int reqId, int field, double price) {
         hasData      = &m_nqDecHasData;
     } else return;
 
-    if (field == 4 || field == 1 || field == 2) {  // LAST, BID, ASK
+    if (field == 4) {               // LAST — actual traded price
         *pricePtr = price;
         *hasData  = true;
-    } else if (field == 9) {  // PREV CLOSE
+    } else if (field == 9) {        // CLOSE — previous session settlement
         *prevClosePtr = price;
     }
+    // Ignore BID (1), ASK (2), HIGH (6), LOW (7), OPEN (14) — they are not
+    // meaningful for a "current price" display and would cause the shown value
+    // to oscillate between bid/ask/last, making /ES and /NQ prices inconsistent
+    // across charts depending on which tick arrived most recently.
 }
 
 void ChartWindow::RequestNewData() {
+    if (m_series.bars.size() >= 50) {
+        fprintf(stderr, "[ChartWindow] RequestNewData: %s clearing bars=%zu\n",
+                m_symbol, m_series.bars.size());
+        fflush(stderr);
+    }
     m_series = core::BarSeries{};
-    m_xs.clear(); m_opens.clear(); m_highs.clear();
+    m_xs.clear(); m_idxs.clear();
+    m_opens.clear(); m_highs.clear();
     m_lows.clear(); m_closes.clear(); m_volumes.clear();
+    // Indicator arrays — cleared so a render between RequestNewData and the
+    // next ComputeIndicators can't plot stale values from the previous symbol.
+    m_sma1.clear(); m_sma2.clear(); m_ema.clear();
+    m_bbMid.clear(); m_bbUpper.clear(); m_bbLower.clear();
+    m_rsi.clear();
     m_vwap.clear();
     m_vwapSd1Up.clear(); m_vwapSd1Dn.clear();
     m_vwapSd2Up.clear(); m_vwapSd2Dn.clear();
+    m_atr14.clear();
+    m_autoSupports.clear(); m_autoResistances.clear();
+    m_autoTrend = AutoTrend{};
+    m_donchHi.clear(); m_donchLo.clear();
+    m_keltUpper.clear(); m_keltLower.clear();
+    m_breakouts.clear();
+    m_setup = SetupPlan{};
+    m_breakoutSignal = BreakoutDirection::None;
+    m_breakoutLevelIdx = -1;
+    // Reset Y-range so a stale fit from the previous symbol can't make the new
+    // bars render off-screen. InitViewRange will recompute on the next render.
+    m_priceMin = 0.0;
+    m_priceMax = 0.0;
     m_loadingMore    = false;
     m_historyAtStart = false;
 
@@ -591,8 +636,52 @@ bool ChartWindow::Render() {
     DrawInfoBar();
     DrawPositionStrip();
     DrawCandleChart();
+
+    // Draggable splitter between price chart and volume sub-plot.
+    // Same pattern as TradingWindow's panel splitters: invisible button +
+    // background rect that highlights on hover/drag, clamped ratio.
+    if (m_ind.volume) {
+        ImGui::InvisibleButton("##chartvolsplit",
+                               ImVec2(ImGui::GetContentRegionAvail().x, 5.0f),
+                               ImGuiButtonFlags_MouseButtonLeft);
+        if (ImGui::IsItemActive()) {
+            m_volumeHeightRatio = std::clamp(
+                m_volumeHeightRatio - ImGui::GetIO().MouseDelta.y / ImGui::GetWindowHeight(),
+                0.05f, 0.50f);
+        }
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        {
+            ImVec2 p = ImGui::GetItemRectMin(), q = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRectFilled(p, q,
+                (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    ? IM_COL32(160, 160, 160, 255) : IM_COL32(70, 70, 70, 200));
+        }
+    }
+
     if (m_ind.volume) DrawVolumeChart();
-    if (m_ind.rsi)    DrawRsiChart();
+
+    // Draggable splitter between volume and RSI sub-plots
+    if (m_ind.volume && m_ind.rsi) {
+        ImGui::InvisibleButton("##volrsisplit",
+                               ImVec2(ImGui::GetContentRegionAvail().x, 5.0f),
+                               ImGuiButtonFlags_MouseButtonLeft);
+        if (ImGui::IsItemActive()) {
+            m_rsiHeightRatio = std::clamp(
+                m_rsiHeightRatio - ImGui::GetIO().MouseDelta.y / ImGui::GetWindowHeight(),
+                0.05f, 0.40f);
+        }
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        {
+            ImVec2 p = ImGui::GetItemRectMin(), q = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRectFilled(p, q,
+                (ImGui::IsItemHovered() || ImGui::IsItemActive())
+                    ? IM_COL32(160, 160, 160, 255) : IM_COL32(70, 70, 70, 200));
+        }
+    }
+
+    if (m_ind.rsi) DrawRsiChart();
 
     DrawConfirmPopup();
 
@@ -767,6 +856,11 @@ void ChartWindow::DrawToolbar() {
         ImGui::Checkbox("Sessions", &m_showSessions);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Highlight trading session backgrounds");
+
+        row.item(FlexRow::checkboxW("Legend"), 4);
+        ImGui::Checkbox("Legend", &m_showLegend);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Show indicator names on chart (SMA, BB, EMA...)");
     }
 
     // Indicator checkboxes
@@ -2075,6 +2169,23 @@ void ChartWindow::DrawConfirmPopup() {
                 ImGui::Text("R:R         %.2f", reward / risk);
         }
         ImGui::TextDisabled("(Stop + TP submitted as OCA pair on entry fill)");
+
+        // Guard: STOP orders are not triggered by IB outside regular trading
+        // hours.  If the market is currently in pre-market / after-hours /
+        // overnight, the stop-loss leg will sit dormant until the next RTH open
+        // — leaving the position unguarded during extended-hours moves.
+        core::Session nowSes = core::BarSession(std::time(nullptr));
+        if (nowSes != core::Session::Regular) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.2f, 1.0f));
+            ImGui::TextWrapped(
+                "EXTENDED HOURS — IB does not trigger stop orders outside "
+                "regular trading hours (09:30–16:00 ET). The stop-loss leg "
+                "will not execute until the next market open, even if price "
+                "moves past $%.2f after hours.",
+                m_bracketStopPrice);
+            ImGui::PopStyleColor();
+        }
         ImGui::Spacing();
     }
 
@@ -2299,13 +2410,17 @@ void ChartWindow::DrawConfirmPopup() {
             if (m_isBracketConfirm) {
                 int entryId = OnOrderSubmit(o);
                 if (OnBracketEntry) {
-                    OnBracketEntry(entryId, {
-                        m_symbol,
-                        (o.side == core::OrderSide::Buy) ? core::OrderSide::Sell
-                                                         : core::OrderSide::Buy,
-                        o.quantity,
-                        m_bracketStopPrice
-                    });
+                    bool extHours = core::BarSession(std::time(nullptr)) != core::Session::Regular;
+                    core::PendingBracketStop pbs;
+                    pbs.symbol     = m_symbol;
+                    pbs.stopSide   = (o.side == core::OrderSide::Buy) ? core::OrderSide::Sell
+                                                                      : core::OrderSide::Buy;
+                    pbs.qty        = o.quantity;
+                    pbs.stopPrice  = m_bracketStopPrice;
+                    pbs.tpPrice    = 0.0;
+                    pbs.outsideRth = extHours;
+                    pbs.useStopLmt = extHours;
+                    OnBracketEntry(entryId, pbs);
                 }
                 m_isBracketConfirm = false;
                 m_bracketStopPrice = 0.0;
@@ -2414,15 +2529,20 @@ void ChartWindow::DrawInfoBar() {
             ImGui::TextDisabled("%s  ---", label);
             return;
         }
-        double chg    = price - prevClose;
-        double chgPct = (prevClose > 0.0) ? (chg / prevClose) * 100.0 : 0.0;
-        bool   bull   = (chg >= 0.0);
-        ImVec4 col    = bull ? ImVec4(0.2f, 0.9f, 0.4f, 1.f)
-                             : ImVec4(0.9f, 0.3f, 0.3f, 1.f);
         char buf[56];
-        std::snprintf(buf, sizeof(buf), "%s %.2f  %+.2f (%+.2f%%)",
-                      label, price, chg, chgPct);
-        ImGui::TextColored(col, "%s", buf);
+        if (prevClose > 0.0) {
+            double chg    = price - prevClose;
+            double chgPct = (chg / prevClose) * 100.0;
+            bool   bull   = (chg >= 0.0);
+            ImVec4 col    = bull ? ImVec4(0.2f, 0.9f, 0.4f, 1.f)
+                                 : ImVec4(0.9f, 0.3f, 0.3f, 1.f);
+            std::snprintf(buf, sizeof(buf), "%s %.2f  %+.2f (%+.2f%%)",
+                          label, price, chg, chgPct);
+            ImGui::TextColored(col, "%s", buf);
+        } else {
+            std::snprintf(buf, sizeof(buf), "%s %.2f", label, price);
+            ImGui::Text("%s", buf);
+        }
     };
 
     // Dynamic labels — front-month from FuturesFrontMonth, Dec = current year
@@ -2454,8 +2574,21 @@ void ChartWindow::InitViewRange() {
 
     double pMin =  1e18, pMax = -1e18;
     for (int i = n - dc; i < n; i++) {
-        pMin = std::min(pMin, m_lows[i]);
-        pMax = std::max(pMax, m_highs[i]);
+        if (m_lows[i]  > 0.0) pMin = std::min(pMin, m_lows[i]);
+        if (m_highs[i] > 0.0) pMax = std::max(pMax, m_highs[i]);
+    }
+    // Degenerate-range guard: if every bar in the view window has 0 OHLC
+    // (zeroed bar from a placeholder, or all bars filtered) fall back to a
+    // safe default so the linked Y-axis isn't [0,0] (which collapses the
+    // plot and renders candles/volume/RSI invisible while leaving SMA/VWAP
+    // plotted as a single horizontal line).
+    if (pMin >= pMax || pMin >= 1e17) {
+        double anchor = (pMax > 0.0 && pMax < 1e17) ? pMax
+                       : (pMin > 0.0 && pMin < 1e17) ? pMin
+                       : (!m_closes.empty() && m_closes.back() > 0.0) ? m_closes.back()
+                       : 1.0;
+        pMin = anchor * 0.99;
+        pMax = anchor * 1.01;
     }
     double margin = (pMax - pMin) * 0.08;
     m_priceMin    = pMin - margin;
@@ -3086,14 +3219,17 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                     if (OnOrderSubmit) {
                         int entryId = OnOrderSubmit(o);
                         if (OnBracketEntry) {
-                            OnBracketEntry(entryId, {
-                                m_symbol,
-                                (m_limitSide == "BUY") ? core::OrderSide::Sell
-                                                       : core::OrderSide::Buy,
-                                static_cast<double>(m_orderQty),
-                                stop,    // STP (second click)
-                                tp       // TP  (third click)
-                            });
+                            bool extHours = core::BarSession(std::time(nullptr)) != core::Session::Regular;
+                            core::PendingBracketStop pbs;
+                            pbs.symbol     = m_symbol;
+                            pbs.stopSide   = (m_limitSide == "BUY") ? core::OrderSide::Sell
+                                                                     : core::OrderSide::Buy;
+                            pbs.qty        = static_cast<double>(m_orderQty);
+                            pbs.stopPrice  = stop;
+                            pbs.tpPrice    = tp;
+                            pbs.outsideRth = extHours;
+                            pbs.useStopLmt = extHours;
+                            OnBracketEntry(entryId, pbs);
                         }
                     }
                     m_limitArmed        = false;
@@ -3692,8 +3828,10 @@ void ChartWindow::DrawCandleChart() {
     if (n == 0) return;
 
     float available = ImGui::GetContentRegionAvail().y;
-    float volumeH   = m_ind.volume ? available * m_volumeHeightRatio : 0.0f;
-    float rsiH      = m_ind.rsi    ? available * 0.20f               : 0.0f;
+    float volRatio  = std::clamp(m_volumeHeightRatio, 0.05f, 0.50f);
+    float rsiRatio  = std::clamp(m_rsiHeightRatio,    0.05f, 0.40f);
+    float volumeH   = m_ind.volume ? available * volRatio : 0.0f;
+    float rsiH      = m_ind.rsi    ? available * rsiRatio : 0.0f;
     float spacing   = ImGui::GetStyle().ItemSpacing.y;
     float chartH    = available - volumeH - rsiH
                       - (m_ind.volume ? spacing : 0.0f)
@@ -3701,6 +3839,8 @@ void ChartWindow::DrawCandleChart() {
     chartH  = std::max(chartH,  80.0f);
     volumeH = std::max(volumeH, m_ind.volume ? 60.0f : 0.0f);
     rsiH    = std::max(rsiH,    m_ind.rsi    ? 60.0f : 0.0f);
+    m_cachedVolumeH = volumeH;
+    m_cachedRsiH    = rsiH;
 
     // Disable ImPlot panning for drawing tools and while dragging an order line.
     // Do NOT add NoInputs for m_limitArmed: ImPlot must keep its mouse-position
@@ -3708,6 +3848,7 @@ void ChartWindow::DrawCandleChart() {
     bool drawingActive = (m_drawTool != DrawTool::Cursor);
     ImPlotFlags plotFlags = ImPlotFlags_NoMouseText;
     if (drawingActive || m_dragPendingActive) plotFlags |= ImPlotFlags_NoInputs;
+    if (!m_showLegend) plotFlags |= ImPlotFlags_NoLegend;
 
     if (!ImPlot::BeginPlot("##candles", ImVec2(-1, chartH), plotFlags))
         return;
@@ -4082,11 +4223,8 @@ void ChartWindow::DrawVolumeChart() {
     int n = (int)m_idxs.size();
     if (n == 0) return;
 
-    float available = ImGui::GetContentRegionAvail().y;
-    float rsiH      = m_ind.rsi ? available * (0.20f / (1.0f - m_volumeHeightRatio)) : 0.0f;
-    float volH      = available - rsiH - (m_ind.rsi ? ImGui::GetStyle().ItemSpacing.y : 0.0f);
-    rsiH = std::max(rsiH, m_ind.rsi ? 60.0f : 0.0f);
-    volH = std::max(volH, 60.0f);
+    // Use the height pre-allocated by DrawCandleChart()
+    float volH = std::max(60.0f, m_cachedVolumeH);
 
     double maxVol = 1.0;
     for (int i = 0; i < n; i++)
@@ -4125,7 +4263,7 @@ void ChartWindow::DrawRsiChart() {
     int n = (int)m_idxs.size();
     if (n == 0 || (int)m_rsi.size() != n) return;
 
-    float rsiAvail = std::max(60.0f, ImGui::GetContentRegionAvail().y);
+    float rsiAvail = std::max(60.0f, m_cachedRsiH);
     if (!ImPlot::BeginPlot("##rsi", ImVec2(-1, rsiAvail),
                            ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend))
         return;

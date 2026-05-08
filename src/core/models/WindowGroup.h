@@ -6,8 +6,10 @@
 
 namespace core {
 
+static constexpr int kNumGroups = 10;
+
 // ============================================================================
-// GroupState — active symbol for a linked group (id 1–4; 0 = no group)
+// GroupState — active symbol for a linked group (id 1–10; 0 = no group)
 // ============================================================================
 struct GroupState {
     int         id     = 0;
@@ -72,7 +74,7 @@ inline bool DrawGroupPicker(int& groupId, const char* popupId) {
         ImGui::Separator();
         if (ImGui::Selectable("None", groupId == 0)) { groupId = 0; changed = true; }
         ImGui::Separator();
-        for (int i = 1; i <= 4; i++) {
+        for (int i = 1; i <= kNumGroups; i++) {
             ImVec4 c = GroupColor(i);
             ImGui::PushStyleColor(ImGuiCol_Text, c);
             char label[24];

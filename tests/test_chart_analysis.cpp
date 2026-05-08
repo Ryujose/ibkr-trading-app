@@ -1830,3 +1830,49 @@ TEST_CASE("VolumeProfile: value area not computed when numBins < 5",
     REQUIRE(vp.valueAreaHiIdx >= 0);
     REQUIRE(vp.valueAreaLoIdx <= vp.valueAreaHiIdx);
 }
+
+// ── ShouldReplaceHistoricalBars ─────────────────────────────────────────────
+
+TEST_CASE("ShouldReplaceHistoricalBars: empty completion on existing data rejected",
+          "[analysis]") {
+    // keepUpToDate reset sends done=true with no bars — must not wipe the chart
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "", 0) == false);
+}
+
+TEST_CASE("ShouldReplaceHistoricalBars: empty completion on empty chart accepted",
+          "[analysis]") {
+    // First-ever data load: empty bars with empty existing is a no-op, harmless
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(0, "", "", 0) == true);
+}
+
+TEST_CASE("ShouldReplaceHistoricalBars: symbol mismatch rejected", "[analysis]") {
+    // Stale AAPL bars arriving after a switch to /NQ
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(0, "/NQ", "AAPL", 200) == false);
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "/NQ", "AAPL", 200) == false);
+}
+
+TEST_CASE("ShouldReplaceHistoricalBars: symbol match accepted", "[analysis]") {
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(0, "AAPL", "AAPL", 200) == true);
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "AAPL", 300) == true);
+}
+
+TEST_CASE("ShouldReplaceHistoricalBars: ratchet blocks tiny replacement on large chart",
+          "[analysis]") {
+    // 200 bars → 1 bar: classic keepUpToDate reset symptom
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "AAPL", 1) == false);
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "AAPL", 5) == false);
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(50,  "AAPL", "AAPL", 3) == false);
+}
+
+TEST_CASE("ShouldReplaceHistoricalBars: ratchet allows reasonable replacement",
+          "[analysis]") {
+    // 200 bars → 180 bars: legitimate full-data refresh
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "AAPL", 180) == true);
+    // 200 bars → 6 bars: above the ≤5 threshold
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(200, "AAPL", "AAPL", 6) == true);
+    // < 50 existing: ratchet doesn't apply
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(10, "AAPL", "AAPL", 5) == true);
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(49, "AAPL", "AAPL", 1) == true);
+    // Existing empty: always accept
+    REQUIRE(core::services::ShouldReplaceHistoricalBars(0, "", "AAPL", 5) == true);
+}

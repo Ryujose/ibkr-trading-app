@@ -53,6 +53,14 @@ struct ChartEntry {
     int              mktId       = 0;   // reqMarketData id (chart ticks)
     int              wshId       = 0;   // reqContractDetails / reqWshEventData id
     bool             wshConIdFired = false;
+    // Stream-active flags: a historical request enters "active" when issued
+    // and exits when its done=true is dispatched (or a fresh request rotates
+    // the id and abandons the old). A late historical bar arriving after the
+    // stream ended would otherwise accumulate into pendingBars and trigger a
+    // phantom second SetHistoricalData (visible symptom: "everything erased
+    // and a single candle appears" when only one such bar got through).
+    bool             histStreamActive = false;
+    bool             extStreamActive  = false;
     core::BarSeries  pendingBars;
     core::BarSeries  pendingExtBars;
     std::string      bboExchange;       // last bboExchange code from tickReqParams
@@ -131,7 +139,7 @@ static std::unordered_map<std::string, double> g_scannerVolume;
 static std::unordered_map<int, std::string> g_tickerSymbols;
 
 static int    g_nextOrderId          = 1;
-static std::unordered_map<int, ui::ChartWindow::PendingBracketStop> g_pendingBracketStops;
+static std::unordered_map<int, core::PendingBracketStop> g_pendingBracketStops;
 static double g_reconnectNextAttempt = 0.0;   // glfwGetTime() of next auto-reconnect try
 static constexpr double kReconnectIntervalSec = 5.0;
 
@@ -143,8 +151,8 @@ static bool     g_settingsOpen = false;
 static constexpr float kFontScales[] = { 0.85f, 1.0f, 1.5f }; // Small / Medium / Large
 static ImGuiStyle      g_baseStyle;   // saved after initial style setup; used to re-scale cleanly
 
-// ---- Window groups (4 slots; index 0 = group id 1) -------------------------
-static std::array<core::GroupState, 4> g_groups;
+// ---- Window groups (10 slots; index 0 = group id 1) ------------------------
+static std::array<core::GroupState, core::kNumGroups> g_groups;
 // Guard against re-entrant group broadcasts when SetSymbol() re-fires callbacks.
 static bool g_groupSyncInProgress = false;
 static bool g_replayCursorSyncInProgress = false;
@@ -514,6 +522,23 @@ inline int AllocChartMktId() {
     if (s_next > 10999) s_next = 10000;
     return id;
 }
+// Rotating pools for chart historical-data reqIds, same rationale as
+// AllocChartMktId: cancel→reissue on the same id leaks stale bars from the
+// previous symbol/timeframe into the new pendingBars (e.g. AAPL bars at $200
+// merging with /ES bars at $5500), which makes InitViewRange fit a Y-range
+// spanning both and renders every candle as a 1-pixel sliver.
+inline int AllocChartHistId() {
+    static int s_next = 12000;
+    int id = s_next++;
+    if (s_next > 12999) s_next = 12000;
+    return id;
+}
+inline int AllocChartExtId() {
+    static int s_next = 13000;
+    int id = s_next++;
+    if (s_next > 13999) s_next = 13000;
+    return id;
+}
 inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119
 inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
 inline int TradingTickId (int idx) { return 130  + idx; }       // 130-139
@@ -831,7 +856,7 @@ static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
 // Propagate a symbol change to all windows in the same group.
 // Re-entrant guard prevents loops when SetSymbol() re-fires callbacks.
 static void BroadcastGroupSymbol(int groupId, const std::string& sym) {
-    if (groupId <= 0 || g_groupSyncInProgress) return;
+    if (groupId <= 0 || groupId > core::kNumGroups || g_groupSyncInProgress) return;
     core::GroupState& gs = g_groups[groupId - 1];
     if (gs.symbol == sym) return;   // already broadcast this symbol
     g_groupSyncInProgress = true;
@@ -893,7 +918,20 @@ static void ReqChartData(ChartEntry& ce, const std::string& sym, core::Timeframe
                          bool useRTH, core::BarSeries& pendingBars,
                          const std::string& durationOverride = "") {
     if (!g_IBClient) return;
+    // Rotate histId+extId on every cancel→reissue cycle so stale bars from the
+    // just-cancelled subscription (IB keeps streaming for a few ms after
+    // CancelHistoricalData) arrive with a reqId no chart owns and are silently
+    // dropped at the dispatcher — instead of leaking into the new symbol's
+    // pendingBars and corrupting the series. Cross-symbol leak (AAPL→/ES) is
+    // the visible symptom: stale AAPL bars merge with /ES bars, InitViewRange
+    // fits a Y-range from $200 to $5500, every candle becomes a 1-pixel sliver.
     g_IBClient->CancelHistoricalData(ce.histId);
+    ce.histStreamActive = false;
+    ce.histId = AllocChartHistId();
+    g_IBClient->CancelHistoricalData(ce.extId);
+    ce.extStreamActive = false;
+    ce.extId = AllocChartExtId();
+    ce.pendingExtBars = core::BarSeries{};
     pendingBars         = core::BarSeries{};
     pendingBars.symbol  = sym;
     pendingBars.timeframe = tf;
@@ -904,6 +942,7 @@ static void ReqChartData(ChartEntry& ce, const std::string& sym, core::Timeframe
                                   duration,
                                   core::TimeframeIBBarSize(tf),
                                   useRTH);
+    ce.histStreamActive = true;
     auto it = g_tickerSymbols.find(ce.mktId);
     bool symbolChanged = (it == g_tickerSymbols.end()) || (it->second != sym);
     if (symbolChanged) {
@@ -936,7 +975,8 @@ static void DrainStyleSwitchQueue() {
     // Cancel any in-flight extend-history request — older bars from the
     // previous TF could otherwise land into the new series.
     g_IBClient->CancelHistoricalData(ce.extId);
-    ce.pendingExtBars = core::BarSeries{};
+    ce.extStreamActive  = false;
+    ce.pendingExtBars   = core::BarSeries{};
 
     // Read symbol + useRTH at drain time, not enqueue time, so a symbol change
     // between the user's combo click and this frame doesn't strand the wrong
@@ -964,7 +1004,7 @@ static void SpawnChartWindow(int idx) {
     e.wshId  = ChartWshId(idx);
     e.win    = new ui::ChartWindow();
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
 
     // Capture idx (not pointer — vector may reallocate)
     e.win->OnDataRequest = [idx](const std::string& sym, core::Timeframe tf, bool useRTH) {
@@ -987,6 +1027,7 @@ static void SpawnChartWindow(int idx) {
         auto& ce = g_chartEntries[idx];
         if (!g_IBClient) { ce.win->PrependHistoricalData({}); return; }
         g_IBClient->CancelHistoricalData(ce.extId);
+        ce.extStreamActive          = false;
         ce.pendingExtBars           = core::BarSeries{};
         ce.pendingExtBars.symbol    = sym;
         ce.pendingExtBars.timeframe = tf;
@@ -994,6 +1035,7 @@ static void SpawnChartWindow(int idx) {
                                       core::TimeframeIBDuration(tf),
                                       core::TimeframeIBBarSize(tf),
                                       useRTH, endDT);
+        ce.extStreamActive = true;
     };
 
     // Trading-style mode switch — push to the throttled queue so we don't
@@ -1035,7 +1077,7 @@ static void SpawnChartWindow(int idx) {
     };
 
     e.win->OnBracketEntry = [](int lmtOrderId,
-                                const ui::ChartWindow::PendingBracketStop& p) {
+                                const core::PendingBracketStop& p) {
         g_pendingBracketStops[lmtOrderId] = p;
     };
 
@@ -1079,7 +1121,7 @@ static void SpawnTradingWindow(int idx) {
     e.tickId  = TradingTickId(idx);
     e.win     = new ui::TradingWindow();
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
     e.win->SetNextOrderId(g_nextOrderId);
 
     e.win->OnOrderSubmit = [](const core::Order& o) {
@@ -1119,7 +1161,7 @@ static void SpawnScannerWindow(int idx) {
     e.mktBase      = ScannerMktBase(idx);
     e.win          = new ui::ScannerWindow();
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
 
     e.win->OnSymbolSelected = [idx](const std::string& sym) {
         // Propagate to all charts/trading in the same group, or just broadcast
@@ -1178,7 +1220,7 @@ static void SpawnNewsWindow(int idx) {
     e.nextArtReqId = NewsArtBase(idx);
     e.artEnd       = NewsArtEnd(idx);
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
 
     e.win->SetStockNewsReqId(NewsHistStock(idx));
     e.win->SetPortNewsReqIdBase(NewsHistPort(idx));
@@ -1549,7 +1591,7 @@ static void SpawnWatchlistWindow(int idx) {
     WatchlistEntry e;
     e.win = new ui::WatchlistWindow();
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
     e.win->setReqIdBase(WatchlistCdId(idx), WatchlistMktBase(idx));
 
     e.win->OnReqContractDetails = [idx](int reqId, const std::string& sym) {
@@ -1600,7 +1642,7 @@ static void SpawnReplayWindow(int idx) {
     e.extId     = e.baseReqId + 1;
     e.win       = new ui::ReplayWindow();
     e.win->setInstanceId(idx + 1);
-    e.win->setGroupId(idx + 1);
+    e.win->setGroupId((idx % core::kNumGroups) + 1);
 
     e.win->OnDataRequest = [idx](const std::string& sym,
                                   const std::string& dateFrom,
@@ -1841,11 +1883,21 @@ static void FinishConnect(bool isReconnect) {
                     duration = core::TimeframeIBDuration(tf);
                 }
 
-                // Stamp the symbol. SetSymbol fires OnDataRequest with the
-                // *default* duration; the ReqChartData call below cancels
-                // that in-flight request and re-issues with the preset
-                // horizon, so the only on-wire request uses the right span.
-                ce.win->SetSymbol(b.symbol);
+                // Stamp the symbol without firing OnDataRequest — the
+                // callback calls BroadcastGroupSymbol which would re-enter
+                // SetSymbol on every sibling chart in the group, each of
+                // which fires its own ReqChartData (default duration) +
+                // BroadcastGroupSymbol chain.  With 3 charts in one group
+                // that is 9+ redundant cancel→reissue cycles during connect,
+                // overwhelming IB's socket with rapid-fire reqId rotations.
+                // We suppress the callback and issue a single ReqChartData
+                // with the correct preset duration below.
+                {
+                    auto saved = ce.win->OnDataRequest;
+                    ce.win->OnDataRequest = nullptr;
+                    ce.win->SetSymbol(b.symbol);
+                    ce.win->OnDataRequest = saved;
+                }
                 // Daily / Weekly / Monthly bars: useRTH=true (no extended-
                 // hours concept on those frames). Intraday: useRTH=false (the
                 // m_useRTH default for a freshly created chart).
@@ -1880,6 +1932,7 @@ static void FinishConnect(bool isReconnect) {
                                           core::TimeframeIBDuration(core::Timeframe::D1),
                                           core::TimeframeIBBarSize(core::Timeframe::D1),
                                           true);
+            ce.histStreamActive = true;
             g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
         }
         if (!g_tradingEntries.empty())
@@ -1919,10 +1972,15 @@ static void FinishConnect(bool isReconnect) {
             g_tickerSymbols[ce.mktId] = sym;
             ce.pendingBars.symbol    = sym;
             ce.pendingBars.timeframe = tf;
+            ce.pendingBars.bars.clear();   // discard leftovers from pre-disconnect symbol
+            g_IBClient->CancelHistoricalData(ce.extId);
+            ce.extStreamActive  = false;
+            ce.pendingExtBars   = core::BarSeries{};
             g_IBClient->ReqHistoricalData(ce.histId, sym,
                                           core::TimeframeIBDuration(tf),
                                           core::TimeframeIBBarSize(tf),
                                           true);
+            ce.histStreamActive = true;
             g_IBClient->ReqMarketData(ce.mktId, sym, MktDataTicks());
         }
         for (auto& te : g_tradingEntries) {
@@ -1952,6 +2010,7 @@ static void FinishConnect(bool isReconnect) {
     if (g_twsGroupSync)
         for (int g = 1; g <= 4; ++g)
             g_IBClient->SubscribeToGroupEvents(8060 + g, g);
+    fprintf(stderr, "[main] FinishConnect done isReconnect=%d\n", isReconnect); fflush(stderr);
 }
 
 // ============================================================================
@@ -2000,23 +2059,38 @@ static void WireIBCallbacks() {
     g_IBClient->onBarData = [](int reqId, const core::Bar& bar, bool done, bool isLive) {
         for (auto& ce : g_chartEntries) {
             if (reqId == ce.extId) {
-                // Extend-history (pan-left) response — prepend to existing chart data
+                // Extend-history (pan-left) response — prepend to existing chart data.
+                // Stream-active gate: drop bars that arrive after done=true so a
+                // late or duplicate completion can't replay PrependHistoricalData.
+                if (!ce.extStreamActive) return;
                 if (!done) {
                     ce.pendingExtBars.bars.push_back(bar);
                 } else if (ce.win) {
                     ce.win->PrependHistoricalData(ce.pendingExtBars);
                     ce.pendingExtBars.bars.clear();
+                    ce.extStreamActive = false;
                 }
                 return;
             }
             if (reqId == ce.histId) {
+                // Live updates (keepUpToDate) flow even after the historical
+                // stream has ended, so they bypass the stream-active gate.
                 if (isLive) {
                     if (ce.win) ce.win->UpdateLiveBar(bar);
-                } else if (!done) {
+                    return;
+                }
+                // Historical stream gate: drop late bars and duplicate done=true
+                // packets so a phantom second SetHistoricalData(pendingBars) can't
+                // wipe the chart with a 0/1-bar series. Symptom this prevents:
+                // "everything erased and a single candle appears" on intraday
+                // charts after a symbol switch.
+                if (!ce.histStreamActive) return;
+                if (!done) {
                     ce.pendingBars.bars.push_back(bar);
                 } else if (ce.win) {
                     ce.win->SetHistoricalData(ce.pendingBars);
                     ce.pendingBars.bars.clear();
+                    ce.histStreamActive = false;
                 }
                 return;
             }
@@ -2437,11 +2511,21 @@ static void WireIBCallbacks() {
             stop.orderId    = stopId;
             stop.symbol     = p.symbol;
             stop.side       = p.stopSide;
-            stop.type       = core::OrderType::Stop;
+            stop.type       = p.useStopLmt ? core::OrderType::StopLimit : core::OrderType::Stop;
             stop.quantity   = p.qty;
             stop.stopPrice  = p.stopPrice;
+            if (p.useStopLmt) {
+                // Offset the limit slightly past the stop so a fast move through
+                // the level still fills.  For a long (SELL stop): limit = stop - 0.1%.
+                // For a short (BUY stop):  limit = stop + 0.1%.
+                // Round to $0.01 tick so IB doesn't reject with error 110.
+                double pad = p.stopPrice * 0.001;
+                double raw = (p.stopSide == core::OrderSide::Sell)
+                    ? p.stopPrice - pad : p.stopPrice + pad;
+                stop.limitPrice = core::services::RoundToTick(raw, 0.01);
+            }
             stop.tif        = core::TimeInForce::GTC;
-            stop.outsideRth = false;
+            stop.outsideRth = false;  // stop condition only triggers during RTH regardless
             stop.account    = g_selectedAccount;
             stop.ocaGroup   = ocaTag;
             stop.ocaType    = ocaTag.empty() ? 0 : 1;
@@ -2462,7 +2546,7 @@ static void WireIBCallbacks() {
                 tp.quantity   = p.qty;
                 tp.limitPrice = p.tpPrice;
                 tp.tif        = core::TimeInForce::GTC;
-                tp.outsideRth = false;
+                tp.outsideRth = p.outsideRth;
                 tp.account    = g_selectedAccount;
                 tp.ocaGroup   = ocaTag;
                 tp.ocaType    = 1;
@@ -3541,6 +3625,7 @@ static void RenderSettingsWindow() {
 // Trading UI
 // ============================================================================
 static void RenderTradingUI() {
+    fprintf(stderr, "[main] RenderTradingUI enter\n"); fflush(stderr);
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, vp->Pos.y + kTitleBarH));
     ImGui::SetNextWindowSize(ImVec2(vp->Size.x, vp->Size.y - kTitleBarH));
