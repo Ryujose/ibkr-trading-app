@@ -71,6 +71,7 @@ struct MsgHistoricalNews { int reqId; std::time_t ts; std::string provider;
                            std::string articleId; std::string headline; };
 struct MsgHistoricalNewsEnd { int reqId; };
 struct MsgNewsArticle    { int reqId; std::string text; };
+struct MsgNewsProviders  { std::vector<std::pair<std::string, std::string>> providers; };  // {code, name}
 
 // Historical tick data (reqHistoricalTicks) — aggregates TRADES, BID_ASK,
 // and MIDPOINT callbacks into a single variant. Each callback converts its
@@ -135,6 +136,7 @@ using IBMessage = std::variant<
     MsgError, MsgNextOrderId,
     MsgOpenOrder, MsgOpenOrderEnd,
     MsgContractConId, MsgHistoricalNews, MsgHistoricalNewsEnd, MsgNewsArticle,
+    MsgNewsProviders,
     MsgHistoricalTick,
     MsgAcctSummary, MsgPnL, MsgPnLSingle, MsgSymbolSamples,
     MsgManagedAccts, MsgPositionMulti, MsgAccountUpdateMulti,
@@ -181,8 +183,11 @@ public:
     void ReqContractDetails(int reqId, const std::string& symbol);
 
     // Historical news headlines for a specific contract.
-    // providerCodes: colon-separated, e.g. "BRFUPDN:BRFG:DJ-N"
-    //   empty → falls back to kFreeNewsProviders (all free providers)
+    // providerCodes: colon-separated, e.g. "BRFUPDN:BRFG:DJ-N". Required —
+    // empty input is rejected (logged and dropped) because IB returns
+    // error 321 / 502 ("Not subscribed for '<list>' provider") whenever the
+    // call includes a code this account isn't entitled to. Caller should
+    // pass the cached output of ReqNewsProviders() (host-side filter).
     void ReqHistoricalNews(int reqId, int conId, int totalResults = 25,
                            const std::string& providerCodes = "");
 
@@ -191,14 +196,14 @@ public:
     // Call once after connection; cancel with CancelMarketData(reqId).
     void SubscribeToNews(int reqId, const std::string& symbol = "AAPL");
 
-    // News provider codes available without a paid subscription.
-    // Used as default for both real-time and historical requests.
-    static constexpr const char* kFreeNewsProviders =
-        "BRFUPDN:BRFG:DJ-N:DJNL:DJ-RTA:DJ-RTE:DJ-RTG:DJ-RTPRO";
-
     // Full article body for an articleId returned by historicalNews / tickNews
     void ReqNewsArticle(int reqId, const std::string& providerCode,
                         const std::string& articleId);
+
+    // Ask IB which news providers this account is entitled to. Fires
+    // onNewsProviders once with the {code, name} list. No reqId — IB's
+    // newsProviders() callback is parameter-less.
+    void ReqNewsProviders();
 
     // Market data type:
     //   1 = Live (requires active subscription)
@@ -358,6 +363,13 @@ public:
     // Full article body (articleType 0 = plain text, 1 = HTML)
     std::function<void(int reqId, int articleType,
                        const std::string& text)>                            onNewsArticle;
+
+    // Entitled news providers — callback fires once after ReqNewsProviders().
+    // Pairs are {providerCode, providerName}. The colon-joined provider-code
+    // string is the only valid input to historicalNews / newsArticle requests
+    // for this account; using anything else triggers IB error 321 / 502.
+    std::function<void(
+        const std::vector<std::pair<std::string, std::string>>& providers)> onNewsProviders;
 
     // Historical tick data — one batch per reqHistoricalTicks callback
     std::function<void(int reqId,
@@ -535,6 +547,8 @@ private:
 
     void newsArticle(int requestId, int articleType,
                      const std::string& articleText) override;
+
+    void newsProviders(const std::vector<NewsProvider>& providers) override;
 
     void accountSummary(int reqId, const std::string& account, const std::string& tag,
                         const std::string& value, const std::string& currency) override;

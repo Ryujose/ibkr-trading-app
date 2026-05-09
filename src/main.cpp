@@ -16,6 +16,8 @@
 #include <cstring>
 #include <cmath>
 #include <unordered_map>
+#include <unordered_set>
+#include <memory>
 #include <filesystem>
 #include <deque>
 
@@ -37,11 +39,14 @@
 #include "ui/windows/WatchlistWindow.h"
 #include "ui/windows/WshCalendarWindow.h"
 #include "ui/windows/ReplayWindow.h"
+#include "ui/windows/NotificationsWindow.h"
 #include "ui/SymbolSearch.h"
 
 #include "core/services/IBKRClient.h"
 #include "core/services/IBKRUtils.h"
+#include "core/services/NotificationService.h"
 #include "core/models/WindowGroup.h"
+#include "ui/NotificationOverlay.h"
 
 // ============================================================================
 // Multi-instance window entry structs
@@ -126,9 +131,20 @@ static std::vector<ReplayEntry>     g_replayEntries;
 static ui::PortfolioWindow*    g_PortfolioWindow    = nullptr;
 static ui::OrdersWindow*       g_OrdersWindow       = nullptr;
 static ui::WshCalendarWindow*  g_WshCalendarWindow  = nullptr;
+static ui::NotificationsWindow* g_NotificationsWindow = nullptr;
 
 // IB API client (created on Connect, deleted on Disconnect)
 static core::services::IBKRClient* g_IBClient = nullptr;
+
+// Notifications (created in main(), destroyed before ImGui shutdown).
+// Audio init failure (no device, headless CI) leaves the service alive — toasts
+// still queue, audio is silenced. All Notify() call sites guard on non-null.
+static std::unique_ptr<core::services::NotificationService> g_NotificationService;
+
+// User-initiated cancellations: when we send a cancel ourselves, record the
+// orderId here so the resulting Cancelled status doesn't fire an unsolicited
+// "Order cancelled" notification. Drained on each onOrderStatusChanged.
+static std::unordered_set<int> g_userCancelled;
 
 // Previous-close prices keyed by symbol, used to compute change/% for scanner rows.
 static std::unordered_map<std::string, double> g_scannerPrevClose;
@@ -179,6 +195,20 @@ static bool g_twsGroupSync = false;   // user-controlled in Settings panel
 static std::vector<std::string>         g_managedAccounts;     // all accounts from managedAccounts()
 static std::string                      g_selectedAccount;     // currently active account
 static bool                             g_pendingReconnect = false; // deferred reconnect flag
+
+// News providers entitled to this account, populated once after FinishConnect
+// via reqNewsProviders → onNewsProviders. Used as the colon-joined provider
+// argument to reqHistoricalNews so we don't ask IB for unsubscribed providers
+// (which fires error 321 / 502 "Not subscribed for 'BRFUPDN:...' provider").
+// Empty = either not yet received or this account has no news entitlements;
+// in that state historical-news requests are suppressed.
+static std::vector<std::pair<std::string, std::string>> g_newsProvidersList;
+static std::string                      g_entitledNewsProviders;
+
+// User-disabled provider codes. The Settings panel writes this set; the
+// rebuilt g_entitledNewsProviders excludes everything in here. Persisted to
+// ~/.config/ibkr-trading-app/news-providers.cfg (one disabled code per line).
+static std::unordered_set<std::string>  g_disabledNewsProviders;
 
 // Real-time P&L subscription state
 static std::string                      g_accountId;           // captured from first updateAccountValue
@@ -303,6 +333,11 @@ static std::vector<UnguardedPosition> g_unguarded;
 // but the strip self-suppresses on `stopTrig <= 0`.
 static void PushUnguardedHintsToWindows();
 
+// Symbol-set of unguarded positions from the previous Recompute, so we can
+// fire a "position unprotected" notification on transition into the unguarded
+// set (and stay quiet for held conditions).
+static std::vector<std::string> g_lastUnguardedSymbols;
+
 static void RecomputeUnguardedPositions() {
     g_unguarded.clear();
 
@@ -338,6 +373,27 @@ static void RecomputeUnguardedPositions() {
             g_unguarded.push_back({ sym, pos.conId, pos.quantity, pos.avgCost });
         }
     }
+
+    // Edge-trigger UnguardedPosition notification on (new ∖ last) symbols.
+    if (g_NotificationService) {
+        for (const auto& u : g_unguarded) {
+            bool wasUnguarded = false;
+            for (const auto& prev : g_lastUnguardedSymbols)
+                if (prev == u.symbol) { wasUnguarded = true; break; }
+            if (wasUnguarded) continue;
+            char body[160];
+            std::snprintf(body, sizeof(body), "%s %g sh @ $%.2f — no protective stop",
+                          u.symbol.c_str(), u.qty, u.avgCost);
+            g_NotificationService->Notify(
+                core::services::NotificationSeverity::Warning,
+                core::services::NotificationCategory::Signals,
+                core::services::NotificationEvent::UnguardedPosition,
+                "Unguarded position", body);
+        }
+    }
+    g_lastUnguardedSymbols.clear();
+    g_lastUnguardedSymbols.reserve(g_unguarded.size());
+    for (const auto& u : g_unguarded) g_lastUnguardedSymbols.push_back(u.symbol);
 }
 
 static void PushUnguardedHintsToWindows() {
@@ -1054,6 +1110,25 @@ static void SpawnChartWindow(int idx) {
         g_chartModesDirty = true;
     };
 
+    e.win->OnSignalChange = [](ui::ChartWindow::BreakoutDirection dir,
+                               const std::string& sym, double last, double rr) {
+        if (!g_NotificationService) return;
+        const bool isLong = (dir == ui::ChartWindow::BreakoutDirection::LongSetup);
+        char body[160];
+        if (rr > 0.0)
+            std::snprintf(body, sizeof(body), "%s @ $%.2f — R:R %.2f",
+                          sym.c_str(), last, rr);
+        else
+            std::snprintf(body, sizeof(body), "%s @ $%.2f", sym.c_str(), last);
+        g_NotificationService->Notify(
+            core::services::NotificationSeverity::Warning,
+            core::services::NotificationCategory::Signals,
+            isLong ? core::services::NotificationEvent::LongSetup
+                   : core::services::NotificationEvent::ShortSetup,
+            isLong ? "Long setup" : "Short setup",
+            body);
+    };
+
     e.win->OnOrderSubmit = [](const core::Order& o) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return 0;
         int id = g_nextOrderId++;
@@ -1073,6 +1148,7 @@ static void SpawnChartWindow(int idx) {
     };
 
     e.win->OnCancelOrder = [](int orderId) {
+        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
 
@@ -1133,6 +1209,7 @@ static void SpawnTradingWindow(int idx) {
     };
 
     e.win->OnOrderCancel = [](int orderId) {
+        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
 
@@ -1377,6 +1454,49 @@ static std::vector<ChartModeBlock> LoadChartModesFromFile() {
         }
     }
     return result;
+}
+
+// ---- News provider filter persistence -----------------------------------------
+
+static std::string NewsProvidersFilePath() {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    return std::string(home) + "/.config/ibkr-trading-app/news-providers.cfg";
+}
+
+static void SaveDisabledNewsProviders() {
+    EnsureWatchlistConfigDir();
+    std::string path = NewsProvidersFilePath();
+    std::string tmp  = path + ".tmp";
+    {
+        std::ofstream f(tmp);
+        if (!f.is_open()) return;
+        for (const auto& code : g_disabledNewsProviders) f << code << '\n';
+    }
+    std::rename(tmp.c_str(), path.c_str());
+}
+
+static void LoadDisabledNewsProviders() {
+    g_disabledNewsProviders.clear();
+    std::ifstream f(NewsProvidersFilePath());
+    if (!f.is_open()) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty()) g_disabledNewsProviders.insert(line);
+    }
+}
+
+// Rebuild the colon-joined cache from g_newsProvidersList minus the user's
+// disabled set. Called from onNewsProviders (fresh IB list) and from the
+// Settings checkbox toggle (re-apply disabled filter without a roundtrip).
+static void RebuildEntitledNewsProviders() {
+    std::string joined;
+    for (const auto& [code, name] : g_newsProvidersList) {
+        if (g_disabledNewsProviders.count(code)) continue;
+        if (!joined.empty()) joined += ':';
+        joined += code;
+    }
+    g_entitledNewsProviders = std::move(joined);
 }
 
 // ---- Replay window persistence ------------------------------------------------
@@ -1755,6 +1875,7 @@ static void CreateTradingWindows() {
 
     // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
+        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
     g_OrdersWindow->OnRefresh = []() {
@@ -2010,6 +2131,14 @@ static void FinishConnect(bool isReconnect) {
     if (g_twsGroupSync)
         for (int g = 1; g <= 4; ++g)
             g_IBClient->SubscribeToGroupEvents(8060 + g, g);
+
+    // Ask IB which news providers this account is entitled to. The response
+    // populates g_entitledNewsProviders; reqHistoricalNews call sites check it
+    // before firing so we never request unsubscribed providers.
+    g_entitledNewsProviders.clear();
+    g_newsProvidersList.clear();
+    g_IBClient->ReqNewsProviders();
+
     fprintf(stderr, "[main] FinishConnect done isReconnect=%d\n", isReconnect); fflush(stderr);
 }
 
@@ -2039,6 +2168,14 @@ static void WireIBCallbacks() {
             } else {
                 FinishConnect(isReconnect);
             }
+
+            if (isReconnect && g_NotificationService) {
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Success,
+                    core::services::NotificationCategory::Connection,
+                    core::services::NotificationEvent::ConnectionRestored,
+                    "Reconnected", "Session restored.");
+            }
         } else {
             // Any disconnect while not in the normal "initial Connecting" flow
             // → keep windows alive, null client, schedule a reconnect attempt.
@@ -2050,6 +2187,13 @@ static void WireIBCallbacks() {
                 g_IBClient                = nullptr;
                 g_Login.state             = ConnectionState::LostConnection;
                 g_reconnectNextAttempt    = glfwGetTime() + kReconnectIntervalSec;
+                if (g_NotificationService) {
+                    g_NotificationService->Notify(
+                        core::services::NotificationSeverity::Warning,
+                        core::services::NotificationCategory::Connection,
+                        core::services::NotificationEvent::ConnectionLost,
+                        "Disconnected", "Lost connection to IB Gateway.");
+                }
             }
             printf("[IB] Disconnected: %s\n", info.c_str());
         }
@@ -2472,6 +2616,25 @@ static void WireIBCallbacks() {
             status == core::OrderStatus::Rejected) {
             g_pendingBracketStops.erase(orderId);
         }
+
+        // Notifications. Rejected gets surfaced via onError (which has the IB
+        // reason string); here we only handle the unsolicited cancel case so we
+        // don't double-fire when the user clicks Cancel themselves.
+        if (status == core::OrderStatus::Cancelled && g_NotificationService) {
+            auto uc = g_userCancelled.find(orderId);
+            if (uc == g_userCancelled.end() && it != g_liveOrders.end()) {
+                char body[160];
+                std::snprintf(body, sizeof(body), "%s %s",
+                              it->second.symbol.c_str(),
+                              core::OrderTypeStr(it->second.type));
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Warning,
+                    core::services::NotificationCategory::Orders,
+                    core::services::NotificationEvent::OrderCancelled,
+                    "Order cancelled", body);
+            }
+            if (uc != g_userCancelled.end()) g_userCancelled.erase(uc);
+        }
     };
 
     // ── Fills ─────────────────────────────────────────────────────────────
@@ -2479,6 +2642,34 @@ static void WireIBCallbacks() {
         for (auto& te : g_tradingEntries)
             if (te.win && te.win->getSymbol() == fill.symbol) te.win->OnFill(fill);
         if (g_OrdersWindow) g_OrdersWindow->OnFill(fill);
+
+        // Notification: full vs partial fill, derived from g_liveOrders.
+        if (g_NotificationService) {
+            auto oit = g_liveOrders.find(fill.orderId);
+            const char* sideStr = (fill.side == core::OrderSide::Buy) ? "BUY" : "SELL";
+            const bool isPartial = (oit != g_liveOrders.end()) &&
+                (oit->second.filledQty + fill.quantity + 1e-9 < oit->second.quantity);
+            char body[160];
+            if (isPartial) {
+                std::snprintf(body, sizeof(body), "%g/%g %s @ $%.2f",
+                              oit->second.filledQty + fill.quantity,
+                              oit->second.quantity, fill.symbol.c_str(), fill.price);
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Success,
+                    core::services::NotificationCategory::Orders,
+                    core::services::NotificationEvent::OrderPartialFill,
+                    "Partial fill", body);
+            } else {
+                std::snprintf(body, sizeof(body), "%s %g %s @ $%.2f",
+                              sideStr, fill.quantity, fill.symbol.c_str(), fill.price);
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Success,
+                    core::services::NotificationCategory::Orders,
+                    core::services::NotificationEvent::OrderFilled,
+                    "Filled", body);
+            }
+        }
+
         // Accumulate commission per symbol for the P&L strip
         g_symbolCommissions[fill.symbol] += fill.commission;
         if (g_PortfolioWindow) {
@@ -2715,24 +2906,45 @@ static void WireIBCallbacks() {
             }
         }
 
+        // Suppress historical-news requests when the account has no news
+        // entitlements — IB returns error 321/502 with the full provider list.
+        // The entitled list is populated asynchronously by ReqNewsProviders;
+        // until it arrives, calls fall through and clear the loading state on
+        // the news window. (g_entitledNewsProviders.empty() == "list not yet
+        // received" OR "no entitlements at all" — both are non-firing cases.)
+        const std::string& providers = g_entitledNewsProviders;
         for (int ni = 0; ni < (int)g_newsEntries.size(); ++ni) {
             auto& ne = g_newsEntries[ni];
             if (reqId == NewsStockConId(ni)) {
                 if (ne.newsConIdFired[reqId]) return;
                 ne.newsConIdFired[reqId] = true;
-                g_IBClient->ReqHistoricalNews(NewsHistStock(ni), (int)conId, 30);
+                if (providers.empty()) {
+                    if (ne.win) ne.win->OnHistoricalNewsEnd(NewsHistStock(ni));
+                } else {
+                    g_IBClient->ReqHistoricalNews(NewsHistStock(ni), (int)conId, 30, providers);
+                }
                 return;
             }
             if (reqId >= NewsPortConId(ni) && reqId < NewsPortConId(ni) + 20) {
                 if (ne.newsConIdFired[reqId]) return;
                 ne.newsConIdFired[reqId] = true;
-                g_IBClient->ReqHistoricalNews(NewsHistPort(ni) + (reqId - NewsPortConId(ni)), (int)conId, 10);
+                int histId = NewsHistPort(ni) + (reqId - NewsPortConId(ni));
+                if (providers.empty()) {
+                    if (ne.win) ne.win->OnHistoricalNewsEnd(histId);
+                } else {
+                    g_IBClient->ReqHistoricalNews(histId, (int)conId, 10, providers);
+                }
                 return;
             }
             if (reqId >= NewsConIdMkt(ni) && reqId < NewsConIdMkt(ni) + kMktSeedCount) {
                 if (ne.newsConIdFired[reqId]) return;
                 ne.newsConIdFired[reqId] = true;
-                g_IBClient->ReqHistoricalNews(NewsHistMkt(ni) + (reqId - NewsConIdMkt(ni)), (int)conId, 20);
+                int histId = NewsHistMkt(ni) + (reqId - NewsConIdMkt(ni));
+                if (providers.empty()) {
+                    if (ne.win) ne.win->OnHistoricalNewsEnd(histId);
+                } else {
+                    g_IBClient->ReqHistoricalNews(histId, (int)conId, 20, providers);
+                }
                 return;
             }
         }
@@ -2793,6 +3005,26 @@ static void WireIBCallbacks() {
         }
     };
 
+    g_IBClient->onNewsProviders =
+        [](const std::vector<std::pair<std::string, std::string>>& providers) {
+            g_newsProvidersList = providers;
+            // Drop stale entries from the disabled set — IB removed an
+            // entitlement, so user's "disabled" preference for it is moot.
+            for (auto it = g_disabledNewsProviders.begin();
+                 it != g_disabledNewsProviders.end(); ) {
+                bool stillEntitled = false;
+                for (const auto& [code, _] : providers)
+                    if (code == *it) { stillEntitled = true; break; }
+                if (stillEntitled) ++it;
+                else               it = g_disabledNewsProviders.erase(it);
+            }
+            RebuildEntitledNewsProviders();
+            fprintf(stderr, "[news] entitled providers (%d), filtered to (%d): %s\n",
+                    (int)providers.size(),
+                    (int)(providers.size() - g_disabledNewsProviders.size()),
+                    g_entitledNewsProviders.c_str());
+        };
+
     // ── Errors ────────────────────────────────────────────────────────────
     g_IBClient->onError = [](int reqId, int code, const std::string& msg) {
         fprintf(stderr, "[IB Error reqId=%d code=%d] %s\n", reqId, code, msg.c_str());
@@ -2816,6 +3048,48 @@ static void WireIBCallbacks() {
             for (auto& te : g_tradingEntries)
                 if (te.win) te.win->OnOrderStatus(reqId, core::OrderStatus::Rejected, 0, 0);
             UpdateAllChartPendingOrders();
+
+            // Notify on order rejection — distinct from generic IB-error toasts.
+            if (g_NotificationService) {
+                char body[260];
+                std::snprintf(body, sizeof(body), "%s %s — %s",
+                              it->second.symbol.c_str(),
+                              core::OrderTypeStr(it->second.type),
+                              msg.c_str());
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Error,
+                    core::services::NotificationCategory::Orders,
+                    core::services::NotificationEvent::OrderRejected,
+                    "Order rejected", body);
+            }
+        }
+
+        // Curated IB-error allowlist: only surface these as toasts. Everything
+        // else stays in the log (filtered by the lambda above for order-status
+        // tracking but not for user-facing alert).
+        if (g_NotificationService) {
+            const bool surface =
+                code == 110   ||   // price does not conform to min tick
+                code == 201   ||   // order rejected
+                code == 202   ||   // order cancelled (with reason)
+                code == 321   ||   // server validation error
+                code == 354   ||   // not subscribed
+                code == 10148 ||   // can't modify cancelled order
+                code == 10149;     // can't cancel — order in terminal state
+            // Skip if we already rendered the order-rejected toast above to
+            // avoid duplicate noise.
+            const bool alreadyRejected = (it != g_liveOrders.end()) &&
+                (it->second.status == core::OrderStatus::Rejected);
+            if (surface && !alreadyRejected) {
+                char title[64];
+                std::snprintf(title, sizeof(title), "IB error %d", code);
+                std::string body = msg.size() > 200 ? msg.substr(0, 200) : msg;
+                g_NotificationService->Notify(
+                    core::services::NotificationSeverity::Error,
+                    core::services::NotificationCategory::Orders,
+                    core::services::NotificationEvent::IbError,
+                    title, std::move(body));
+            }
         }
 
         // News errors: if reqHistoricalNews or reqContractDetails fails (e.g. no news
@@ -3626,6 +3900,114 @@ static void RenderSettingsWindow() {
             "TWS linked-window groups 1–4 (bidirectional).\n"
             "Requires IB Gateway / TWS with API access enabled.");
 
+    // ── Notifications ────────────────────────────────────────────────────────
+    if (g_NotificationService) {
+        ImGui::Spacing();
+        ImGui::SeparatorText("Notifications");
+        ImGui::Spacing();
+
+        auto s = g_NotificationService->settings();
+        bool dirty = false;
+
+        if (ImGui::Checkbox("Enable notifications##n_master", &s.masterEnable)) dirty = true;
+
+        ImGui::BeginDisabled(!s.masterEnable);
+
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::SliderInt("Volume##n_vol", &s.masterVolume, 0, 100, "%d"))
+            dirty = true;
+
+        ImGui::TextDisabled("Surfaces:");
+        if (ImGui::Checkbox("Alert tones##n_tones",   &s.enableTones))   dirty = true;
+        ImGui::SameLine(0, 16);
+        if (ImGui::Checkbox("Voice phrases##n_voice", &s.enableVoice))   dirty = true;
+        ImGui::SameLine(0, 16);
+        if (ImGui::Checkbox("Visual toasts##n_toast", &s.enableToasts))  dirty = true;
+
+        ImGui::TextDisabled("Categories:");
+        if (ImGui::Checkbox("Order events##n_ord",   &s.enableOrders))     dirty = true;
+        ImGui::SameLine(0, 16);
+        if (ImGui::Checkbox("Connection events##n_conn", &s.enableConnection)) dirty = true;
+        ImGui::SameLine(0, 16);
+        if (ImGui::Checkbox("Signal events##n_sig",  &s.enableSignals))    dirty = true;
+
+        ImGui::Spacing();
+        if (ImGui::Button("Test tone##n_t1")) {
+            g_NotificationService->NotifyForce(
+                core::services::NotificationSeverity::Info,
+                core::services::NotificationCategory::System,
+                core::services::NotificationEvent::Test,
+                "Test tone", "",
+                /*playTone=*/true, /*playVoice=*/false, /*showToast=*/false);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Test voice##n_t2")) {
+            g_NotificationService->NotifyForce(
+                core::services::NotificationSeverity::Info,
+                core::services::NotificationCategory::System,
+                core::services::NotificationEvent::Test,
+                "Test voice", "",
+                /*playTone=*/false, /*playVoice=*/true, /*showToast=*/false);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Test toast##n_t3")) {
+            g_NotificationService->NotifyForce(
+                core::services::NotificationSeverity::Info,
+                core::services::NotificationCategory::System,
+                core::services::NotificationEvent::Test,
+                "Test", "Notifications working.",
+                /*playTone=*/false, /*playVoice=*/false, /*showToast=*/true);
+        }
+
+        ImGui::EndDisabled();
+
+        if (dirty) g_NotificationService->setSettings(s);
+    }
+
+    // ── News providers ──────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::SeparatorText("News providers");
+    ImGui::Spacing();
+
+    if (g_newsProvidersList.empty()) {
+        ImGui::TextDisabled(g_IBClient && g_IBClient->IsConnected()
+            ? "Waiting for IB to return entitled providers…"
+            : "Connect to IB to load entitled providers.");
+    } else {
+        ImGui::TextDisabled("%d entitled · %d enabled",
+                            (int)g_newsProvidersList.size(),
+                            (int)(g_newsProvidersList.size() - g_disabledNewsProviders.size()));
+        ImGui::SameLine(0, 16);
+        if (ImGui::SmallButton("All##news_all")) {
+            g_disabledNewsProviders.clear();
+            RebuildEntitledNewsProviders();
+            SaveDisabledNewsProviders();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("None##news_none")) {
+            for (const auto& [code, _] : g_newsProvidersList)
+                g_disabledNewsProviders.insert(code);
+            RebuildEntitledNewsProviders();
+            SaveDisabledNewsProviders();
+        }
+
+        ImGui::BeginChild("##news_provider_list",
+                          ImVec2(0, 160), ImGuiChildFlags_Borders);
+        for (const auto& [code, name] : g_newsProvidersList) {
+            bool enabled = g_disabledNewsProviders.count(code) == 0;
+            char label[256];
+            std::snprintf(label, sizeof(label), "%s — %s##np_%s",
+                          code.c_str(), name.c_str(), code.c_str());
+            if (ImGui::Checkbox(label, &enabled)) {
+                if (enabled) g_disabledNewsProviders.erase(code);
+                else         g_disabledNewsProviders.insert(code);
+                RebuildEntitledNewsProviders();
+                SaveDisabledNewsProviders();
+            }
+        }
+        ImGui::EndChild();
+    }
+
     ImGui::End();
 }
 
@@ -3766,6 +4148,7 @@ static void RenderTradingUI() {
                     if (g_OrdersWindow)       ImGui::MenuItem("Orders",        nullptr, &g_OrdersWindow->open());
                     if (g_PortfolioWindow)    ImGui::MenuItem("Portfolio",     nullptr, &g_PortfolioWindow->open());
                     if (g_WshCalendarWindow)  ImGui::MenuItem("WSH Calendar",  nullptr, &g_WshCalendarWindow->open());
+                    if (g_NotificationsWindow) ImGui::MenuItem("Notifications", nullptr, &g_NotificationsWindow->open());
                     ImGui::PopItemFlag();
                     ImGui::EndMenu();
                 }
@@ -3896,6 +4279,9 @@ static void RenderTradingUI() {
     // chart's freshly-detected S/R. Cheap (positions × charts is small).
     PushUnguardedHintsToWindows();
 
+    // Dispatch any due voice/tone plays (delayed-voice scheduling).
+    if (g_NotificationService) g_NotificationService->Tick();
+
     // Render all window instances
     for (auto& ce : g_chartEntries)   if (ce.win) ce.win->Render();
     for (auto& te : g_tradingEntries) if (te.win) te.win->Render();
@@ -3906,6 +4292,8 @@ static void RenderTradingUI() {
     if (g_PortfolioWindow)   g_PortfolioWindow->Render();
     if (g_OrdersWindow)      g_OrdersWindow->Render();
     if (g_WshCalendarWindow) g_WshCalendarWindow->Render();
+    if (g_NotificationsWindow && g_NotificationService)
+        g_NotificationsWindow->Render(*g_NotificationService);
     RenderSettingsWindow();
 }
 
@@ -3944,6 +4332,12 @@ static void RenderMainUI() {
         RenderAccountSelectorUI();
     else
         RenderLoginWindow();
+
+    // Toast overlay sits above everything but the title bar so the × close
+    // button on the title bar still wins for hit-testing.
+    if (g_NotificationService)
+        ui::RenderNotificationOverlay(*g_NotificationService);
+
     RenderCustomTitleBar(); // always last so it renders on top of everything
 }
 
@@ -3997,9 +4391,49 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
-    // Font sizes are applied via FontGlobalScale at runtime (no atlas rebuild needed)
-    // g_fonts[0..2] unused — scale factors applied in RenderSettingsWindow
-    io.Fonts->AddFontDefault();
+    // Font sizes are applied via FontGlobalScale at runtime (no atlas rebuild needed).
+    // We load a TTF with extended Unicode coverage so IB-returned strings
+    // (e.g. "BRFG — Briefing.com General Market Columns") and our own UI
+    // strings (em dash, bullet, arrows, multiplication ×, sigma σ, ±) render
+    // properly instead of '?' fallback glyphs from ProggyClean.
+    {
+        // Glyph range: ASCII + Latin-1 + General Punctuation + Arrows
+        // + Mathematical Operators + Greek (for σ). Static so the array
+        // outlives the AddFontFromFileTTF call (ImGui doesn't copy it).
+        static const ImWchar kRanges[] = {
+            0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement
+            0x0370, 0x03FF,   // Greek (σ, µ, …)
+            0x2010, 0x205F,   // General Punctuation (em/en dash, bullets, quotes, ellipsis)
+            0x2190, 0x21FF,   // Arrows
+            0x2200, 0x22FF,   // Mathematical Operators (×, ±, ≥, ≤, …)
+            0,
+        };
+
+        // Try several common system TTFs in priority order; fall back to
+        // ImGui's bundled ProggyClean if none are present (renders '?' for
+        // out-of-ASCII glyphs but keeps the app launching on minimal systems).
+        const char* kCandidates[] = {
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/Library/Fonts/Arial.ttf",                                 // macOS
+            "C:\\Windows\\Fonts\\segoeui.ttf",                          // Windows
+        };
+        ImFont* loaded = nullptr;
+        for (const char* path : kCandidates) {
+            if (std::filesystem::exists(path)) {
+                loaded = io.Fonts->AddFontFromFileTTF(path, 14.0f, nullptr, kRanges);
+                if (loaded) {
+                    fprintf(stderr, "[font] loaded %s\n", path);
+                    break;
+                }
+            }
+        }
+        if (!loaded) {
+            fprintf(stderr, "[font] no TTF candidate found; non-ASCII glyphs will render as '?'\n");
+            io.Fonts->AddFontDefault();
+        }
+    }
 
     // ── Terminal Dark theme ───────────────────────────────────────────────────
     ImGui::StyleColorsDark();
@@ -4145,6 +4579,50 @@ int main(int argc, char* argv[]) {
     init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     ImGui_ImplVulkan_Init(&init_info);
 
+    // Notifications service. Audio init failure is non-fatal — the service
+    // still queues toasts; PlayNow becomes a no-op when no audio device is
+    // available (headless CI, Wayland-without-pulse, etc.).
+    g_NotificationService = std::make_unique<core::services::NotificationService>();
+    {
+        // Asset directory resolution. We try multiple candidates because
+        // the dev build sits at <repo>/build/ibkr-trading-app while the WAVs
+        // live at <repo>/assets/sounds — there's no install step copying
+        // assets next to the exe.
+        std::vector<std::filesystem::path> candidates;
+        try {
+            std::filesystem::path exeDir =
+                std::filesystem::canonical("/proc/self/exe").parent_path();
+            candidates.push_back(exeDir / "assets" / "sounds");        // installed
+            candidates.push_back(exeDir / ".." / "assets" / "sounds"); // dev (build/ → repo)
+        } catch (...) {}
+        try {
+            candidates.push_back(std::filesystem::current_path() / "assets" / "sounds");
+        } catch (...) {}
+
+        bool resolved = false;
+        for (const auto& c : candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(c, ec)) {
+                std::filesystem::path canon = std::filesystem::weakly_canonical(c, ec);
+                std::string dir = ec ? c.string() : canon.string();
+                g_NotificationService->SetAssetDir(dir);
+                fprintf(stderr, "[notify] assets: %s\n", dir.c_str());
+                resolved = true;
+                break;
+            }
+        }
+        if (!resolved)
+            fprintf(stderr, "[notify] no assets/sounds dir found — audio disabled\n");
+    }
+
+    // History window — independent of IB connection lifetime so the user can
+    // re-read events that fired before / during a disconnect.
+    g_NotificationsWindow = new ui::NotificationsWindow();
+
+    // Load saved news-provider disabled set so the filter is respected on
+    // first connect (before IB even returns the entitled list).
+    LoadDisabledNewsProviders();
+
     g_Login.UpdatePort();
 
     ImVec4 clear_color = ImVec4(0.08f, 0.08f, 0.08f, 1.0f);
@@ -4215,6 +4693,8 @@ int main(int argc, char* argv[]) {
     err = vkDeviceWaitIdle(g_Device);
     check_vk_result(err);
 
+    delete g_NotificationsWindow; g_NotificationsWindow = nullptr;
+    g_NotificationService.reset();
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImPlot::DestroyContext();

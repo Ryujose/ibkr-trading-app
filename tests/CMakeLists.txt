@@ -29,11 +29,17 @@ add_executable(tests-core
     test_ibkr_utils.cpp
     test_chart_analysis.cpp
     test_replay.cpp
+    test_notification_service.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/services/NotificationService.cpp
 )
 
 target_include_directories(tests-core PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
+
+# Compile NotificationService.cpp without the miniaudio backend in tests-core
+# so we keep the "no IB API / no audio dep" promise. PlayHook stubs out audio.
+target_compile_definitions(tests-core PRIVATE IBKR_NOTIFICATIONS_NO_AUDIO)
 
 target_link_libraries(tests-core PRIVATE Catch2::Catch2WithMain)
 target_compile_features(tests-core PRIVATE cxx_std_20)

@@ -43,6 +43,31 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
   ./build/tests/tests-core
 ```
 
+## Tools Commands (sound asset generators)
+
+```bash
+# Configure with helper tools enabled
+cmake -B build -S . -DIBKR_BUILD_TOOLS=ON
+
+# Build the alert-tone WAV generator
+cmake --build build --target gen_tones -j$(nproc)
+
+# Generate the 11 alert tones (skips existing files)
+./build/tools/gen_tones assets/sounds/tones/
+# Force-overwrite all 11
+./build/tools/gen_tones --force assets/sounds/tones/
+
+# Generate the 11 voice phrases (requires piper + sox + downloaded model)
+# See tools/README.md for piper/model setup.
+./tools/gen_voice.sh
+./tools/gen_voice.sh --force
+```
+
+Tone WAVs are committed to `assets/sounds/tones/`. Voice WAVs land in
+`assets/sounds/voice/` and are also committed once generated. Piper voice
+models in `tools/piper-voices/` are gitignored — each developer downloads
+their own copy.
+
 ## Binary Location
 - Output: `build/ibkr-trading-app`
 - Display `:1` is available on this machine — always use `DISPLAY=:1` when running
@@ -61,10 +86,12 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
 - `libprotobuf` 3.21.12 (system, `find_package(Protobuf REQUIRED)`)
 - `ibapi-lib` — in-tree static lib from `twsapi_macunix.1037.02/...`
 - `bid-stubs` — in-tree: `src/bid_stubs/bid_stubs.c` (double bit-cast for Intel BID64)
+- `miniaudio` v0.11.22 — in-tree single header at `third_party/miniaudio/miniaudio.h` (audio backend for `NotificationService`; public domain / MIT-0)
 - `Catch2` v3.7.1 (FetchContent, only when `IBKR_BUILD_TESTS=ON`)
 
 ## CMake Options
 - `IBKR_BUILD_TESTS` (default OFF) — build test binaries and register with CTest
+- `IBKR_BUILD_TOOLS` (default OFF) — build helper tools (e.g. the `gen_tones` sound generator under `tools/`)
 - `IBKR_SANITIZE` (default OFF) — enable ASan + UBSan on `tests-core` (requires `IBKR_BUILD_TESTS=ON`, GCC/Clang only)
 
 ## CMake Notes

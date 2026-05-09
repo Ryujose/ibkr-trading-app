@@ -171,3 +171,12 @@ CLAUDE.local.md
 external/tws-api
 twsapi_macunix.1037.02/
 twsapi_macunix.1037.02.tar.gz
+
+# =========================
+
+# Piper voice models (per-developer download, ~20 MB each)
+# See tools/README.md for the canonical download URL.
+
+# =========================
+tools/piper-voices/*.onnx
+tools/piper-voices/*.onnx.json

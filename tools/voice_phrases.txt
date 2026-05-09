@@ -1,0 +1,18 @@
+# Voice phrases for the NotificationService — single source of truth.
+#
+# Format: <event_name>|<phrase>
+# event_name MUST match NotificationService::EventName (e.g. "order_filled").
+# Lines starting with `#` and blank lines are ignored.
+# Phrases must be short enough that piper renders them in ≤ 1.2 s.
+
+order_filled        | Order filled
+order_partial_fill  | Partial fill
+order_rejected      | Order rejected
+order_cancelled     | Order cancelled
+ib_error            | Order error
+connection_lost     | Connection lost
+connection_restored | Connection restored
+long_setup          | Long setup detected
+short_setup         | Short setup detected
+unguarded_position  | Position unprotected
+test                | Test

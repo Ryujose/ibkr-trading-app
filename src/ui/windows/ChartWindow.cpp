@@ -260,6 +260,8 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     m_dragPendingIsAux  = false;
     m_firstPricePlaced  = false;
     m_secondPricePlaced = false;
+    // Reset edge-detector so a new symbol can fire OnSignalChange.
+    m_lastNotifiedSignal = BreakoutDirection::None;
     AddToHistory(symbol);
     RequestNewData();
 }
@@ -4489,6 +4491,17 @@ void ChartWindow::DetectStructure() {
     if (m_setupSettings.overlay && m_breakoutSignal != BreakoutDirection::None) {
         ComputeSetupPlan();
     }
+
+    // Edge-trigger OnSignalChange so a held signal doesn't re-fire every recompute.
+    if (m_lastNotifiedSignal == BreakoutDirection::None &&
+        m_breakoutSignal     != BreakoutDirection::None &&
+        OnSignalChange)
+    {
+        const double last = m_closes.empty() ? 0.0 : m_closes.back();
+        const double rr   = m_setup.valid ? m_setup.rr : 0.0;
+        OnSignalChange(m_breakoutSignal, m_symbol, last, rr);
+    }
+    m_lastNotifiedSignal = m_breakoutSignal;
 }
 
 // ============================================================================
