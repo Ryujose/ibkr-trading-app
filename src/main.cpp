@@ -3373,14 +3373,21 @@ static void HandleWindowResize() {
 
     // Resize math uses global mouse coords (io.MousePos = screen space).
     const ImGuiIO& io = ImGui::GetIO();
-    const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    const bool lmb         = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    // Only START a resize on the click frame — never on "LMB happens to be
+    // held while the cursor entered the edge zone." Otherwise mid-drag of an
+    // ImGui floating viewport toward a screen edge will cause the OS to clamp
+    // the floating window, the cursor exits it onto the main app's edge zone,
+    // and we'd flip into resize mode — shrinking the main window every frame
+    // and pulling the docking drop-target rectangles out from under the cursor.
+    const bool lmbClicked  = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
     if (!lmb) {
         s_resizing = false;
         s_edge     = 0;
     }
 
-    if (!s_resizing && lmb && edge != 0) {
+    if (!s_resizing && lmbClicked && edge != 0) {
         s_resizing = true;
         s_edge     = edge;
         s_startMX  = io.MousePos.x;
@@ -3425,7 +3432,8 @@ static void RenderCustomTitleBar() {
     ImGui::Begin("##titlebar", nullptr,
         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove       |
         ImGuiWindowFlags_NoScrollbar  | ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav);
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoDocking);
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2  wp = ImGui::GetWindowPos();
@@ -4105,6 +4113,20 @@ int main(int argc, char* argv[]) {
     g_baseStyle = ImGui::GetStyle(); // snapshot before any scaling
 
     ImGui_ImplGlfw_InitForVulkan(g_AppWindow, true);
+
+    // Force ImGui's own hovered-viewport heuristic for docking drag-and-drop.
+    // The GLFW backend sets ImGuiBackendFlags_HasMouseHoveredViewport and reports
+    // the dragged viewport itself as hovered (because OS hit-testing sees the
+    // floating window on top), which makes the dock-target highlight track the
+    // wrong viewport — the blue marks shift away from the cursor and the window
+    // snaps to the wrong dock node on release. The Win32 WndProc hook in the
+    // GLFW backend doesn't fully fix this either, and on Linux GLFW < 3.4 has
+    // no GLFW_MOUSE_PASSTHROUGH at all, so the misreport happens on every OS.
+    // Clearing the flag makes ImGui ignore the backend value and call
+    // FindHoveredViewportFromPlatformWindowStack(), which skips
+    // ImGuiViewportFlags_NoInputs viewports and correctly returns the dock
+    // target underneath the dragged window.
+    io.BackendFlags &= ~ImGuiBackendFlags_HasMouseHoveredViewport;
 
     ImGui_ImplVulkan_InitInfo init_info = {};
     init_info.Instance              = g_Instance;
