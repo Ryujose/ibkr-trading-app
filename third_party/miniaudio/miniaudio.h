@@ -31533,7 +31533,7 @@ static int ma_device__jack_buffer_size_callback(ma_jack_nframes_t frameCount, vo
     MA_ASSERT(pDevice != NULL);
 
     if (pDevice->type == ma_device_type_capture || pDevice->type == ma_device_type_duplex) {
-        size_t newBufferSize = frameCount * (pDevice->capture.internalChannels * ma_get_bytes_per_sample(pDevice->capture.internalFormat));
+        size_t newBufferSize = (size_t)frameCount * pDevice->capture.internalChannels * ma_get_bytes_per_sample(pDevice->capture.internalFormat);
         float* pNewBuffer = (float*)ma_calloc(newBufferSize, &pDevice->pContext->allocationCallbacks);
         if (pNewBuffer == NULL) {
             return MA_OUT_OF_MEMORY;
@@ -31546,7 +31546,7 @@ static int ma_device__jack_buffer_size_callback(ma_jack_nframes_t frameCount, vo
     }
 
     if (pDevice->type == ma_device_type_playback || pDevice->type == ma_device_type_duplex) {
-        size_t newBufferSize = frameCount * (pDevice->playback.internalChannels * ma_get_bytes_per_sample(pDevice->playback.internalFormat));
+        size_t newBufferSize = (size_t)frameCount * pDevice->playback.internalChannels * ma_get_bytes_per_sample(pDevice->playback.internalFormat);
         float* pNewBuffer = (float*)ma_calloc(newBufferSize, &pDevice->pContext->allocationCallbacks);
         if (pNewBuffer == NULL) {
             return MA_OUT_OF_MEMORY;
