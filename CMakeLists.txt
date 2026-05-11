@@ -339,9 +339,14 @@ target_compile_definitions(ibkr-trading-app PRIVATE
 # ============================================================================
 # Installation Rules
 # ============================================================================
+# Install layout (used by `cmake --install build --prefix dist` and by the
+# CI release pipeline). Binary and assets/ sit as siblings at the root of
+# the install prefix so the runtime resolver hits <exe>/assets/sounds on
+# its first candidate path — no PATH/CWD juggling required.
 install(TARGETS ibkr-trading-app
-    RUNTIME DESTINATION bin
+    RUNTIME DESTINATION .
 )
+install(DIRECTORY assets DESTINATION .)
 
 # ============================================================================
 # Optional: Tests

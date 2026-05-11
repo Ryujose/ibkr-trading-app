@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gen_voice.sh — generate the 11 voice-phrase WAVs for NotificationService.
+# gen_voice.sh — generate the voice-phrase WAVs for NotificationService.
 #
 # Reads tools/voice_phrases.txt (event_name | phrase) and writes one WAV per
 # line into assets/sounds/voice/<event_name>.wav.

@@ -72,6 +72,32 @@ their own copy.
 - Output: `build/ibkr-trading-app`
 - Display `:1` is available on this machine — always use `DISPLAY=:1` when running
 
+## Install / Shipping Layout
+
+`cmake --install build --prefix <dir>` produces a self-contained directory:
+
+```
+<prefix>/
+├── ibkr-trading-app        (binary at root, not under bin/)
+└── assets/
+    └── sounds/{tones,voice}/*.wav
+```
+
+Binary and `assets/` sit as siblings so the runtime resolver in `main.cpp`
+hits its **first** candidate path (`<exeDir>/assets/sounds`) without
+PATH/CWD juggling. The CI release pipeline (`.github/workflows/build.yml`)
+runs `cmake --install build --prefix dist` after the test suite passes,
+then uploads `dist/` as the `ibkr-trading-app-{linux,macos,windows}`
+artifact — users download a single zip and run the binary in place with
+all sounds working.
+
+Driven by two install rules at `CMakeLists.txt:342`:
+- `install(TARGETS ibkr-trading-app RUNTIME DESTINATION .)`
+- `install(DIRECTORY assets DESTINATION .)`
+
+The Windows install command needs `--config Release` because MSVC is a
+multi-config generator (`cmake --install build --config Release --prefix dist`).
+
 ## Platform Notes
 - **Linux**: Requires `vulkan-sdk` and development headers via package manager
 - **macOS**: Requires Xcode CLI tools + Homebrew (`imgui`, `glm`)

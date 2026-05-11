@@ -49,6 +49,10 @@ enum class NotificationEvent : int {
     ShortSetup,
     UnguardedPosition,
     Test,
+    // Appended after Test to preserve existing integer values for any
+    // serialised int-keyed notification state on disk.
+    OrderWorking,        // order accepted by IB and live in the book
+    OrderHeld,           // order accepted but parked (e.g. pre-open hold)
     _Count
 };
 

@@ -2870,9 +2870,14 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                           && m_dragPendingIsAux == isAux;
         double drawPrice = isDragging ? m_dragPendingPrice : legPrice;
 
-        // Color: main leg uses side color; aux (limit) leg uses orange
+        // Color: main leg uses side color; aux (limit) leg uses orange.
+        // Held orders override to amber so they pop visually against live ones.
         ImU32 lineCol, txtCol, lblBg;
-        if (isAux) {
+        if (!order.holdReason.empty()) {
+            lineCol = isDragging ? IM_COL32(255, 200,  60, 255) : IM_COL32(220, 170,  40, 210);
+            txtCol  = IM_COL32(255, 230, 160, 255);
+            lblBg   = IM_COL32( 90,  60,   0, 255);
+        } else if (isAux) {
             lineCol = isDragging ? IM_COL32(255, 180,  50, 255) : IM_COL32(220, 140,  30, 210);
             txtCol  = IM_COL32(255, 230, 160, 255);
             lblBg   = IM_COL32(100,  55,   5, 255);
@@ -3010,6 +3015,16 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                     std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
                                   order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
             }
+            lblSz = ImGui::CalcTextSize(lbl);
+        }
+
+        // Append IB hold-warning suffix (main leg only — aux is the limit twin
+        // of the same order and would just duplicate the tag). The full
+        // holdReason text shows on hover via the cancel-button tooltip path,
+        // here we just signal "this order is being held, not Working".
+        if (!isAux && !order.holdReason.empty()) {
+            size_t lblLen = std::strlen(lbl);
+            std::snprintf(lbl + lblLen, sizeof(lbl) - lblLen, " ⚠ HELD ");
             lblSz = ImGui::CalcTextSize(lbl);
         }
 

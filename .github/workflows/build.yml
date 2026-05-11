@@ -49,12 +49,15 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 
+      - name: Install (binary + assets/) to dist/
+        run: cmake --install build --prefix dist
+
       - name: Upload artifact
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: ibkr-trading-app-linux
-          path: build/ibkr-trading-app
+          path: dist/
           retention-days: 30
 
   build-macos:
@@ -95,12 +98,15 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 
+      - name: Install (binary + assets/) to dist/
+        run: cmake --install build --prefix dist
+
       - name: Upload artifact
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: ibkr-trading-app-macos
-          path: build/ibkr-trading-app
+          path: dist/
           retention-days: 30
 
   build-windows:
@@ -171,12 +177,16 @@ jobs:
         run: ctest --test-dir build -C Release --output-on-failure
         shell: pwsh
 
+      - name: Install (binary + assets/) to dist/
+        run: cmake --install build --config Release --prefix dist
+        shell: pwsh
+
       - name: Upload artifact
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: ibkr-trading-app-windows
-          path: build/Release/ibkr-trading-app.exe
+          path: dist/
           retention-days: 30
 
   # ── Sanitizer job (Linux only) ────────────────────────────────────────────

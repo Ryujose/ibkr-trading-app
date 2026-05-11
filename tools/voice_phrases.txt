@@ -16,3 +16,5 @@ long_setup          | Long setup detected
 short_setup         | Short setup detected
 unguarded_position  | Position unprotected
 test                | Test
+order_working       | Order working
+order_held          | Order held

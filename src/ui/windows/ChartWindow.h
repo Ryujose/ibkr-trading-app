@@ -36,6 +36,7 @@ public:
         bool        isBuy     = true;
         double      qty       = 0.0;
         std::string orderType;         // IB order-type string: "LMT", "STP", "STP LMT", …
+        std::string holdReason;        // IB hold warning (e.g. "[404] held until open"); "" if live
     };
 
     // ---- Current position info (for the P&L strip) --------------------------

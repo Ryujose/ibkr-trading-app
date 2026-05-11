@@ -59,12 +59,14 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
 
 | Job | Trigger | What runs |
 |---|---|---|
-| `build-linux` | Every push/PR | Full build + `ctest` (both targets) |
-| `build-macos` | Every push/PR | Full build + `ctest` (both targets) |
-| `build-windows` | Every push/PR | Full build + `ctest -C Release` (both targets) |
+| `build-linux` | Every push/PR | Full build + `ctest`; on main also `cmake --install build --prefix dist` + upload `dist/` as `ibkr-trading-app-linux` artifact |
+| `build-macos` | Every push/PR | Full build + `ctest`; same install + upload step on main |
+| `build-windows` | Every push/PR | Full build + `ctest -C Release`; on main `cmake --install build --config Release --prefix dist` + upload `dist/` as `ibkr-trading-app-windows` |
 | `sanitize-linux` | After `build-linux` passes | Debug build of `tests-core` only, with ASan+UBSan |
 
 FetchContent artifacts (`build/_deps`) are cached in GitHub Actions keyed on `CMakeLists.txt` + `tests/CMakeLists.txt` hashes.
+
+Release artifacts are self-contained: each downloaded zip contains the binary at the root plus `assets/sounds/{tones,voice}/*.wav` (26 WAVs) as a sibling directory. The runtime asset resolver in `main.cpp` (cross-platform via `GetModuleFileNameW` / `_NSGetExecutablePath` / `/proc/self/exe`) hits the `<exeDir>/assets/sounds` candidate immediately, so tone + voice playback works without CWD/PATH adjustments. See `.claude/rules/build.md` for the install layout details.
 
 ## Adding New Tests
 

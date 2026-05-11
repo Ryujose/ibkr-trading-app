@@ -21,6 +21,13 @@
 #include <filesystem>
 #include <deque>
 
+// Platform-specific exe-path discovery (used in the asset-dir resolver).
+#if defined(_WIN32)
+    #include <windows.h>
+#elif defined(__APPLE__)
+    #include <mach-o/dyld.h>
+#endif
+
 #define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -141,10 +148,15 @@ static core::services::IBKRClient* g_IBClient = nullptr;
 // still queue, audio is silenced. All Notify() call sites guard on non-null.
 static std::unique_ptr<core::services::NotificationService> g_NotificationService;
 
-// User-initiated cancellations: when we send a cancel ourselves, record the
-// orderId here so the resulting Cancelled status doesn't fire an unsolicited
-// "Order cancelled" notification. Drained on each onOrderStatusChanged.
-static std::unordered_set<int> g_userCancelled;
+// Order ids we just placed locally and haven't yet observed accepted at IB.
+// IB sends `onOpenOrder` (status=Working) before `onOrderStatusChanged`, and
+// `onOpenOrder` also fires for every existing order on `reqAllOpenOrders`
+// (connect/reconnect) — so we can't infer "first acceptance" from status
+// alone. Inserted at every PlaceOrder() submission site; consumed on the
+// first observation of Working/PartialFill (which then fires the
+// OrderWorking / OrderHeld toast); also pruned on terminal status so a
+// rejected-on-submit order doesn't leak.
+static std::unordered_set<int> g_pendingLocalAccept;
 
 // Previous-close prices keyed by symbol, used to compute change/% for scanner rows.
 static std::unordered_map<std::string, double> g_scannerPrevClose;
@@ -232,9 +244,10 @@ static void UpdateChartPendingOrders(ui::ChartWindow* win) {
         if (o.symbol != sym) continue;
         if (IsTerminalOrderStatus(o.status)) continue;
         ui::ChartWindow::PendingOrderLine ln;
-        ln.orderId = id;
-        ln.isBuy   = (o.side == core::OrderSide::Buy);
-        ln.qty     = o.quantity;
+        ln.orderId    = id;
+        ln.isBuy      = (o.side == core::OrderSide::Buy);
+        ln.qty        = o.quantity;
+        ln.holdReason = o.holdReason;
         if (o.type == core::OrderType::StopLimit) {
             ln.price     = o.stopPrice;
             ln.auxPrice  = o.limitPrice;
@@ -266,6 +279,41 @@ static void UpdateChartPendingOrders(ui::ChartWindow* win) {
 
 static void UpdateAllChartPendingOrders() {
     for (auto& e : g_chartEntries) UpdateChartPendingOrders(e.win);
+}
+
+// Fire OrderWorking or OrderHeld toast the first time a locally-placed order
+// is observed accepted (status Working or PartialFill). Idempotent: removes
+// the id from g_pendingLocalAccept so subsequent observations stay quiet.
+// Safe to call from both onOpenOrder and onOrderStatusChanged — whichever
+// arrives first wins, the other becomes a no-op.
+static void MaybeNotifyOrderAccepted(int orderId) {
+    if (!g_NotificationService) return;
+    auto pit = g_pendingLocalAccept.find(orderId);
+    if (pit == g_pendingLocalAccept.end()) return;
+    auto it = g_liveOrders.find(orderId);
+    if (it == g_liveOrders.end()) return;
+    const core::OrderStatus s = it->second.status;
+    if (s != core::OrderStatus::Working && s != core::OrderStatus::PartialFill)
+        return;
+    const auto& o = it->second;
+    const bool isHeld = !o.holdReason.empty();
+    char body[260];
+    if (isHeld) {
+        std::snprintf(body, sizeof(body), "%s %s — %s",
+                      o.symbol.c_str(), core::OrderTypeStr(o.type),
+                      o.holdReason.c_str());
+    } else {
+        std::snprintf(body, sizeof(body), "%s %s %g @ live",
+                      o.symbol.c_str(), core::OrderTypeStr(o.type), o.quantity);
+    }
+    g_NotificationService->Notify(
+        isHeld ? core::services::NotificationSeverity::Warning
+               : core::services::NotificationSeverity::Info,
+        core::services::NotificationCategory::Orders,
+        isHeld ? core::services::NotificationEvent::OrderHeld
+               : core::services::NotificationEvent::OrderWorking,
+        isHeld ? "Order held" : "Order working", body);
+    g_pendingLocalAccept.erase(pit);
 }
 
 // Push position info for a specific chart window (matched by symbol)
@@ -1141,6 +1189,7 @@ static void SpawnChartWindow(int idx) {
         order.submittedAt   = std::time(nullptr);
         order.updatedAt     = order.submittedAt;
         g_liveOrders[id]    = order;
+        g_pendingLocalAccept.insert(id);
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
         UpdateAllChartPendingOrders();
         g_IBClient->PlaceOrder(order);
@@ -1148,7 +1197,6 @@ static void SpawnChartWindow(int idx) {
     };
 
     e.win->OnCancelOrder = [](int orderId) {
-        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
 
@@ -1204,12 +1252,12 @@ static void SpawnTradingWindow(int idx) {
         if (!g_IBClient || !g_IBClient->IsConnected()) return;
         core::Order order = o;
         order.account     = g_selectedAccount;
+        g_pendingLocalAccept.insert(order.orderId);
         g_IBClient->PlaceOrder(order);
         if (order.orderId >= g_nextOrderId) g_nextOrderId = order.orderId + 1;
     };
 
     e.win->OnOrderCancel = [](int orderId) {
-        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
 
@@ -1875,7 +1923,6 @@ static void CreateTradingWindows() {
 
     // Wire OrdersWindow
     g_OrdersWindow->OnCancelOrder = [](int orderId) {
-        g_userCancelled.insert(orderId);
         if (g_IBClient) g_IBClient->CancelOrder(orderId);
     };
     g_OrdersWindow->OnRefresh = []() {
@@ -2589,6 +2636,10 @@ static void WireIBCallbacks() {
         if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(order);
         UpdateAllChartPendingOrders();
         RecomputeUnguardedPositions();
+        // IB acks a locally-placed order via onOpenOrder before
+        // orderStatus arrives; fire the accept toast here so we don't miss
+        // it if onOrderStatusChanged is delayed or coalesced. Idempotent.
+        MaybeNotifyOrderAccepted(order.orderId);
     };
     g_IBClient->onOpenOrderEnd = []() {
         // nothing extra needed — data already pushed via onOpenOrder
@@ -2601,7 +2652,7 @@ static void WireIBCallbacks() {
             if (te.win) te.win->OnOrderStatus(orderId, status, filled, avgPrice);
         if (g_OrdersWindow)
             g_OrdersWindow->OnOrderStatus(orderId, status, filled, avgPrice);
-        // Keep our local order map in sync for the chart overlay
+        // Keep our local order map in sync for the chart overlay.
         auto it = g_liveOrders.find(orderId);
         if (it != g_liveOrders.end()) {
             it->second.status       = status;
@@ -2611,29 +2662,42 @@ static void WireIBCallbacks() {
         UpdateAllChartPendingOrders();
         RecomputeUnguardedPositions();
 
+        // Fire the OrderWorking / OrderHeld toast on first observation of
+        // an accepted state for a locally-placed order. Idempotent across
+        // both onOpenOrder and onOrderStatusChanged — whichever IB fires
+        // first wins. On terminal status (Filled / Cancelled / Rejected)
+        // before any Working observation (rare but possible on instant
+        // rejection), drop the id silently so we don't toast Working for
+        // an order that never made it.
+        if (status == core::OrderStatus::Filled    ||
+            status == core::OrderStatus::Cancelled ||
+            status == core::OrderStatus::Rejected) {
+            g_pendingLocalAccept.erase(orderId);
+        } else {
+            MaybeNotifyOrderAccepted(orderId);
+        }
+
         // Bracket: LMT cancelled/rejected → forget pending STP
         if (status == core::OrderStatus::Cancelled ||
             status == core::OrderStatus::Rejected) {
             g_pendingBracketStops.erase(orderId);
         }
 
-        // Notifications. Rejected gets surfaced via onError (which has the IB
-        // reason string); here we only handle the unsolicited cancel case so we
-        // don't double-fire when the user clicks Cancel themselves.
-        if (status == core::OrderStatus::Cancelled && g_NotificationService) {
-            auto uc = g_userCancelled.find(orderId);
-            if (uc == g_userCancelled.end() && it != g_liveOrders.end()) {
-                char body[160];
-                std::snprintf(body, sizeof(body), "%s %s",
-                              it->second.symbol.c_str(),
-                              core::OrderTypeStr(it->second.type));
-                g_NotificationService->Notify(
-                    core::services::NotificationSeverity::Warning,
-                    core::services::NotificationCategory::Orders,
-                    core::services::NotificationEvent::OrderCancelled,
-                    "Order cancelled", body);
-            }
-            if (uc != g_userCancelled.end()) g_userCancelled.erase(uc);
+        // Cancel notification — fires on every Cancelled status, including
+        // user-initiated cancels. Acts as confirmation that IB actually
+        // processed the cancel request. Rejected is handled separately via
+        // onError (which has the IB reason string).
+        if (status == core::OrderStatus::Cancelled && g_NotificationService &&
+            it != g_liveOrders.end()) {
+            char body[160];
+            std::snprintf(body, sizeof(body), "%s %s",
+                          it->second.symbol.c_str(),
+                          core::OrderTypeStr(it->second.type));
+            g_NotificationService->Notify(
+                core::services::NotificationSeverity::Warning,
+                core::services::NotificationCategory::Orders,
+                core::services::NotificationEvent::OrderCancelled,
+                "Order cancelled", body);
         }
     };
 
@@ -2716,7 +2780,11 @@ static void WireIBCallbacks() {
                 stop.limitPrice = core::services::RoundToTick(raw, 0.01);
             }
             stop.tif        = core::TimeInForce::GTC;
-            stop.outsideRth = false;  // stop condition only triggers during RTH regardless
+            // Stop triggers are evaluated by IB only when outsideRth=true outside
+            // RTH (for instruments that allow ext-hours stops). For an intra-RTH
+            // bracket this stays false; for an ext-hours bracket the caller already
+            // set p.outsideRth=true so the stop is eligible to fire pre/post-market.
+            stop.outsideRth = p.outsideRth;
             stop.account    = g_selectedAccount;
             stop.ocaGroup   = ocaTag;
             stop.ocaType    = ocaTag.empty() ? 0 : 1;
@@ -2724,6 +2792,7 @@ static void WireIBCallbacks() {
             stop.submittedAt = now;
             stop.updatedAt   = now;
             g_liveOrders[stopId] = stop;
+            g_pendingLocalAccept.insert(stopId);
             if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(stop);
             g_IBClient->PlaceOrder(stop);
 
@@ -2745,6 +2814,7 @@ static void WireIBCallbacks() {
                 tp.submittedAt = now;
                 tp.updatedAt   = now;
                 g_liveOrders[tpId] = tp;
+                g_pendingLocalAccept.insert(tpId);
                 if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(tp);
                 g_IBClient->PlaceOrder(tp);
             }
@@ -3029,6 +3099,53 @@ static void WireIBCallbacks() {
     g_IBClient->onError = [](int reqId, int code, const std::string& msg) {
         fprintf(stderr, "[IB Error reqId=%d code=%d] %s\n", reqId, code, msg.c_str());
 
+        // ── Informational hold warnings ──────────────────────────────────────
+        // IB sends these as error() but the order is still live — it's just
+        // being held (typically until RTH open) or has had an attribute
+        // adjusted by the routing engine. Stamp them onto the order's
+        // holdReason so the UI can show a "(held)" tag without flipping the
+        // order to Rejected.
+        //  399  — order message warning (general info modifier)
+        //  404  — order held until market open
+        //  2109 — outside RTH attribute ignored on non-routed order
+        //  2148 — order held: routed but not yet eligible
+        //  10311 — order has a constraint but is not rejected
+        const bool isHoldWarning =
+            code == 399  || code == 404  || code == 2109 ||
+            code == 2148 || code == 10311;
+        if (isHoldWarning) {
+            auto hit = g_liveOrders.find(reqId);
+            if (hit != g_liveOrders.end() &&
+                hit->second.status != core::OrderStatus::Filled    &&
+                hit->second.status != core::OrderStatus::Cancelled &&
+                hit->second.status != core::OrderStatus::Rejected) {
+                char hold[512];
+                std::snprintf(hold, sizeof(hold), "[%d] %s", code, msg.c_str());
+                hit->second.holdReason = hold;
+                // OrdersWindow is the global blotter; refresh it via OnOpenOrder
+                // which preserves any commission / fill info already received.
+                // TradingWindow's per-instance blotter only tracks locally-
+                // submitted orders so we skip it here — chart overlay covers
+                // the bracket case where the stop/TP legs were submitted by
+                // main.cpp on entry fill.
+                if (g_OrdersWindow) g_OrdersWindow->OnOpenOrder(hit->second);
+                UpdateAllChartPendingOrders();
+                if (g_NotificationService) {
+                    char body[260];
+                    std::snprintf(body, sizeof(body), "%s %s — %s",
+                                  hit->second.symbol.c_str(),
+                                  core::OrderTypeStr(hit->second.type),
+                                  msg.c_str());
+                    g_NotificationService->Notify(
+                        core::services::NotificationSeverity::Warning,
+                        core::services::NotificationCategory::Orders,
+                        core::services::NotificationEvent::OrderHeld,
+                        "Order held", body);
+                }
+            }
+            return;  // do NOT fall through to the rejection path
+        }
+
         // Order-related error: mark the order as Rejected in all windows.
         // IB sends error() for rejections alongside (or instead of) orderStatus().
         // We act on Pending OR Working orders — outside-RTH rejections arrive after
@@ -3067,20 +3184,27 @@ static void WireIBCallbacks() {
         // Curated IB-error allowlist: only surface these as toasts. Everything
         // else stays in the log (filtered by the lambda above for order-status
         // tracking but not for user-facing alert).
+        //
+        // Code 202 ("Order Canceled - Reason: ...") is deliberately NOT in
+        // this list: IB sends it alongside orderStatus(Cancelled) for every
+        // cancel, and the orderStatus path below already fires an
+        // OrderCancelled toast with proper user-cancel dedup. Surfacing 202
+        // here as IbError would double-toast every cancel.
         if (g_NotificationService) {
             const bool surface =
                 code == 110   ||   // price does not conform to min tick
                 code == 201   ||   // order rejected
-                code == 202   ||   // order cancelled (with reason)
                 code == 321   ||   // server validation error
                 code == 354   ||   // not subscribed
                 code == 10148 ||   // can't modify cancelled order
                 code == 10149;     // can't cancel — order in terminal state
-            // Skip if we already rendered the order-rejected toast above to
-            // avoid duplicate noise.
-            const bool alreadyRejected = (it != g_liveOrders.end()) &&
-                (it->second.status == core::OrderStatus::Rejected);
-            if (surface && !alreadyRejected) {
+            // Skip if we already rendered the order-rejected toast above, or
+            // if the order is already in a terminal Cancelled state (the
+            // OrderCancelled toast handles those), to avoid duplicate noise.
+            const bool alreadyHandled = (it != g_liveOrders.end()) &&
+                (it->second.status == core::OrderStatus::Rejected ||
+                 it->second.status == core::OrderStatus::Cancelled);
+            if (surface && !alreadyHandled) {
                 char title[64];
                 std::snprintf(title, sizeof(title), "IB error %d", code);
                 std::string body = msg.size() > 200 ? msg.substr(0, 200) : msg;
@@ -4584,17 +4708,40 @@ int main(int argc, char* argv[]) {
     // available (headless CI, Wayland-without-pulse, etc.).
     g_NotificationService = std::make_unique<core::services::NotificationService>();
     {
-        // Asset directory resolution. We try multiple candidates because
-        // the dev build sits at <repo>/build/ibkr-trading-app while the WAVs
-        // live at <repo>/assets/sounds — there's no install step copying
-        // assets next to the exe.
-        std::vector<std::filesystem::path> candidates;
+        // Cross-platform "where is my executable" lookup. Each branch returns
+        // an absolute path to the running binary; we then take parent_path()
+        // for the assets-dir search. Falls through to an empty path on
+        // failure — the resolver below then only tries CWD.
+        std::filesystem::path exeDir;
         try {
-            std::filesystem::path exeDir =
-                std::filesystem::canonical("/proc/self/exe").parent_path();
-            candidates.push_back(exeDir / "assets" / "sounds");        // installed
-            candidates.push_back(exeDir / ".." / "assets" / "sounds"); // dev (build/ → repo)
+#if defined(_WIN32)
+            wchar_t buf[32768] = {};
+            DWORD n = GetModuleFileNameW(nullptr, buf, 32768);
+            if (n > 0 && n < 32768)
+                exeDir = std::filesystem::path(buf).parent_path();
+#elif defined(__APPLE__)
+            uint32_t bufSize = 0;
+            _NSGetExecutablePath(nullptr, &bufSize);   // first call: size query
+            std::string buf(bufSize, '\0');
+            if (_NSGetExecutablePath(buf.data(), &bufSize) == 0) {
+                std::error_code ec;
+                exeDir = std::filesystem::canonical(buf, ec).parent_path();
+            }
+#else  // Linux, BSDs with procfs
+            std::error_code ec;
+            exeDir = std::filesystem::canonical("/proc/self/exe", ec).parent_path();
+#endif
         } catch (...) {}
+
+        // Asset directory resolution. Candidates ordered most-specific first:
+        //   1. <exe>/assets/sounds      — shipped layout (binary + assets siblings)
+        //   2. <exe>/../assets/sounds  — dev layout (build/ → repo)
+        //   3. <cwd>/assets/sounds     — last-resort when exe-dir lookup failed
+        std::vector<std::filesystem::path> candidates;
+        if (!exeDir.empty()) {
+            candidates.push_back(exeDir / "assets" / "sounds");
+            candidates.push_back(exeDir / ".." / "assets" / "sounds");
+        }
         try {
             candidates.push_back(std::filesystem::current_path() / "assets" / "sounds");
         } catch (...) {}

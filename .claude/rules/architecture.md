@@ -350,6 +350,7 @@ Midprice, Relative                 // smart / pegged-to-primary
 - `account` — IB account code; stamped from `g_selectedAccount` at submit time in `main.cpp`
 - `parentId` — non-zero links an order as an IB-native bracket child of the parent order
 - `ocaGroup` / `ocaType` — One-Cancels-All linkage. Siblings sharing the same `ocaGroup` are mutually-OCA; `ocaType=1` is cancel-with-block (most common). Used by ChartWindow's Bracket order to OCA-pair the STP stop-loss and TP take-profit legs submitted on entry fill.
+- `holdReason` — informational IB warning when an order is accepted but held (e.g. pre/post-market submission held until RTH open, "Outside RTH attribute ignored"). Distinct from `rejectReason`: the order is still live. Populated in `main.cpp`'s `onError` lambda for a curated warning-code allowlist (399, 404, 2109, 2148, 10311); cleared implicitly once the order transitions to Filled/Cancelled/Rejected. The OrdersWindow status column appends a yellow `HELD` chip; the ChartWindow pending-order overlay renders the leg's dashed line in amber and appends `⚠ HELD` to the row label.
 
 ## Bracket Orders (ChartWindow)
 
@@ -504,7 +505,7 @@ Per instance N (0–9): base = 11000 + N×100
 
 ## Bracket After-Hours Guard
 
-When a bracket order (entry LMT + STP stop-loss + TP take-profit) is placed outside regular trading hours (09:30–16:00 ET), IB does not trigger the stop condition. The position would be unguarded until the next RTH open.
+When a bracket order (entry LMT + STP stop-loss + TP take-profit) is placed outside regular trading hours (09:30–16:00 ET), IB only evaluates the stop trigger during extended hours when the stop leg itself is marked `outsideRth = true`. Originally we hardcoded the stop leg to `outsideRth = false` on the assumption that "stop conditions only trigger during RTH regardless" — that turned out to be wrong; IB *does* evaluate stop triggers in pre/after-market for stocks that allow ext-hours stops, but only when the flag is set. With it false the order was just parked until the next RTH open, leaving the position effectively unguarded.
 
 **Detection**: `core::BarSession(std::time(nullptr))` checks current session at bracket fire time (both confirmation popup and transmit-instantly paths).
 
@@ -512,9 +513,11 @@ When a bracket order (entry LMT + STP stop-loss + TP take-profit) is placed outs
 1. Confirmation popup shows an orange warning: *"IB does not trigger stop orders outside regular trading hours..."*
 2. Stop type auto-switches from `STP` to `STP LMT` (`useStopLmt = true` in `core::PendingBracketStop`)
 3. Stop limit offset = `stopPrice * 0.001` rounded via `core::services::RoundToTick(raw, 0.01)` to the penny grid (prevents IB error 110)
-4. `outsideRth = false` on the stop leg (stop condition only triggers during RTH regardless)
+4. **`outsideRth = true` on the stop leg** — propagated from `PendingBracketStop.outsideRth` in `main.cpp`'s `onFillReceived` bracket handler. Makes the stop eligible to fire pre/post-market for instruments that support it.
 5. `outsideRth = true` on the TP leg (limit orders can fill outside RTH)
-6. During regular hours — behavior is unchanged (plain STP with `outsideRth = false`)
+6. During regular hours — `PendingBracketStop.outsideRth = false`, propagates to both legs unchanged (plain STP / RTH-only TP).
+
+**Caveat**: not every instrument honours `outsideRth = true` on stop orders — futures and some ETFs behave differently from common stocks. When IB still parks the order until RTH open, it sends an informational warning (`error()` code 399/404/2109/2148/10311) that the `holdReason` plumbing surfaces as an amber `HELD` chip in the OrdersWindow and on the chart pending-order overlay (amber dashed line + `⚠ HELD` row tag).
 
 `core::PendingBracketStop` struct moved from `ChartWindow.h` to `core/models/OrderData.h` with 7 fields including `outsideRth` and `useStopLmt` (both default `false`). Unit-tested in `test_models.cpp`.
 

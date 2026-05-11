@@ -41,6 +41,8 @@ constexpr std::array<EventMeta, static_cast<size_t>(NotificationEvent::_Count)> 
     { NotificationEvent::ShortSetup,          "short_setup"         },
     { NotificationEvent::UnguardedPosition,   "unguarded_position"  },
     { NotificationEvent::Test,                "test"                },
+    { NotificationEvent::OrderWorking,        "order_working"       },
+    { NotificationEvent::OrderHeld,           "order_held"          },
 }};
 
 const char* eventNameInternal(NotificationEvent e) {

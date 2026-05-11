@@ -3,7 +3,7 @@
 // Run once:
 //   ./build/tools/gen_tones [--force] <output_dir>
 //
-// Writes 11 WAV files (one per NotificationEvent) into <output_dir>. Each file
+// Writes one WAV file per NotificationEvent into <output_dir>. Each file
 // is 22.05 kHz 16-bit mono PCM. Refuses to overwrite existing files unless
 // --force is passed, so committed sounds are not silently clobbered by a
 // routine `cmake --build build`.
@@ -251,6 +251,8 @@ static std::vector<double> buildLongSetup()          { return makeBell(1320.0, 2
 static std::vector<double> buildShortSetup()         { return makeBell(660.0, 280.0); }
 static std::vector<double> buildUnguardedPosition()  { return makeTwoTone(880.0, 660.0, 150.0, 30.0, 150.0); }
 static std::vector<double> buildTest()               { return makeSinePing(1100.0, 200.0, 5, 25, 0.7, 80); }
+static std::vector<double> buildOrderWorking()       { return makeSinePing(720.0, 140.0, 4, 20, 0.55, 60); }
+static std::vector<double> buildOrderHeld()          { return makeTwoTone(540.0, 420.0, 180.0, 40.0, 180.0); }
 
 constexpr ToneSpec kTones[] = {
     { "order_filled",        buildOrderFilled        },
@@ -264,6 +266,8 @@ constexpr ToneSpec kTones[] = {
     { "short_setup",         buildShortSetup         },
     { "unguarded_position",  buildUnguardedPosition  },
     { "test",                buildTest               },
+    { "order_working",       buildOrderWorking       },
+    { "order_held",          buildOrderHeld          },
 };
 
 // ── main ────────────────────────────────────────────────────────────────────
