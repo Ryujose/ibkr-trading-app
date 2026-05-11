@@ -10,6 +10,9 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#ifdef _WIN32
+    #include <direct.h>
+#endif
 
 // miniaudio implementation lives in this TU. Header-only library — exactly one
 // translation unit must define the impl macro.
@@ -358,7 +361,11 @@ std::string configHome() {
 
 void mkDirP(const std::string& path) {
     // Lazy: just ensure the immediate parent exists. No-op on EEXIST.
+#ifdef _WIN32
+    _mkdir(path.c_str());
+#else
     ::mkdir(path.c_str(), 0755);
+#endif
 }
 
 bool parseBool(const std::string& v) {

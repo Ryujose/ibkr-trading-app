@@ -23,6 +23,12 @@
 
 // Platform-specific exe-path discovery (used in the asset-dir resolver).
 #if defined(_WIN32)
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
     #include <windows.h>
 #elif defined(__APPLE__)
     #include <mach-o/dyld.h>
