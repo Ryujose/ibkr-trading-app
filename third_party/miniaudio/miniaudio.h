@@ -18948,7 +18948,7 @@ static void ma_device__handle_data_callback(ma_device* pDevice, void* pFramesOut
                 }
 
                 if (!pDevice->noClip && pDevice->playback.format == ma_format_f32) {
-                    ma_clip_samples_f32((float*)pFramesOut, (const float*)pFramesOut, frameCount * pDevice->playback.channels);   /* Intentionally specifying the same pointer for both input and output for in-place processing. */
+                    ma_clip_samples_f32((float*)pFramesOut, (const float*)pFramesOut, (ma_uint64)frameCount * pDevice->playback.channels);   /* Intentionally specifying the same pointer for both input and output for in-place processing. */
                 }
             }
         }
@@ -27953,7 +27953,7 @@ static ma_result ma_device_init_by_type__alsa(ma_device* pDevice, const ma_devic
 
     /* Buffer Size */
     {
-        ma_snd_pcm_uframes_t actualBufferSizeInFrames = ma_calculate_buffer_size_in_frames_from_descriptor(pDescriptor, internalSampleRate, pConfig->performanceProfile) * internalPeriods;
+        ma_snd_pcm_uframes_t actualBufferSizeInFrames = (ma_snd_pcm_uframes_t)ma_calculate_buffer_size_in_frames_from_descriptor(pDescriptor, internalSampleRate, pConfig->performanceProfile) * internalPeriods;
 
         resultALSA = ((ma_snd_pcm_hw_params_set_buffer_size_near_proc)pDevice->pContext->alsa.snd_pcm_hw_params_set_buffer_size_near)(pPCM, pHWParams, &actualBufferSizeInFrames);
         if (resultALSA < 0) {
@@ -28005,7 +28005,7 @@ static ma_result ma_device_init_by_type__alsa(ma_device* pDevice, const ma_devic
 
     resultALSA = ((ma_snd_pcm_sw_params_get_boundary_proc)pDevice->pContext->alsa.snd_pcm_sw_params_get_boundary)(pSWParams, &bufferBoundary);
     if (resultALSA < 0) {
-        bufferBoundary = internalPeriodSizeInFrames * internalPeriods;
+        bufferBoundary = (ma_snd_pcm_uframes_t)internalPeriodSizeInFrames * internalPeriods;
     }
 
     if (deviceType == ma_device_type_playback && !isUsingMMap) {   /* Only playback devices in writei/readi mode need a start threshold. */
@@ -31708,7 +31708,7 @@ static ma_result ma_device_init__jack(ma_device* pDevice, const ma_device_config
         pDescriptorCapture->periodSizeInFrames = periodSizeInFrames;
         pDescriptorCapture->periodCount        = 1; /* There's no notion of a period in JACK. Just set to 1. */
 
-        pDevice->jack.pIntermediaryBufferCapture = (float*)ma_calloc(pDescriptorCapture->periodSizeInFrames * ma_get_bytes_per_frame(pDescriptorCapture->format, pDescriptorCapture->channels), &pDevice->pContext->allocationCallbacks);
+        pDevice->jack.pIntermediaryBufferCapture = (float*)ma_calloc((size_t)pDescriptorCapture->periodSizeInFrames * ma_get_bytes_per_frame(pDescriptorCapture->format, pDescriptorCapture->channels), &pDevice->pContext->allocationCallbacks);
         if (pDevice->jack.pIntermediaryBufferCapture == NULL) {
             ma_device_uninit__jack(pDevice);
             return MA_OUT_OF_MEMORY;
@@ -31760,7 +31760,7 @@ static ma_result ma_device_init__jack(ma_device* pDevice, const ma_device_config
         pDescriptorPlayback->periodSizeInFrames = periodSizeInFrames;
         pDescriptorPlayback->periodCount        = 1;   /* There's no notion of a period in JACK. Just set to 1. */
 
-        pDevice->jack.pIntermediaryBufferPlayback = (float*)ma_calloc(pDescriptorPlayback->periodSizeInFrames * ma_get_bytes_per_frame(pDescriptorPlayback->format, pDescriptorPlayback->channels), &pDevice->pContext->allocationCallbacks);
+        pDevice->jack.pIntermediaryBufferPlayback = (float*)ma_calloc((size_t)pDescriptorPlayback->periodSizeInFrames * ma_get_bytes_per_frame(pDescriptorPlayback->format, pDescriptorPlayback->channels), &pDevice->pContext->allocationCallbacks);
         if (pDevice->jack.pIntermediaryBufferPlayback == NULL) {
             ma_device_uninit__jack(pDevice);
             return MA_OUT_OF_MEMORY;
@@ -42357,7 +42357,7 @@ MA_API ma_result ma_device_init(ma_context* pContext, const ma_device_config* pC
                 }
             }
 
-            intermediaryBufferSizeInBytes = pDevice->playback.intermediaryBufferCap * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
+            intermediaryBufferSizeInBytes = (ma_uint64)pDevice->playback.intermediaryBufferCap * ma_get_bytes_per_frame(pDevice->playback.format, pDevice->playback.channels);
 
             pDevice->playback.pIntermediaryBuffer = ma_malloc((size_t)intermediaryBufferSizeInBytes, &pContext->allocationCallbacks);
             if (pDevice->playback.pIntermediaryBuffer == NULL) {
@@ -57112,7 +57112,7 @@ MA_API ma_result ma_pcm_rb_init_ex(ma_format format, ma_uint32 channels, ma_uint
         return MA_INVALID_ARGS;
     }
 
-    result = ma_rb_init_ex(subbufferSizeInFrames*bpf, subbufferCount, subbufferStrideInFrames*bpf, pOptionalPreallocatedBuffer, pAllocationCallbacks, &pRB->rb);
+    result = ma_rb_init_ex((size_t)subbufferSizeInFrames*bpf, subbufferCount, (size_t)subbufferStrideInFrames*bpf, pOptionalPreallocatedBuffer, pAllocationCallbacks, &pRB->rb);
     if (result != MA_SUCCESS) {
         return result;
     }
@@ -57169,7 +57169,7 @@ MA_API ma_result ma_pcm_rb_acquire_read(ma_pcm_rb* pRB, ma_uint32* pSizeInFrames
         return MA_INVALID_ARGS;
     }
 
-    sizeInBytes = *pSizeInFrames * ma_pcm_rb_get_bpf(pRB);
+    sizeInBytes = (size_t)*pSizeInFrames * ma_pcm_rb_get_bpf(pRB);
 
     result = ma_rb_acquire_read(&pRB->rb, &sizeInBytes, ppBufferOut);
     if (result != MA_SUCCESS) {
@@ -57186,7 +57186,7 @@ MA_API ma_result ma_pcm_rb_commit_read(ma_pcm_rb* pRB, ma_uint32 sizeInFrames)
         return MA_INVALID_ARGS;
     }
 
-    return ma_rb_commit_read(&pRB->rb, sizeInFrames * ma_pcm_rb_get_bpf(pRB));
+    return ma_rb_commit_read(&pRB->rb, (size_t)sizeInFrames * ma_pcm_rb_get_bpf(pRB));
 }
 
 MA_API ma_result ma_pcm_rb_acquire_write(ma_pcm_rb* pRB, ma_uint32* pSizeInFrames, void** ppBufferOut)
@@ -57198,7 +57198,7 @@ MA_API ma_result ma_pcm_rb_acquire_write(ma_pcm_rb* pRB, ma_uint32* pSizeInFrame
         return MA_INVALID_ARGS;
     }
 
-    sizeInBytes = *pSizeInFrames * ma_pcm_rb_get_bpf(pRB);
+    sizeInBytes = (size_t)*pSizeInFrames * ma_pcm_rb_get_bpf(pRB);
 
     result = ma_rb_acquire_write(&pRB->rb, &sizeInBytes, ppBufferOut);
     if (result != MA_SUCCESS) {
@@ -57215,7 +57215,7 @@ MA_API ma_result ma_pcm_rb_commit_write(ma_pcm_rb* pRB, ma_uint32 sizeInFrames)
         return MA_INVALID_ARGS;
     }
 
-    return ma_rb_commit_write(&pRB->rb, sizeInFrames * ma_pcm_rb_get_bpf(pRB));
+    return ma_rb_commit_write(&pRB->rb, (size_t)sizeInFrames * ma_pcm_rb_get_bpf(pRB));
 }
 
 MA_API ma_result ma_pcm_rb_seek_read(ma_pcm_rb* pRB, ma_uint32 offsetInFrames)
@@ -57224,7 +57224,7 @@ MA_API ma_result ma_pcm_rb_seek_read(ma_pcm_rb* pRB, ma_uint32 offsetInFrames)
         return MA_INVALID_ARGS;
     }
 
-    return ma_rb_seek_read(&pRB->rb, offsetInFrames * ma_pcm_rb_get_bpf(pRB));
+    return ma_rb_seek_read(&pRB->rb, (size_t)offsetInFrames * ma_pcm_rb_get_bpf(pRB));
 }
 
 MA_API ma_result ma_pcm_rb_seek_write(ma_pcm_rb* pRB, ma_uint32 offsetInFrames)
@@ -57233,7 +57233,7 @@ MA_API ma_result ma_pcm_rb_seek_write(ma_pcm_rb* pRB, ma_uint32 offsetInFrames)
         return MA_INVALID_ARGS;
     }
 
-    return ma_rb_seek_write(&pRB->rb, offsetInFrames * ma_pcm_rb_get_bpf(pRB));
+    return ma_rb_seek_write(&pRB->rb, (size_t)offsetInFrames * ma_pcm_rb_get_bpf(pRB));
 }
 
 MA_API ma_int32 ma_pcm_rb_pointer_distance(ma_pcm_rb* pRB)
@@ -66653,7 +66653,7 @@ static void ma_waveform_read_pcm_frames__sine(ma_waveform* pWaveform, void* pFra
             pWaveform->time += pWaveform->advance;
 
             for (iChannel = 0; iChannel < pWaveform->config.channels; iChannel += 1) {
-                ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
             }
         }
     }
@@ -66695,7 +66695,7 @@ static void ma_waveform_read_pcm_frames__square(ma_waveform* pWaveform, double d
             pWaveform->time += pWaveform->advance;
 
             for (iChannel = 0; iChannel < pWaveform->config.channels; iChannel += 1) {
-                ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
             }
         }
     }
@@ -66737,7 +66737,7 @@ static void ma_waveform_read_pcm_frames__triangle(ma_waveform* pWaveform, void* 
             pWaveform->time += pWaveform->advance;
 
             for (iChannel = 0; iChannel < pWaveform->config.channels; iChannel += 1) {
-                ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
             }
         }
     }
@@ -66779,7 +66779,7 @@ static void ma_waveform_read_pcm_frames__sawtooth(ma_waveform* pWaveform, void* 
             pWaveform->time += pWaveform->advance;
 
             for (iChannel = 0; iChannel < pWaveform->config.channels; iChannel += 1) {
-                ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pWaveform->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
             }
         }
     }
@@ -67317,14 +67317,14 @@ static MA_INLINE ma_uint64 ma_noise_read_pcm_frames__white(ma_noise* pNoise, voi
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 float s = ma_noise_f32_white(pNoise);
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         } else {
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
                     float s = ma_noise_f32_white(pNoise);
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         }
@@ -67436,14 +67436,14 @@ static MA_INLINE ma_uint64 ma_noise_read_pcm_frames__pink(ma_noise* pNoise, void
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 float s = ma_noise_f32_pink(pNoise, 0);
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         } else {
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
                     float s = ma_noise_f32_pink(pNoise, iChannel);
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         }
@@ -67518,14 +67518,14 @@ static MA_INLINE ma_uint64 ma_noise_read_pcm_frames__brownian(ma_noise* pNoise, 
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 float s = ma_noise_f32_brownian(pNoise, 0);
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         } else {
             for (iFrame = 0; iFrame < frameCount; iFrame += 1) {
                 for (iChannel = 0; iChannel < channels; iChannel += 1) {
                     float s = ma_noise_f32_brownian(pNoise, iChannel);
-                    ma_pcm_convert(ma_offset_ptr(pFramesOut, iFrame*bpf + iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
+                    ma_pcm_convert(ma_offset_ptr(pFramesOut, (size_t)iFrame*bpf + (size_t)iChannel*bps), pNoise->config.format, &s, ma_format_f32, 1, ma_dither_mode_none);
                 }
             }
         }
@@ -71905,7 +71905,7 @@ MA_API ma_result ma_node_graph_init(const ma_node_graph_config* pConfig, const m
 
     /* Processing cache. */
     if (pConfig->processingSizeInFrames > 0) {
-        pNodeGraph->pProcessingCache = (float*)ma_malloc(pConfig->processingSizeInFrames * pConfig->channels * sizeof(float), pAllocationCallbacks);
+        pNodeGraph->pProcessingCache = (float*)ma_malloc((size_t)pConfig->processingSizeInFrames * pConfig->channels * sizeof(float), pAllocationCallbacks);
         if (pNodeGraph->pProcessingCache == NULL) {
             ma_node_uninit(&pNodeGraph->endpoint, pAllocationCallbacks);
             ma_node_uninit(&pNodeGraph->base, pAllocationCallbacks);
@@ -72008,8 +72008,8 @@ MA_API ma_result ma_node_graph_read_pcm_frames(ma_node_graph* pNodeGraph, void* 
                 framesToReadFromCache = pNodeGraph->processingCacheFramesRemaining;
             }
 
-            MA_COPY_MEMORY(pRunningFramesOut, pNodeGraph->pProcessingCache, framesToReadFromCache * channels * sizeof(float));
-            MA_MOVE_MEMORY(pNodeGraph->pProcessingCache, pNodeGraph->pProcessingCache + (framesToReadFromCache * channels), (pNodeGraph->processingCacheFramesRemaining - framesToReadFromCache) * channels * sizeof(float));
+            MA_COPY_MEMORY(pRunningFramesOut, pNodeGraph->pProcessingCache, (size_t)framesToReadFromCache * channels * sizeof(float));
+            MA_MOVE_MEMORY(pNodeGraph->pProcessingCache, pNodeGraph->pProcessingCache + ((size_t)framesToReadFromCache * channels), (size_t)(pNodeGraph->processingCacheFramesRemaining - framesToReadFromCache) * channels * sizeof(float));
             pNodeGraph->processingCacheFramesRemaining -= framesToReadFromCache;
 
             totalFramesRead += framesToReadFromCache;
@@ -72503,7 +72503,7 @@ static ma_result ma_node_input_bus_read_pcm_frames(ma_node* pInputNode, ma_node_
                 } else {
                     /* Slow path. Not the first attachment. Mixing required. */
                     ma_uint32 preMixBufferCapInFrames = ((ma_node_base*)pInputNode)->cachedDataCapInFramesPerBus;
-                    float* pPreMixBuffer = (float*)ma_stack_alloc(((ma_node_base*)pInputNode)->pNodeGraph->pPreMixStack, preMixBufferCapInFrames * inputChannels * sizeof(float));
+                    float* pPreMixBuffer = (float*)ma_stack_alloc(((ma_node_base*)pInputNode)->pNodeGraph->pPreMixStack, (size_t)preMixBufferCapInFrames * inputChannels * sizeof(float));
 
                     if (pPreMixBuffer == NULL) {
                         /*
@@ -72781,11 +72781,11 @@ static ma_result ma_node_get_heap_layout(ma_node_graph* pNodeGraph, const ma_nod
         cacheCapInFrames = ma_node_config_get_cache_size_in_frames(pConfig, pNodeGraph);
 
         for (iBus = 0; iBus < inputBusCount; iBus += 1) {
-            cachedDataSizeInBytes += cacheCapInFrames * ma_get_bytes_per_frame(ma_format_f32, pConfig->pInputChannels[iBus]);
+            cachedDataSizeInBytes += (size_t)cacheCapInFrames * ma_get_bytes_per_frame(ma_format_f32, pConfig->pInputChannels[iBus]);
         }
 
         for (iBus = 0; iBus < outputBusCount; iBus += 1) {
-            cachedDataSizeInBytes += cacheCapInFrames * ma_get_bytes_per_frame(ma_format_f32, pConfig->pOutputChannels[iBus]);
+            cachedDataSizeInBytes += (size_t)cacheCapInFrames * ma_get_bytes_per_frame(ma_format_f32, pConfig->pOutputChannels[iBus]);
         }
 
         pHeapLayout->cachedDataOffset = pHeapLayout->sizeInBytes;
