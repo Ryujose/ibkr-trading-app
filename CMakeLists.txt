@@ -46,6 +46,7 @@ endif()
 # Build Options
 # ============================================================================
 option(IBKR_BUILD_TESTS "Build unit tests" OFF)
+option(IBKR_BUILD_TOOLS "Build helper tools (sound generators, etc.)" OFF)
 option(IBKR_BUILD_DOCS "Generate documentation" OFF)
 option(IBKR_USE_SYSTEM_IMGUI "Use system-installed ImGui" OFF)
 option(IBKR_USE_SYSTEM_VULKAN "Use system-installed Vulkan headers" OFF)
@@ -233,11 +234,19 @@ endif()
 set_target_properties(ibapi-lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED OFF)
 
 # ============================================================================
+# miniaudio — vendored single-header audio library (NotificationService)
+# ============================================================================
+add_subdirectory(third_party/miniaudio)
+
+# ============================================================================
 # Main Application Sources
 # ============================================================================
 set(APPLICATION_SOURCES
     src/main.cpp
     src/core/services/IBKRClient.cpp
+    src/core/services/NotificationService.cpp
+    src/ui/NotificationOverlay.cpp
+    src/ui/windows/NotificationsWindow.cpp
     src/ui/windows/ChartWindow.cpp
     src/ui/windows/NewsWindow.cpp
     src/ui/windows/TradingWindow.cpp
@@ -258,6 +267,7 @@ set(APPLICATION_LIBS
     glfw
     ibapi-lib
     bid-stubs
+    miniaudio
 )
 
 # Platform-specific libraries
@@ -329,9 +339,14 @@ target_compile_definitions(ibkr-trading-app PRIVATE
 # ============================================================================
 # Installation Rules
 # ============================================================================
+# Install layout (used by `cmake --install build --prefix dist` and by the
+# CI release pipeline). Binary and assets/ sit as siblings at the root of
+# the install prefix so the runtime resolver hits <exe>/assets/sounds on
+# its first candidate path — no PATH/CWD juggling required.
 install(TARGETS ibkr-trading-app
-    RUNTIME DESTINATION bin
+    RUNTIME DESTINATION .
 )
+install(DIRECTORY assets DESTINATION .)
 
 # ============================================================================
 # Optional: Tests
@@ -339,6 +354,13 @@ install(TARGETS ibkr-trading-app
 if(IBKR_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ============================================================================
+# Optional: Helper Tools (gen_tones, etc.)
+# ============================================================================
+if(IBKR_BUILD_TOOLS)
+    add_subdirectory(tools)
 endif()
 
 # ============================================================================

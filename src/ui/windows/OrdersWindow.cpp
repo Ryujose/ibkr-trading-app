@@ -30,6 +30,10 @@ void OrdersWindow::OnOpenOrder(const core::Order& order) {
             existing.status = order.status;
         if (existing.commission == 0.0 && order.commission != 0.0)
             existing.commission = order.commission;
+        // Hold reason is informational; copy non-empty value through so a
+        // late-arriving IB warning ("[404] held until open") gets shown.
+        if (!order.holdReason.empty())
+            existing.holdReason = order.holdReason;
         existing.updatedAt = order.updatedAt;
     }
 }
@@ -446,11 +450,23 @@ void OrdersWindow::DrawOrderRow(core::Order& o, bool showCancel) {
         }
     }
 
-    // 13 — Status
+    // 13 — Status. Append amber ⚠ HELD chip when IB has held the order
+    // (typically pre/post-market submission held until RTH open). Hover the
+    // status text for the full IB warning message.
     ImGui::TableSetColumnIndex(13);
     ImGui::PushStyleColor(ImGuiCol_Text, StatusColor(o.status));
     ImGui::TextUnformatted(core::OrderStatusStr(o.status));
     ImGui::PopStyleColor();
+    if (!o.holdReason.empty() && !IsTerminal(o.status)) {
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", o.holdReason.c_str());
+        ImGui::SameLine(0, 4);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.78f, 0.20f, 1.0f));
+        ImGui::TextUnformatted("HELD");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", o.holdReason.c_str());
+    }
 
     // 14 — Cancel (open) or Reject reason (history)
     ImGui::TableSetColumnIndex(14);

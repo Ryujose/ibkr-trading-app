@@ -195,9 +195,16 @@ void IBKRClient::ReqHistoricalTicks(int reqId, const std::string& symbol,
 
 void IBKRClient::ReqHistoricalNews(int reqId, int conId, int totalResults,
                                     const std::string& providerCodes) {
+    if (providerCodes.empty()) {
+        // Caller must pass an entitled-providers string. Issuing a wildcard
+        // request triggers IB error 321 / 502 ("Not subscribed for ... provider")
+        // for any code the account isn't entitled to — cleaner to drop.
+        std::fprintf(stderr,
+            "[IBKR] ReqHistoricalNews(reqId=%d) skipped: empty providerCodes\n", reqId);
+        return;
+    }
     TagValueListSPtr empty;
-    const std::string& codes = providerCodes.empty() ? kFreeNewsProviders : providerCodes;
-    m_client->reqHistoricalNews(reqId, conId, codes, "", "", totalResults, empty);
+    m_client->reqHistoricalNews(reqId, conId, providerCodes, "", "", totalResults, empty);
 }
 
 void IBKRClient::SubscribeToNews(int reqId, const std::string& symbol) {
@@ -212,6 +219,10 @@ void IBKRClient::ReqNewsArticle(int reqId, const std::string& providerCode,
                                  const std::string& articleId) {
     TagValueListSPtr empty;
     m_client->reqNewsArticle(reqId, providerCode, articleId, empty);
+}
+
+void IBKRClient::ReqNewsProviders() {
+    m_client->reqNewsProviders();
 }
 
 void IBKRClient::ReqMarketDataType(int type) {
@@ -564,6 +575,9 @@ void IBKRClient::ProcessMessages() {
 
             } else if constexpr (std::is_same_v<T, MsgNewsArticle>) {
                 if (onNewsArticle) onNewsArticle(m.reqId, 0, m.text);
+
+            } else if constexpr (std::is_same_v<T, MsgNewsProviders>) {
+                if (onNewsProviders) onNewsProviders(m.providers);
 
             } else if constexpr (std::is_same_v<T, MsgAcctSummary>) {
                 if (onAccountSummary) onAccountSummary(m.tag, m.value, m.currency);
@@ -1121,6 +1135,14 @@ void IBKRClient::historicalTicksLast(int reqId,
 void IBKRClient::newsArticle(int requestId, int /*articleType*/,
                               const std::string& articleText) {
     Push(MsgNewsArticle{requestId, articleText});
+}
+
+void IBKRClient::newsProviders(const std::vector<NewsProvider>& providers) {
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(providers.size());
+    for (const auto& p : providers)
+        out.emplace_back(p.providerCode, p.providerName);
+    Push(MsgNewsProviders{std::move(out)});
 }
 
 // ── Account summary ──────────────────────────────────────────────────────────

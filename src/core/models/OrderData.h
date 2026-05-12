@@ -68,6 +68,10 @@ struct Order {
     double      commission   = 0.0;  // actual commission from fills (or estimate from OrderState)
     OrderStatus status       = OrderStatus::Pending;
     std::string rejectReason;        // IB error message when status == Rejected
+    // Informational IB warning when the order is accepted but held — typically
+    // pre/post-market submissions held until RTH open, or "Outside RTH attribute
+    // ignored" notices. Distinct from rejectReason: order is still live.
+    std::string holdReason;
     std::time_t submittedAt  = 0;
     std::time_t updatedAt    = 0;
 };

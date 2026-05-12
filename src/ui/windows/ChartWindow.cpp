@@ -260,6 +260,8 @@ void ChartWindow::SetSymbol(const std::string& symbol) {
     m_dragPendingIsAux  = false;
     m_firstPricePlaced  = false;
     m_secondPricePlaced = false;
+    // Reset edge-detector so a new symbol can fire OnSignalChange.
+    m_lastNotifiedSignal = BreakoutDirection::None;
     AddToHistory(symbol);
     RequestNewData();
 }
@@ -2868,9 +2870,14 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                           && m_dragPendingIsAux == isAux;
         double drawPrice = isDragging ? m_dragPendingPrice : legPrice;
 
-        // Color: main leg uses side color; aux (limit) leg uses orange
+        // Color: main leg uses side color; aux (limit) leg uses orange.
+        // Held orders override to amber so they pop visually against live ones.
         ImU32 lineCol, txtCol, lblBg;
-        if (isAux) {
+        if (!order.holdReason.empty()) {
+            lineCol = isDragging ? IM_COL32(255, 200,  60, 255) : IM_COL32(220, 170,  40, 210);
+            txtCol  = IM_COL32(255, 230, 160, 255);
+            lblBg   = IM_COL32( 90,  60,   0, 255);
+        } else if (isAux) {
             lineCol = isDragging ? IM_COL32(255, 180,  50, 255) : IM_COL32(220, 140,  30, 210);
             txtCol  = IM_COL32(255, 230, 160, 255);
             lblBg   = IM_COL32(100,  55,   5, 255);
@@ -3008,6 +3015,16 @@ void ChartWindow::DrawOverlays(double /*step*/) {
                     std::snprintf(lbl, sizeof(lbl), " %s %.0f @ $%.2f  %+.2f ",
                                   order.isBuy ? "BUY" : "SELL", order.qty, drawPrice, pnl);
             }
+            lblSz = ImGui::CalcTextSize(lbl);
+        }
+
+        // Append IB hold-warning suffix (main leg only — aux is the limit twin
+        // of the same order and would just duplicate the tag). The full
+        // holdReason text shows on hover via the cancel-button tooltip path,
+        // here we just signal "this order is being held, not Working".
+        if (!isAux && !order.holdReason.empty()) {
+            size_t lblLen = std::strlen(lbl);
+            std::snprintf(lbl + lblLen, sizeof(lbl) - lblLen, " ⚠ HELD ");
             lblSz = ImGui::CalcTextSize(lbl);
         }
 
@@ -4167,11 +4184,14 @@ void ChartWindow::DrawSessionBands() {
     ImDrawList* dl = ImPlot::GetPlotDrawList();
     ImPlot::PushPlotClipRect();
 
+    // Background tint per session. Hues are picked from non-overlapping families
+    // (blue / orange / charcoal-grey) so the bands stay distinct at low alpha
+    // on a dark chart — the legend below uses the same hues at full alpha.
     auto sessionColor = [](core::Session s) -> ImU32 {
         switch (s) {
-            case core::Session::PreMarket:  return IM_COL32( 40,  80, 140, 38);
-            case core::Session::AfterHours: return IM_COL32(140,  80,  30, 38);
-            case core::Session::Overnight:  return IM_COL32( 80,  40, 140, 38);
+            case core::Session::PreMarket:  return IM_COL32( 40, 110, 210, 50);  // blue
+            case core::Session::AfterHours: return IM_COL32(210, 130,  40, 50);  // orange
+            case core::Session::Overnight:  return IM_COL32( 60,  60,  75, 90);  // dim charcoal
             default:                        return 0;  // Regular: no shading
         }
     };
@@ -4202,9 +4222,9 @@ void ChartWindow::DrawSessionBands() {
         float  lh = ImGui::GetTextLineHeight();
         struct LegEntry { const char* label; ImU32 col; };
         static constexpr LegEntry kLeg[] = {
-            { "Pre-Market",  IM_COL32( 40, 120, 220, 200) },
-            { "After-Hours", IM_COL32(220, 140,  40, 200) },
-            { "Overnight",   IM_COL32(140,  60, 220, 200) },
+            { "Pre-Market",  IM_COL32( 40, 110, 210, 220) },
+            { "After-Hours", IM_COL32(210, 130,  40, 220) },
+            { "Overnight",   IM_COL32(110, 110, 130, 220) },
         };
         for (const auto& e : kLeg) {
             dl->AddRectFilled(ImVec2(lx, ly + 2), ImVec2(lx + 10, ly + lh - 2), e.col, 2.f);
@@ -4489,6 +4509,17 @@ void ChartWindow::DetectStructure() {
     if (m_setupSettings.overlay && m_breakoutSignal != BreakoutDirection::None) {
         ComputeSetupPlan();
     }
+
+    // Edge-trigger OnSignalChange so a held signal doesn't re-fire every recompute.
+    if (m_lastNotifiedSignal == BreakoutDirection::None &&
+        m_breakoutSignal     != BreakoutDirection::None &&
+        OnSignalChange)
+    {
+        const double last = m_closes.empty() ? 0.0 : m_closes.back();
+        const double rr   = m_setup.valid ? m_setup.rr : 0.0;
+        OnSignalChange(m_breakoutSignal, m_symbol, last, rr);
+    }
+    m_lastNotifiedSignal = m_breakoutSignal;
 }
 
 // ============================================================================

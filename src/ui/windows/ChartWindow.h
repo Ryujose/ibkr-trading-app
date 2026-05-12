@@ -36,6 +36,7 @@ public:
         bool        isBuy     = true;
         double      qty       = 0.0;
         std::string orderType;         // IB order-type string: "LMT", "STP", "STP LMT", …
+        std::string holdReason;        // IB hold warning (e.g. "[404] held until open"); "" if live
     };
 
     // ---- Current position info (for the P&L strip) --------------------------
@@ -172,6 +173,17 @@ public:
     // Host must cancel the old order and re-submit a replacement.
     std::function<void(int orderId, double newPrice, double newAuxPrice)> OnModifyOrder;
 
+    // Imminent-breakout signal direction. Public so the host (main.cpp) can use
+    // it in OnSignalChange callback signatures.
+    enum class BreakoutDirection { None, LongSetup, ShortSetup };
+
+    // Fired on edge transition None → LongSetup / None → ShortSetup, so the host
+    // can route a single notification per signal occurrence (held signals don't
+    // re-fire). Resets to None on SetSymbol() so a new symbol starts fresh.
+    // Args: (direction, symbol, last close, R:R from m_setup if valid else 0).
+    std::function<void(BreakoutDirection dir, const std::string& sym,
+                       double lastPrice, double rr)> OnSignalChange;
+
     // WSH corporate event markers — called once per event JSON from IBKRClient
     void OnWshEvent(const WshData::WshEvent& event);
     void ClearWshEvents() { m_wshEvents.clear(); }
@@ -222,8 +234,6 @@ private:
         int  scanCap        = 1000;  // cap swing scan to last N bars (0 = unlimited)
         bool trendChannel   = false; // ±2σ regression bands
     };
-
-    enum class BreakoutDirection { None, LongSetup, ShortSetup };
 
     using AutoLevel     = core::services::Level;
     using AutoTrend     = core::services::TrendFit;
@@ -346,6 +356,7 @@ private:
 
     // Imminent-breakout signal (populated by ComputeBreakoutSignal)
     BreakoutDirection      m_breakoutSignal     = BreakoutDirection::None;
+    BreakoutDirection      m_lastNotifiedSignal = BreakoutDirection::None; // edge-detector for OnSignalChange
     double                 m_breakoutZoneTop    = 0.0;
     double                 m_breakoutZoneBot    = 0.0;
     bool                   m_breakoutFromSupply = false; // true = supply zone, false = demand
