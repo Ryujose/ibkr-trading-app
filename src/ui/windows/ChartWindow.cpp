@@ -4184,11 +4184,14 @@ void ChartWindow::DrawSessionBands() {
     ImDrawList* dl = ImPlot::GetPlotDrawList();
     ImPlot::PushPlotClipRect();
 
+    // Background tint per session. Hues are picked from non-overlapping families
+    // (blue / orange / charcoal-grey) so the bands stay distinct at low alpha
+    // on a dark chart — the legend below uses the same hues at full alpha.
     auto sessionColor = [](core::Session s) -> ImU32 {
         switch (s) {
-            case core::Session::PreMarket:  return IM_COL32( 40,  80, 140, 38);
-            case core::Session::AfterHours: return IM_COL32(140,  80,  30, 38);
-            case core::Session::Overnight:  return IM_COL32( 80,  40, 140, 38);
+            case core::Session::PreMarket:  return IM_COL32( 40, 110, 210, 50);  // blue
+            case core::Session::AfterHours: return IM_COL32(210, 130,  40, 50);  // orange
+            case core::Session::Overnight:  return IM_COL32( 60,  60,  75, 90);  // dim charcoal
             default:                        return 0;  // Regular: no shading
         }
     };
@@ -4219,9 +4222,9 @@ void ChartWindow::DrawSessionBands() {
         float  lh = ImGui::GetTextLineHeight();
         struct LegEntry { const char* label; ImU32 col; };
         static constexpr LegEntry kLeg[] = {
-            { "Pre-Market",  IM_COL32( 40, 120, 220, 200) },
-            { "After-Hours", IM_COL32(220, 140,  40, 200) },
-            { "Overnight",   IM_COL32(140,  60, 220, 200) },
+            { "Pre-Market",  IM_COL32( 40, 110, 210, 220) },
+            { "After-Hours", IM_COL32(210, 130,  40, 220) },
+            { "Overnight",   IM_COL32(110, 110, 130, 220) },
         };
         for (const auto& e : kLeg) {
             dl->AddRectFilled(ImVec2(lx, ly + 2), ImVec2(lx + 10, ly + lh - 2), e.col, 2.f);

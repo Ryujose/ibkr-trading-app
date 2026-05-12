@@ -779,17 +779,37 @@ void TradingWindow::DrawOrderBook() {
 
     // ── S/R proximity helper ──────────────────────────────────────────────────
     // Uses the same tolerance as ChartWindow::DetectStructure: max(0.3% × price,
-    // 0.5 × ATR14).  When ATR hasn't been computed yet (m_atrForSR ≤ 0), falls
+    // 0.5 × ATR14). When ATR hasn't been computed yet (m_atrForSR ≤ 0), falls
     // back to 0.3% × price alone.
+    //
+    // The S/R lists are detected on the chart's last close; by the time they
+    // reach the DOM the live price may have moved through one or more levels.
+    // To keep the labels consistent with the ladder order, classify each
+    // matched level by its position relative to the live reference price
+    // (level > ref → R, level < ref → S). Pick the nearest level on ties.
+    const double refPrice = (m_lastPrice > 0.0) ? m_lastPrice
+                          : (m_midPrice  > 0.0) ? m_midPrice
+                          : (m_nbboBid > 0.0 && m_nbboAsk > 0.0) ? 0.5 * (m_nbboBid + m_nbboAsk)
+                                                                 : 0.0;
     auto srTag = [&](double price) -> const char* {
         if (m_supportPrices.empty() && m_resistancePrices.empty()) return nullptr;
-        double tol = (m_atrForSR > 0.0) ? std::max(0.003 * price, 0.5 * m_atrForSR)
-                                        : 0.003 * price;
-        for (double s : m_supportPrices)
-            if (std::abs(price - s) <= tol) return "S";
-        for (double r : m_resistancePrices)
-            if (std::abs(price - r) <= tol) return "R";
-        return nullptr;
+        const double tol = (m_atrForSR > 0.0) ? std::max(0.003 * price, 0.5 * m_atrForSR)
+                                              : 0.003 * price;
+        double  bestDist = tol;
+        double  bestLvl  = 0.0;
+        bool    bestFromSupport = false;
+        bool    found    = false;
+        for (double s : m_supportPrices) {
+            double d = std::abs(price - s);
+            if (d <= bestDist) { bestDist = d; bestLvl = s; bestFromSupport = true;  found = true; }
+        }
+        for (double r : m_resistancePrices) {
+            double d = std::abs(price - r);
+            if (d <= bestDist) { bestDist = d; bestLvl = r; bestFromSupport = false; found = true; }
+        }
+        if (!found) return nullptr;
+        if (refPrice > 0.0) return (bestLvl >= refPrice) ? "R" : "S";
+        return bestFromSupport ? "S" : "R";
     };
 
     // ── Price-column click-to-trade ───────────────────────────────────────────

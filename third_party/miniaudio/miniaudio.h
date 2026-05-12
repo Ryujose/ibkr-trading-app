@@ -73655,7 +73655,7 @@ static ma_result ma_node_read_pcm_frames(ma_node* pNode, ma_uint32 outputBusInde
     }
 
     /* Apply volume, if necessary. */
-    ma_apply_volume_factor_f32(pFramesOut, totalFramesRead * ma_node_get_output_channels(pNodeBase, outputBusIndex), ma_node_output_bus_get_volume(&pNodeBase->pOutputBuses[outputBusIndex]));
+    ma_apply_volume_factor_f32(pFramesOut, (ma_uint64)totalFramesRead * ma_node_get_output_channels(pNodeBase, outputBusIndex), ma_node_output_bus_get_volume(&pNodeBase->pOutputBuses[outputBusIndex]));
 
     /* Advance our local time forward. */
     ma_atomic_fetch_add_64(&pNodeBase->localTime, (ma_uint64)totalFramesRead);
@@ -75080,10 +75080,10 @@ static void ma_engine_node_process_pcm_frames__general(ma_engine_node* pEngineNo
                 /* No channel conversion required. Just copy straight to the output buffer. */
                 if (isVolumeSmoothingEnabled) {
                     /* Volume has already been applied. Just copy straight to the output buffer. */
-                    ma_copy_pcm_frames(pRunningFramesOut, pWorkingBuffer, framesJustProcessedOut * channelsOut, ma_format_f32, channelsOut);
+                    ma_copy_pcm_frames(pRunningFramesOut, pWorkingBuffer, (ma_uint64)framesJustProcessedOut * channelsOut, ma_format_f32, channelsOut);
                 } else {
                     /* Volume has not been applied yet. Copy and apply volume in the same pass. */
-                    ma_copy_and_apply_volume_factor_f32(pRunningFramesOut, pWorkingBuffer, framesJustProcessedOut * channelsOut, volume);
+                    ma_copy_and_apply_volume_factor_f32(pRunningFramesOut, pWorkingBuffer, (ma_uint64)framesJustProcessedOut * channelsOut, volume);
                 }
             } else {
                 /* Channel conversion required. TODO: Add support for channel maps here. */
@@ -75091,7 +75091,7 @@ static void ma_engine_node_process_pcm_frames__general(ma_engine_node* pEngineNo
 
                 /* If we're using smoothing, the volume will have already been applied. */
                 if (!isVolumeSmoothingEnabled) {
-                    ma_apply_volume_factor_f32(pRunningFramesOut, framesJustProcessedOut * channelsOut, volume);
+                    ma_apply_volume_factor_f32(pRunningFramesOut, (ma_uint64)framesJustProcessedOut * channelsOut, volume);
                 }
             }
         }
