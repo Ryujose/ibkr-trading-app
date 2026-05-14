@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace core::services { struct StateBlock; }   // state-io.h, used by SerializeSettings/ApplySettings
+
 namespace ui {
 
 // ============================================================================
@@ -35,6 +37,17 @@ public:
     bool useL2() const         { return m_useL2; }
     int  numDepthRows() const  { return m_numDepthRows; }
     void setNumDepthRows(int n);
+
+    // ── State persistence ────────────────────────────────────────────────────
+    // SerializeSettings fills `b` with every persistable user preference on
+    // this trading window (L2 toggle, exchange filter name, depth row count,
+    // splitter ratios, click-to-trade, expand-spread, default order entry
+    // side/type/TIF/outside-RTH and qty). ApplySettings reads the same keys
+    // back. Both are pure — no IB calls, no subscription side effects. The
+    // exchange filter is persisted by *name* (not index) so it survives the
+    // dynamic per-symbol smart-component refresh.
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
 
     // Subscription status per data stream
     enum class SubStatus { Unknown, Ok, NeedSubscription, NotAllowed };
@@ -90,8 +103,15 @@ public:
 
     // Fired when the user toggles between L1 aggregated depth and L2 per-exchange
     // depth.  main.cpp cancels the current depth subscription and re-subscribes
-    // with the appropriate isSmartDepth flag.
+    // with the appropriate isSmartDepth flag.  Callback receives the NEW mode;
+    // the OLD mode is `!useL2`.
     std::function<void(bool useL2)> OnDepthModeChanged;
+
+    // Fired when numDepthRows() changes without a mode flip.  main.cpp cancels
+    // the current depth subscription (in the *current* mode) and re-subscribes
+    // with the new row count.  Distinct from OnDepthModeChanged because the
+    // cancel must use the current isSmartDepth flag, not its inverse.
+    std::function<void()> OnDepthRowsChanged;
 
     // Replace the exchange combo list with fresh smart-component data.
     // Always leads with "SMART"; resets selected index to 0.
@@ -149,6 +169,14 @@ private:
     bool m_expandSpread  = true;    // show individual tick rows inside the spread
     int  m_ladderRows    = 25;    // virtual price levels above ask / below bid
     int  m_ladderRowsIdx = 4;     // index into kLadderOptions[] — default 25 (index 4)
+
+    // ── Auto-follow ──────────────────────────────────────────────────────────
+    // When ON: every frame, scroll the DOM ladder so the bid/ask spread row
+    // stays vertically centered as the live price moves.
+    // m_snapPending is a one-shot flag set by OnFill so even with auto-follow
+    // OFF, the user's executions briefly snap the view to the spread region.
+    bool m_autoFollow    = true;
+    bool m_snapPending   = false;
 
     struct DOMOrder {
         int               orderId;

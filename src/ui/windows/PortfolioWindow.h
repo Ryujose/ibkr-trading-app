@@ -5,6 +5,8 @@
 #include <vector>
 #include <string>
 
+namespace core::services { struct StateBlock; }
+
 namespace ui {
 
 // ============================================================================
@@ -56,6 +58,10 @@ public:
     // value out to ChartWindow's setup-suggestion sizing. Returns 0 before the
     // first accountSummary() callback fires.
     [[nodiscard]] double netLiquidation() const { return m_account.netLiquidation; }
+
+    // ── State persistence ───────────────────────────────────────────────────
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
 
 private:
     // ---- Window state -------------------------------------------------------

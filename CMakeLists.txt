@@ -337,6 +337,49 @@ target_compile_definitions(ibkr-trading-app PRIVATE
 )
 
 # ============================================================================
+# macOS: bundle MoltenVK + Vulkan loader next to the binary
+# ============================================================================
+# macOS has no native Vulkan — apps go through MoltenVK (Metal translation
+# layer). To keep the shipped binary self-contained, we copy libvulkan.1.dylib
+# (the loader) and libMoltenVK.dylib (the ICD) next to the executable, ship a
+# custom MoltenVK_icd.json with a relative library_path, and set
+# VK_ICD_FILENAMES at startup (main.cpp) to point at it. INSTALL_RPATH is
+# @executable_path so the binary finds the bundled loader.
+if(APPLE)
+    find_library(MOLTENVK_DYLIB
+        NAMES MoltenVK
+        PATHS /opt/homebrew/opt/molten-vk/lib
+              /usr/local/opt/molten-vk/lib
+              ENV VULKAN_SDK
+        PATH_SUFFIXES lib macOS/lib
+    )
+    if(NOT MOLTENVK_DYLIB)
+        message(FATAL_ERROR
+            "libMoltenVK.dylib not found. Install with:  brew install molten-vk")
+    endif()
+
+    set_target_properties(ibkr-trading-app PROPERTIES
+        INSTALL_RPATH "@executable_path"
+        BUILD_WITH_INSTALL_RPATH FALSE
+    )
+
+    # Dev convenience: copy dylibs + ICD JSON next to the build-tree binary
+    # so `./build/ibkr-trading-app` runs without `cmake --install`.
+    add_custom_command(TARGET ibkr-trading-app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${Vulkan_LIBRARY}"   "$<TARGET_FILE_DIR:ibkr-trading-app>/"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${MOLTENVK_DYLIB}"   "$<TARGET_FILE_DIR:ibkr-trading-app>/"
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:ibkr-trading-app>/vulkan/icd.d"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/cmake/MoltenVK_icd.json"
+            "$<TARGET_FILE_DIR:ibkr-trading-app>/vulkan/icd.d/"
+        VERBATIM
+    )
+endif()
+
+# ============================================================================
 # Installation Rules
 # ============================================================================
 # Install layout (used by `cmake --install build --prefix dist` and by the
@@ -347,6 +390,48 @@ install(TARGETS ibkr-trading-app
     RUNTIME DESTINATION .
 )
 install(DIRECTORY assets DESTINATION .)
+
+if(APPLE)
+    install(FILES "${Vulkan_LIBRARY}" "${MOLTENVK_DYLIB}"
+        DESTINATION .
+        FOLLOW_SYMLINK_CHAIN
+    )
+    install(FILES "${CMAKE_SOURCE_DIR}/cmake/MoltenVK_icd.json"
+        DESTINATION vulkan/icd.d
+    )
+    # Defensive: brew's vulkan-loader normally ships with install_name
+    # `@rpath/libvulkan.1.dylib`, but rewrite the binary's loader reference
+    # and the bundled dylibs' ids if any of them ended up with absolute
+    # Cellar paths. install_name_tool exits non-zero on a no-op, so each
+    # call is wrapped in execute_process with ERROR_QUIET.
+    install(CODE [[
+        foreach(_lib libvulkan.1.dylib libMoltenVK.dylib)
+            set(_path "${CMAKE_INSTALL_PREFIX}/${_lib}")
+            if(EXISTS "${_path}")
+                execute_process(
+                    COMMAND install_name_tool -id "@rpath/${_lib}" "${_path}"
+                    OUTPUT_QUIET ERROR_QUIET)
+            endif()
+        endforeach()
+        set(_exe "${CMAKE_INSTALL_PREFIX}/ibkr-trading-app")
+        if(EXISTS "${_exe}")
+            execute_process(
+                COMMAND otool -L "${_exe}"
+                OUTPUT_VARIABLE _otool
+                ERROR_QUIET)
+            string(REGEX MATCHALL "[^ \t\r\n(]+libvulkan[^ \t\r\n(]*\\.dylib"
+                _matches "${_otool}")
+            foreach(_old IN LISTS _matches)
+                if(NOT _old MATCHES "^@")
+                    execute_process(
+                        COMMAND install_name_tool
+                            -change "${_old}" "@rpath/libvulkan.1.dylib" "${_exe}"
+                        OUTPUT_QUIET ERROR_QUIET)
+                endif()
+            endforeach()
+        endif()
+    ]])
+endif()
 
 # ============================================================================
 # Optional: Tests

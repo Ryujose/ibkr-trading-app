@@ -7,6 +7,8 @@
 #include <functional>
 #include <string>
 
+namespace core::services { struct StateBlock; }
+
 namespace ui {
 
 // ============================================================================
@@ -41,6 +43,10 @@ public:
     // Filter toolbar "Load" → calls ReqExecutions(8001, sym, side, dateFrom)
     std::function<void(const std::string& sym, const std::string& side,
                        const std::string& dateFrom)> OnLoadHistory;
+
+    // ── State persistence ───────────────────────────────────────────────────
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
 
 private:
     bool m_open    = true;

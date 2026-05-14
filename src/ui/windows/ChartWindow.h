@@ -13,6 +13,8 @@
 
 struct ImDrawList;   // forward-declare to avoid pulling imgui.h into every TU
 
+namespace core::services { struct StateBlock; }   // state-io.h, used by SerializeSettings/ApplySettings
+
 namespace ui {
 
 // ============================================================================
@@ -102,6 +104,16 @@ public:
     int  groupId() const       { return m_groupId; }
     void setInstanceId(int id);
     int  instanceId() const    { return m_instanceId; }
+
+    // ── State persistence ────────────────────────────────────────────────────
+    // SerializeSettings fills `b` with every persistable user preference on
+    // this chart (indicator toggles + params, auto-analysis toggles + params,
+    // setup-overlay knobs + confluence gates, useRTH / showOvernight /
+    // showLegend, subplot height ratios). ApplySettings reads the same keys
+    // back. Both are pure — no IB calls, no rendering side effects.
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
+
     void AddBar(const core::Bar& bar, bool done);
     void SetHistoricalData(const core::BarSeries& series);
     // Prepend older bars to the left of the current series (extend-history result).
