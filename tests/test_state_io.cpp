@@ -91,12 +91,12 @@ struct HomeOverride {
 
 // ── Parser: basic shapes ─────────────────────────────────────────────────────
 
-TEST_CASE("ParseStateBlocks: empty input → no blocks", "[state-io]") {
+TEST_CASE("ParseStateBlocks: empty input -> no blocks", "[state-io]") {
     auto blocks = ParseStateBlocks("");
     REQUIRE(blocks.empty());
 }
 
-TEST_CASE("ParseStateBlocks: comment-only input → no blocks", "[state-io]") {
+TEST_CASE("ParseStateBlocks: comment-only input -> no blocks", "[state-io]") {
     auto blocks = ParseStateBlocks("# this is a comment\n# another\n");
     REQUIRE(blocks.empty());
 }
@@ -239,7 +239,7 @@ TEST_CASE("ParseStateBlocks: INSTANCE and WINDOW blocks intermixed", "[state-io]
 
 // ── Round-trip: Format → Parse ───────────────────────────────────────────────
 
-TEST_CASE("FormatStateBlocks → ParseStateBlocks: round-trip", "[state-io]") {
+TEST_CASE("FormatStateBlocks -> ParseStateBlocks: round-trip", "[state-io]") {
     std::vector<StateBlock> blocks(3);
     blocks[0].instance = 0;
     SetString(blocks[0], "SYMBOL", "AAPL");
