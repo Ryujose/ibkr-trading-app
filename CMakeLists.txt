@@ -392,10 +392,18 @@ install(TARGETS ibkr-trading-app
 install(DIRECTORY assets DESTINATION .)
 
 if(APPLE)
-    install(FILES "${Vulkan_LIBRARY}" "${MOLTENVK_DYLIB}"
-        DESTINATION .
-        FOLLOW_SYMLINK_CHAIN
-    )
+    # FOLLOW_SYMLINK_CHAIN is not a keyword on install(FILES) — it only works
+    # with file(INSTALL ...). brew's libvulkan.1.dylib / libMoltenVK.dylib are
+    # symlinks pointing into the Cellar (e.g. libvulkan.1.dylib →
+    # libvulkan.1.4.341.dylib), so we need the chain followed at install time.
+    install(CODE "
+        file(INSTALL
+            \"${Vulkan_LIBRARY}\"
+            \"${MOLTENVK_DYLIB}\"
+            DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
+            FOLLOW_SYMLINK_CHAIN
+        )
+    ")
     install(FILES "${CMAKE_SOURCE_DIR}/cmake/MoltenVK_icd.json"
         DESTINATION vulkan/icd.d
     )
