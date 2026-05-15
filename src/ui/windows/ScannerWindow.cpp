@@ -1,5 +1,6 @@
 #include "ui/UiScale.h"
 #include "ScannerWindow.h"
+#include "core/services/state-io.h"
 
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
@@ -229,6 +230,127 @@ void ScannerWindow::setInstanceId(int id) {
 
 const char* ScannerWindow::getPresetLabel() const {
     return core::ScanPresetLabel(kPresets[m_presetIdx]);
+}
+
+// ============================================================================
+// State persistence — every user-tunable preference round-trips through a
+// single StateBlock. Pure: no IB calls, no scan side effects.
+// ============================================================================
+void ScannerWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+
+    SetInt   (b, "ASSET_CLASS",      (int)m_activeClass);
+    SetInt   (b, "PRESET_IDX",       m_presetIdx);
+    SetBool  (b, "SHOW_FILTERS",     m_showFilters);
+
+    // ── ScanFilter values ──
+    SetDouble(b, "FLT_MIN_PRICE",    m_filter.minPrice);
+    SetDouble(b, "FLT_MAX_PRICE",    m_filter.maxPrice);
+    SetDouble(b, "FLT_MIN_CHGPCT",   m_filter.minChangePct);
+    SetDouble(b, "FLT_MAX_CHGPCT",   m_filter.maxChangePct);
+    SetDouble(b, "FLT_MIN_VOLUME",   m_filter.minVolume);
+    SetDouble(b, "FLT_MAX_VOLUME",   m_filter.maxVolume);
+    SetDouble(b, "FLT_MIN_MKTCAP",   m_filter.minMktCapM);
+    SetDouble(b, "FLT_MAX_MKTCAP",   m_filter.maxMktCapM);
+    SetDouble(b, "FLT_MIN_RSI",      m_filter.minRsi);
+    SetDouble(b, "FLT_MAX_RSI",      m_filter.maxRsi);
+    SetString(b, "FLT_SECTOR",       m_filter.sector);
+    SetString(b, "FLT_EXCHANGE",     m_filter.exchange);
+
+    // ── Filter UI buffers (mirror the ranges, but a few may diverge if
+    // the user is mid-typing — serialise them too so the input fields look
+    // identical across restart) ──
+    SetString(b, "FLT_BUF_MIN_PRICE", std::string(m_minPriceBuf));
+    SetString(b, "FLT_BUF_MAX_PRICE", std::string(m_maxPriceBuf));
+    SetString(b, "FLT_BUF_MIN_CHG",   std::string(m_minChgBuf));
+    SetString(b, "FLT_BUF_MAX_CHG",   std::string(m_maxChgBuf));
+    SetString(b, "FLT_BUF_MIN_VOL",   std::string(m_minVolBuf));
+    SetString(b, "FLT_BUF_SECTOR",    std::string(m_sectorBuf));
+
+    // ── Column visibility ──
+    SetBool(b, "COL_COMPANY",    m_showCompany);
+    SetBool(b, "COL_CHANGE",     m_showChange);
+    SetBool(b, "COL_CHANGE_PCT", m_showChangePct);
+    SetBool(b, "COL_VOLUME",     m_showVolume);
+    SetBool(b, "COL_RELVOL",     m_showRelVol);
+    SetBool(b, "COL_MKTCAP",     m_showMktCap);
+    SetBool(b, "COL_PE",         m_showPE);
+    SetBool(b, "COL_HIGH52",     m_showHigh52);
+    SetBool(b, "COL_LOW52",      m_showLow52);
+    SetBool(b, "COL_PCT_H52",    m_showPctH52);
+    SetBool(b, "COL_RSI",        m_showRSI);
+    SetBool(b, "COL_MACD",       m_showMACD);
+    SetBool(b, "COL_ATR",        m_showATR);
+    SetBool(b, "COL_SPARKLINE",  m_showSparkline);
+
+    // ── Sort state ──
+    SetInt (b, "SORT_COL", (int)m_sortCol);
+    SetBool(b, "SORT_ASC", m_sortAscending);
+
+    // ── Auto-refresh ──
+    SetBool  (b, "AUTO_REFRESH",     m_autoRefresh);
+    SetDouble(b, "AUTO_REFRESH_SEC", m_autoRefreshSec);
+}
+
+void ScannerWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+
+    m_activeClass = static_cast<core::AssetClass>(
+        GetInt(b, "ASSET_CLASS", (int)m_activeClass, 0, 3));
+    m_presetIdx   = GetInt(b, "PRESET_IDX", m_presetIdx, 0, kNumPresets - 1);
+    m_showFilters = GetBool(b, "SHOW_FILTERS", m_showFilters);
+
+    // ── ScanFilter ranges (clamped to sane bounds) ──
+    m_filter.minPrice     = GetDouble(b, "FLT_MIN_PRICE",  m_filter.minPrice,     0.0, 1e9);
+    m_filter.maxPrice     = GetDouble(b, "FLT_MAX_PRICE",  m_filter.maxPrice,     0.0, 1e9);
+    m_filter.minChangePct = GetDouble(b, "FLT_MIN_CHGPCT", m_filter.minChangePct, -1000.0, 1000.0);
+    m_filter.maxChangePct = GetDouble(b, "FLT_MAX_CHGPCT", m_filter.maxChangePct, -1000.0, 1000.0);
+    m_filter.minVolume    = GetDouble(b, "FLT_MIN_VOLUME", m_filter.minVolume,    0.0, 1e12);
+    m_filter.maxVolume    = GetDouble(b, "FLT_MAX_VOLUME", m_filter.maxVolume,    0.0, 1e12);
+    m_filter.minMktCapM   = GetDouble(b, "FLT_MIN_MKTCAP", m_filter.minMktCapM,   0.0, 1e9);
+    m_filter.maxMktCapM   = GetDouble(b, "FLT_MAX_MKTCAP", m_filter.maxMktCapM,   0.0, 1e9);
+    m_filter.minRsi       = GetDouble(b, "FLT_MIN_RSI",    m_filter.minRsi,       0.0, 100.0);
+    m_filter.maxRsi       = GetDouble(b, "FLT_MAX_RSI",    m_filter.maxRsi,       0.0, 100.0);
+    m_filter.sector       = GetString(b, "FLT_SECTOR",     m_filter.sector);
+    m_filter.exchange     = GetString(b, "FLT_EXCHANGE",   m_filter.exchange);
+
+    // ── Filter UI buffers ──
+    auto copyBuf = [&](const char* key, char* dst, size_t cap) {
+        std::string v = GetString(b, key, std::string(dst));
+        std::strncpy(dst, v.c_str(), cap - 1);
+        dst[cap - 1] = '\0';
+    };
+    copyBuf("FLT_BUF_MIN_PRICE", m_minPriceBuf, sizeof(m_minPriceBuf));
+    copyBuf("FLT_BUF_MAX_PRICE", m_maxPriceBuf, sizeof(m_maxPriceBuf));
+    copyBuf("FLT_BUF_MIN_CHG",   m_minChgBuf,   sizeof(m_minChgBuf));
+    copyBuf("FLT_BUF_MAX_CHG",   m_maxChgBuf,   sizeof(m_maxChgBuf));
+    copyBuf("FLT_BUF_MIN_VOL",   m_minVolBuf,   sizeof(m_minVolBuf));
+    copyBuf("FLT_BUF_SECTOR",    m_sectorBuf,   sizeof(m_sectorBuf));
+
+    // ── Column visibility ──
+    m_showCompany   = GetBool(b, "COL_COMPANY",    m_showCompany);
+    m_showChange    = GetBool(b, "COL_CHANGE",     m_showChange);
+    m_showChangePct = GetBool(b, "COL_CHANGE_PCT", m_showChangePct);
+    m_showVolume    = GetBool(b, "COL_VOLUME",     m_showVolume);
+    m_showRelVol    = GetBool(b, "COL_RELVOL",     m_showRelVol);
+    m_showMktCap    = GetBool(b, "COL_MKTCAP",     m_showMktCap);
+    m_showPE        = GetBool(b, "COL_PE",         m_showPE);
+    m_showHigh52    = GetBool(b, "COL_HIGH52",     m_showHigh52);
+    m_showLow52     = GetBool(b, "COL_LOW52",      m_showLow52);
+    m_showPctH52    = GetBool(b, "COL_PCT_H52",    m_showPctH52);
+    m_showRSI       = GetBool(b, "COL_RSI",        m_showRSI);
+    m_showMACD      = GetBool(b, "COL_MACD",       m_showMACD);
+    m_showATR       = GetBool(b, "COL_ATR",        m_showATR);
+    m_showSparkline = GetBool(b, "COL_SPARKLINE",  m_showSparkline);
+
+    // ── Sort state — ScanColumn enum spans 16 values (Symbol..Sparkline) ──
+    m_sortCol       = static_cast<core::ScanColumn>(
+        GetInt(b, "SORT_COL", (int)m_sortCol, 0, 15));
+    m_sortAscending = GetBool(b, "SORT_ASC", m_sortAscending);
+
+    // ── Auto-refresh ──
+    m_autoRefresh    = GetBool  (b, "AUTO_REFRESH",     m_autoRefresh);
+    m_autoRefreshSec = (float)GetDouble(b, "AUTO_REFRESH_SEC", m_autoRefreshSec, 5.0, 3600.0);
 }
 
 // ============================================================================

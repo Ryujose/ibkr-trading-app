@@ -2,6 +2,7 @@
 #include "ui/windows/TradingWindow.h"
 #include "ui/SymbolSearch.h"
 #include "core/services/ChartAnalysis.h"
+#include "core/services/state-io.h"
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
 
@@ -134,6 +135,30 @@ void TradingWindow::RebuildDepthView() {
     };
     rebuild(m_asks, m_askBuckets, true);   // asks: low → high   (best ask at [0])
     rebuild(m_bids, m_bidBuckets, false);  // bids: high → low   (best bid at [0])
+
+    // NBBO-bounded filter for the merged "All" view: per-exchange L2 feeds from
+    // IB can be stale or briefly disagree across venues, producing a crossed
+    // book in the merge (e.g. EDGEA bid=8.42 above BYX ask=8.39).  NBBO is the
+    // exchange-consolidated top of book and is uncrossed by definition — any
+    // merged ask below NBBO bid, or merged bid above NBBO ask, is therefore
+    // either stale data that never received its delete or a brief latency
+    // artefact.  Drop those crossed levels so the ladder stays monotonic.
+    // Only applied to the merged view; per-exchange filter selections show the
+    // raw bucket so the user can still inspect what each venue is publishing.
+    if (filter == "All") {
+        if (m_nbboAsk > 0.0) {
+            // Drop bid levels at or above the consolidated best ask
+            m_bids.erase(std::remove_if(m_bids.begin(), m_bids.end(),
+                [this](const core::DepthLevel& l) { return l.price >= m_nbboAsk; }),
+                m_bids.end());
+        }
+        if (m_nbboBid > 0.0) {
+            // Drop ask levels at or below the consolidated best bid
+            m_asks.erase(std::remove_if(m_asks.begin(), m_asks.end(),
+                [this](const core::DepthLevel& l) { return l.price <= m_nbboBid; }),
+                m_asks.end());
+        }
+    }
 }
 
 void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
@@ -158,6 +183,10 @@ void TradingWindow::OnOrderStatus(int orderId, core::OrderStatus status,
 void TradingWindow::OnFill(const core::Fill& fill) {
     m_fills.insert(m_fills.begin(), fill);
     if (m_fills.size() > 200) m_fills.resize(200);
+
+    // Trigger one-shot DOM-ladder snap-to-spread so the user sees their fill
+    // land even when continuous auto-follow is off.
+    m_snapPending = true;
 
     // Update running position and average entry price
     double delta   = (fill.side == core::OrderSide::Buy) ? fill.quantity : -fill.quantity;
@@ -202,6 +231,11 @@ void TradingWindow::OnNBBO(double bid, double bidSz, double ask, double askSz) {
     } else if (m_nbboAsk > 0 && m_midPrice <= 0) {
         UpdateMidPrice(m_nbboAsk);
     }
+
+    // Refresh the merged L2 view so its NBBO-bounded filter picks up the new
+    // bounds — otherwise stale crossed levels would linger until the next
+    // depth tick refreshed the merge.
+    if (m_useL2) RebuildDepthView();
 }
 
 void TradingWindow::OnMktDataError(int code) {
@@ -294,9 +328,99 @@ void TradingWindow::UpdateMidPrice(double price) {
 void TradingWindow::setNumDepthRows(int n) {
     if (n == m_numDepthRows) return;
     m_numDepthRows = n;
-    // Re-subscribe with the new row count.  Fire OnDepthModeChanged so main.cpp
-    // cancels the old subscription and re-subscribes with the correct rows.
-    if (OnDepthModeChanged) OnDepthModeChanged(m_useL2);
+    // Re-subscribe with the new row count.  Must use OnDepthRowsChanged (not
+    // OnDepthModeChanged) — the mode hasn't flipped, so the cancel needs the
+    // *current* isSmartDepth flag, not its inverse.  Using OnDepthModeChanged
+    // here would cancel with the wrong flag, IB would silently drop it, and
+    // the new ReqMktDepth would collide with the still-alive subscription —
+    // the user keeps seeing the old row count (e.g. selecting 300 but only
+    // 25 rows render).
+    if (OnDepthRowsChanged) OnDepthRowsChanged();
+}
+
+// ============================================================================
+// State persistence — every user-tunable TradingWindow preference round-trips
+// through a single StateBlock. Pure: no IB calls, no subscription side
+// effects. ApplySettings sets fields directly (no setter calls) so loading
+// before any depth subscription exists doesn't trigger spurious cancels.
+//
+// The exchange filter is persisted by *name* (not index) so it survives the
+// dynamic per-symbol smart-component refresh — on apply we look up the saved
+// name in the current m_exchangeList, falling back to index 0 ("All") if the
+// name isn't (yet) in the list.
+// ============================================================================
+void TradingWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+
+    SetBool  (b, "USE_L2",            m_useL2);
+    // Resolve the current filter index to its name. If the index is invalid
+    // (out-of-range), fall back to "All".
+    std::string filterName = "All";
+    if (m_exchangeFilterIdx >= 0 &&
+        m_exchangeFilterIdx < (int)m_exchangeList.size())
+        filterName = m_exchangeList[m_exchangeFilterIdx];
+    SetString(b, "EXCH_FILTER",       filterName);
+    SetInt   (b, "NUM_DEPTH_ROWS",    m_numDepthRows);
+    SetInt   (b, "LADDER_ROWS_IDX",   m_ladderRowsIdx);
+    SetDouble(b, "TOP_HEIGHT_RATIO",  m_topHeightRatio);
+    SetDouble(b, "BOOK_WIDTH_RATIO",  m_bookWidthRatio);
+    SetBool  (b, "CLICK_TO_TRADE",    m_clickToTrade);
+    SetBool  (b, "EXPAND_SPREAD",     m_expandSpread);
+    SetBool  (b, "AUTO_FOLLOW",       m_autoFollow);
+
+    // Order-entry defaults — qty + side + type + TIF + outside-RTH survive
+    // across sessions so the user's typical setup is ready on launch.
+    SetString(b, "DEFAULT_QTY",       std::string(m_qtyBuf));
+    SetInt   (b, "DEFAULT_SIDE",      m_sideIdx);
+    SetInt   (b, "DEFAULT_TYPE",      m_typeIdx);
+    SetInt   (b, "DEFAULT_TIF",       m_tifIdx);
+    SetBool  (b, "DEFAULT_OUTSIDE_RTH", m_outsideRth);
+}
+
+void TradingWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+
+    m_useL2          = GetBool(b, "USE_L2",         m_useL2);
+
+    // Look up the saved exchange filter name in the rebuilt list. The list is
+    // dynamic per symbol (populated from smart-component callbacks) and will
+    // be rebuilt later as ticks arrive — on first load it's just {"All"} so
+    // anything other than "All" falls back to index 0 here and is restored
+    // when the list re-populates and the user (or RefreshExchangeFilterList)
+    // re-evaluates. Persisting by name is the right call regardless.
+    std::string savedFilter = GetString(b, "EXCH_FILTER", "All");
+    m_exchangeFilterIdx = 0;
+    for (int i = 0; i < (int)m_exchangeList.size(); ++i)
+        if (m_exchangeList[i] == savedFilter) { m_exchangeFilterIdx = i; break; }
+
+    m_numDepthRows   = GetInt(b, "NUM_DEPTH_ROWS",  m_numDepthRows,  5, kDepthLevels);
+    m_ladderRowsIdx  = GetInt(b, "LADDER_ROWS_IDX", m_ladderRowsIdx, 0, 13);
+    // Keep m_ladderRows aligned with the index (mirrors what the Combo
+    // change handler does in DrawOrderBook).
+    {
+        static constexpr int kLadderOptions[] = {5, 10, 15, 20, 25, 30, 40, 50,
+                                                  75, 100, 150, 200, 250, 300};
+        if (m_ladderRowsIdx >= 0 && m_ladderRowsIdx < 14)
+            m_ladderRows = kLadderOptions[m_ladderRowsIdx];
+    }
+
+    m_topHeightRatio = (float)GetDouble(b, "TOP_HEIGHT_RATIO", m_topHeightRatio, 0.15, 0.85);
+    m_bookWidthRatio = (float)GetDouble(b, "BOOK_WIDTH_RATIO", m_bookWidthRatio, 0.15, 0.85);
+    m_clickToTrade   = GetBool(b, "CLICK_TO_TRADE", m_clickToTrade);
+    m_expandSpread   = GetBool(b, "EXPAND_SPREAD",  m_expandSpread);
+    m_autoFollow     = GetBool(b, "AUTO_FOLLOW",    m_autoFollow);
+
+    // Order-entry defaults. Qty is a stringy char buffer, so the saved value
+    // is copied byte-for-byte (truncating to fit). Side/type/TIF/outside-RTH
+    // are clamped to safe enum ranges so a corrupted file can't crash on the
+    // first render — type covers all 13 OrderType variants (indices 0..12).
+    std::string qty = GetString(b, "DEFAULT_QTY", std::string(m_qtyBuf));
+    std::strncpy(m_qtyBuf, qty.c_str(), sizeof(m_qtyBuf) - 1);
+    m_qtyBuf[sizeof(m_qtyBuf) - 1] = '\0';
+    m_sideIdx     = GetInt (b, "DEFAULT_SIDE",        m_sideIdx,     0, 1);
+    m_typeIdx     = GetInt (b, "DEFAULT_TYPE",        m_typeIdx,     0, 12);
+    m_tifIdx      = GetInt (b, "DEFAULT_TIF",         m_tifIdx,      0, 6);
+    m_outsideRth  = GetBool(b, "DEFAULT_OUTSIDE_RTH", m_outsideRth);
 }
 
 // ============================================================================
@@ -522,6 +646,13 @@ void TradingWindow::DrawOrderBook() {
             "Click any ask row → BUY limit order at that price.\n"
             "Click any bid row → SELL limit order at that price.\n"
             "Uses Quantity and TIF from the Order Entry panel.");
+    hdr.item(FlexRow::checkboxW("Auto-Follow"), 12);
+    ImGui::Checkbox("Auto-Follow", &m_autoFollow);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "Keep the bid/ask spread centered as price moves.\n"
+            "Even when OFF, the ladder briefly snaps to the spread when one of\n"
+            "your own orders fills, so executions stay visible.");
     hdr.item(FlexRow::textW("Levels:"), 16);
     ImGui::TextDisabled("Levels:");
     {
@@ -830,6 +961,27 @@ void TradingWindow::DrawOrderBook() {
         }
     };
 
+    // ── Auto-follow scroll anchor ─────────────────────────────────────────────
+    // Call once on the first spread/mid row of whichever branch renders below.
+    // m_autoFollow keeps the spread centered every frame; m_snapPending is a
+    // one-shot from OnFill so executions snap into view even when auto-follow
+    // is off. The flag is cleared after the table has been rendered.
+    //
+    // SetScrollHereY uses CursorPosPrevLine to position the scroll target, so
+    // it needs a valid cell context — calling it before any cell content was
+    // rendered on the current row would anchor on the PREVIOUS row's last
+    // item. We submit a tiny invisible Dummy in column 0 first to advance the
+    // line cursor onto the current row, then SetScrollHereY anchors here.
+    bool scrollAnchored = false;
+    auto anchorSpread = [&]() {
+        if (scrollAnchored) return;
+        if (!m_autoFollow && !m_snapPending) return;
+        ImGui::TableSetColumnIndex(0);
+        ImGui::Dummy(ImVec2(1.0f, 1.0f));    // pin the cursor onto this row
+        ImGui::SetScrollHereY(0.5f);
+        scrollAnchored = true;
+    };
+
     // ── DOM table ─────────────────────────────────────────────────────────────
     ImGuiTableFlags tflags =
         ImGuiTableFlags_BordersInnerV |
@@ -923,6 +1075,7 @@ void TradingWindow::DrawOrderBook() {
                     double price = RoundTick(m_asks[0].price - s * 0.01);
                     double pnl   = CalcPnl(price);
                     ImGui::TableNextRow();
+                    anchorSpread();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                     ImGui::TableSetColumnIndex(0);
                     RowOverlay(price, 'm');
@@ -962,6 +1115,7 @@ void TradingWindow::DrawOrderBook() {
                 // Collapsed: single summary row
                 double midP = RoundTick((m_asks[0].price + m_bids[0].price) / 2.0);
                 ImGui::TableNextRow();
+                anchorSpread();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                 ImGui::TableSetColumnIndex(0);
                 RowOverlay(midP, 'm');
@@ -1039,6 +1193,7 @@ void TradingWindow::DrawOrderBook() {
                     double price = RoundTick(m_nbboAsk - s * 0.01);
                     double pnl   = CalcPnl(price);
                     ImGui::TableNextRow();
+                    anchorSpread();
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                     ImGui::TableSetColumnIndex(0);
                     RowOverlay(price, 'm');
@@ -1077,6 +1232,7 @@ void TradingWindow::DrawOrderBook() {
             } else {
                 double midP = RoundTick((m_nbboAsk + m_nbboBid) / 2.0);
                 ImGui::TableNextRow();
+                anchorSpread();
                 ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(44, 44, 52, 100));
                 ImGui::TableSetColumnIndex(0);
                 RowOverlay(midP, 'm');
@@ -1233,6 +1389,12 @@ void TradingWindow::DrawOrderBook() {
     }
 
     ImGui::EndTable();
+
+    // Consume the one-shot fill-snap flag after the table has had a chance to
+    // anchor on it. Anchoring may not happen this frame (e.g. no spread rows
+    // rendered because asks or bids are empty); in that case the flag persists
+    // and the snap fires on the next frame that actually has a spread row.
+    if (scrollAnchored) m_snapPending = false;
 }
 
 // ============================================================================

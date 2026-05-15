@@ -1,4 +1,5 @@
 #include "ui/windows/WshCalendarWindow.h"
+#include "core/services/state-io.h"
 #include "ui/UiScale.h"
 #include "ui/WshData.h"
 #include "imgui.h"
@@ -22,6 +23,36 @@ enum ColIdx { kColDate = 0, kColSymbol, kColType, kColImportance, kColDescriptio
 WshCalendarWindow::WshCalendarWindow() {}
 
 WshCalendarWindow::~WshCalendarWindow() { CancelAll(); }
+
+// ============================================================================
+// State persistence
+// ============================================================================
+
+void WshCalendarWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+    if (m_filterSymbol[0]) SetString(b, "WSH_FILTER_SYMBOL", m_filterSymbol);
+    if (m_filterFrom[0])   SetString(b, "WSH_FILTER_FROM",   m_filterFrom);
+    if (m_filterTo[0])     SetString(b, "WSH_FILTER_TO",     m_filterTo);
+    SetInt (b, "WSH_FILTER_TYPE",       m_filterType);
+    SetInt (b, "WSH_FILTER_IMPORTANCE", m_filterImportance);
+    SetInt (b, "WSH_SORT_COL",          m_sortCol);
+    SetBool(b, "WSH_SORT_ASC",          m_sortAsc);
+}
+
+void WshCalendarWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+    std::string s;
+    s = GetString(b, "WSH_FILTER_SYMBOL", "");
+    if (!s.empty()) { std::strncpy(m_filterSymbol, s.c_str(), sizeof(m_filterSymbol)-1); }
+    s = GetString(b, "WSH_FILTER_FROM", "");
+    if (!s.empty()) { std::strncpy(m_filterFrom, s.c_str(), sizeof(m_filterFrom)-1); }
+    s = GetString(b, "WSH_FILTER_TO", "");
+    if (!s.empty()) { std::strncpy(m_filterTo, s.c_str(), sizeof(m_filterTo)-1); }
+    m_filterType       = GetInt (b, "WSH_FILTER_TYPE",       m_filterType,       0, 4);
+    m_filterImportance = GetInt (b, "WSH_FILTER_IMPORTANCE", m_filterImportance, 0, 3);
+    m_sortCol          = GetInt (b, "WSH_SORT_COL",          m_sortCol,          0, 4);
+    m_sortAsc          = GetBool(b, "WSH_SORT_ASC",          m_sortAsc);
+}
 
 // ============================================================================
 // Slot allocation

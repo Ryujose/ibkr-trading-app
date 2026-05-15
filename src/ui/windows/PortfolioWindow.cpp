@@ -1,4 +1,5 @@
 #include "ui/UiScale.h"
+#include "core/services/state-io.h"
 #include "PortfolioWindow.h"
 
 #include "imgui.h"
@@ -45,6 +46,40 @@ static const char* CurrSym(const std::string& bc) {
 PortfolioWindow::PortfolioWindow()
 {
     RecalcAccountTotals();
+    SortPositions();
+}
+
+// ============================================================================
+// State persistence
+// ============================================================================
+
+void PortfolioWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+    SetInt(b, "PORT_SORT_COL", (int)m_sortCol);
+    SetBool(b, "PORT_SORT_ASC", m_sortAscending);
+    SetBool(b, "PORT_COL_DESC",     m_showDesc);
+    SetBool(b, "PORT_COL_AVGCOST",  m_showAvgCost);
+    SetBool(b, "PORT_COL_COSTBASIS",m_showCostBasis);
+    SetBool(b, "PORT_COL_REALPNL",  m_showRealPnL);
+    SetBool(b, "PORT_COL_DAYPnL",   m_showDayPnL);
+    SetBool(b, "PORT_COL_DAYCHG",   m_showDayChg);
+    SetBool(b, "PORT_COL_WEIGHT",   m_showWeight);
+    if (m_tradeFilterBuf[0]) SetString(b, "PORT_FILTER_SYMBOL", m_tradeFilterBuf);
+}
+
+void PortfolioWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+    m_sortCol        = (core::PositionColumn)GetInt(b, "PORT_SORT_COL", (int)m_sortCol, 0, 12);
+    m_sortAscending  = GetBool(b, "PORT_SORT_ASC", m_sortAscending);
+    m_showDesc       = GetBool(b, "PORT_COL_DESC",     m_showDesc);
+    m_showAvgCost    = GetBool(b, "PORT_COL_AVGCOST",  m_showAvgCost);
+    m_showCostBasis  = GetBool(b, "PORT_COL_COSTBASIS",m_showCostBasis);
+    m_showRealPnL    = GetBool(b, "PORT_COL_REALPNL",  m_showRealPnL);
+    m_showDayPnL     = GetBool(b, "PORT_COL_DAYPnL",   m_showDayPnL);
+    m_showDayChg     = GetBool(b, "PORT_COL_DAYCHG",   m_showDayChg);
+    m_showWeight     = GetBool(b, "PORT_COL_WEIGHT",   m_showWeight);
+    std::string fs = GetString(b, "PORT_FILTER_SYMBOL", "");
+    if (!fs.empty()) { std::strncpy(m_tradeFilterBuf, fs.c_str(), sizeof(m_tradeFilterBuf)-1); }
     SortPositions();
 }
 

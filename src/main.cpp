@@ -58,6 +58,7 @@
 #include "core/services/IBKRClient.h"
 #include "core/services/IBKRUtils.h"
 #include "core/services/NotificationService.h"
+#include "core/services/state-io.h"
 #include "core/models/WindowGroup.h"
 #include "ui/NotificationOverlay.h"
 
@@ -181,6 +182,13 @@ static constexpr double kReconnectIntervalSec = 5.0;
 enum class FontSize { Small = 0, Medium = 1, Large = 2 };
 static FontSize g_fontSize     = FontSize::Medium;
 static bool     g_settingsOpen = false;
+
+// Default trading style applied to every newly-spawned ChartWindow. Restored
+// from app-prefs.cfg at startup; user changes it via Settings → "Default
+// trading style for new charts". Existing charts keep their own style
+// (persisted via chart-modes.cfg) — this only affects fresh spawns.
+static core::services::TradingStyle g_defaultTradingStyle =
+    core::services::TradingStyle::Swing;
 
 static constexpr float kFontScales[] = { 0.85f, 1.0f, 1.5f }; // Small / Medium / Large
 static ImGuiStyle      g_baseStyle;   // saved after initial style setup; used to re-scale cleanly
@@ -649,9 +657,33 @@ inline int AllocChartExtId() {
     if (s_next > 13999) s_next = 13000;
     return id;
 }
-inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119
-inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129
-inline int TradingTickId (int idx) { return 130  + idx; }       // 130-139
+// Rotating pools for trading-window reqIds — same rationale as
+// AllocChartMktId. ApplyTradingSymbol cancels and immediately re-issues on the
+// same depthId/mktId/tickId, but IB keeps streaming for a few ms after cancel.
+// Without rotation those stale messages land on the new symbol's L2 buckets,
+// producing a crossed/intercalated book (e.g. PSX showing bid=8.45/ask=8.08
+// when stale data from a previous $8 ticker leaks through).
+inline int AllocTradingMktId() {
+    static int s_next = 14000;
+    int id = s_next++;
+    if (s_next > 14999) s_next = 14000;
+    return id;
+}
+inline int AllocTradingDepthId() {
+    static int s_next = 15000;
+    int id = s_next++;
+    if (s_next > 15999) s_next = 15000;
+    return id;
+}
+inline int AllocTradingTickId() {
+    static int s_next = 16000;
+    int id = s_next++;
+    if (s_next > 16999) s_next = 16000;
+    return id;
+}
+inline int TradingMktId  (int idx) { return 110  + idx; }       // 110-119 (initial slot)
+inline int TradingDepthId(int idx) { return 120  + idx; }       // 120-129 (initial slot)
+inline int TradingTickId (int idx) { return 130  + idx; }       // 130-139 (initial slot)
 inline int ChartWshId    (int idx) { return 8020 + idx; }       // 8020-8029
 inline int ScannerBase   (int idx) { return 1000 + idx * 100; } // 1000,1100,...,1900
 inline int ScannerMktBase(int idx) { return 800  + idx * 12; }  // 800,812,...,908
@@ -953,9 +985,16 @@ static void ApplyTradingSymbol(TradingEntry& te, const std::string& sym) {
             te.win->SetPosition(it->second.quantity, it->second.avgCost);
     }
     if (!g_IBClient) return;
+    // Cancel + rotate to fresh reqIds so stale depth/tick messages from the
+    // previous subscription (IB streams for a few ms after cancel) land on
+    // ids no entry owns and are silently dropped at the dispatcher.
     g_IBClient->CancelMarketData(te.mktId);
     g_IBClient->CancelMktDepth(te.depthId, te.win ? te.win->useL2() : false);
     g_IBClient->CancelTickByTickData(te.tickId);
+    g_tickerSymbols.erase(te.mktId);
+    te.mktId   = AllocTradingMktId();
+    te.depthId = AllocTradingDepthId();
+    te.tickId  = AllocTradingTickId();
     g_tickerSymbols[te.mktId] = sym;
     g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
     g_IBClient->ReqMktDepth(te.depthId, sym, te.win ? te.win->numDepthRows() : 20,
@@ -1115,6 +1154,13 @@ static void SpawnChartWindow(int idx) {
     e.win    = new ui::ChartWindow();
     e.win->setInstanceId(idx + 1);
     e.win->setGroupId((idx % core::kNumGroups) + 1);
+
+    // Adopt the app-wide default trading style (set via Settings; persisted
+    // in app-prefs.cfg). silent=true so this doesn't enqueue a redundant IB
+    // request — chart-modes.cfg restore will override this for known charts,
+    // and fresh-spawn (no chart-modes entry) uses the default as-is.
+    if (g_defaultTradingStyle != core::services::TradingStyle::Swing)
+        e.win->setTradingStyle(g_defaultTradingStyle, /*silent=*/true);
 
     // Capture idx (not pointer — vector may reallocate)
     e.win->OnDataRequest = [idx](const std::string& sym, core::Timeframe tf, bool useRTH) {
@@ -1279,6 +1325,18 @@ static void SpawnTradingWindow(int idx) {
         std::string sym = te.win->getSymbol();
         if (sym.empty()) return;
         g_IBClient->CancelMktDepth(te.depthId, !useL2);  // cancel the old mode
+        te.depthId = AllocTradingDepthId();              // rotate to drop stale L1/L2 ticks
+        g_IBClient->ReqMktDepth(te.depthId, sym, te.win->numDepthRows(), useL2);
+    };
+
+    e.win->OnDepthRowsChanged = [idx]() {
+        auto& te = g_tradingEntries[idx];
+        if (!g_IBClient || !te.win) return;
+        std::string sym = te.win->getSymbol();
+        if (sym.empty()) return;
+        bool useL2 = te.win->useL2();
+        g_IBClient->CancelMktDepth(te.depthId, useL2);   // mode unchanged
+        te.depthId = AllocTradingDepthId();              // rotate to drop stale ticks at old row count
         g_IBClient->ReqMktDepth(te.depthId, sym, te.win->numDepthRows(), useL2);
     };
 
@@ -1306,16 +1364,8 @@ static void SpawnScannerWindow(int idx) {
                 UpdateChartPosition(ce.win);
             }
         for (auto& te : g_tradingEntries)
-            if (te.win && te.win->groupId() == 0) {
-                if (g_IBClient) {
-                    g_IBClient->CancelMarketData(te.mktId);
-                    g_IBClient->CancelMktDepth(te.depthId, te.win->useL2());
-                    g_tickerSymbols[te.mktId] = sym;
-                    g_IBClient->ReqMarketData(te.mktId, sym, MktDataTicks());
-                    g_IBClient->ReqMktDepth(te.depthId, sym, te.win->numDepthRows(), te.win->useL2());
-                }
-                te.win->SetSymbol(sym, 0.0);
-            }
+            if (te.win && te.win->groupId() == 0)
+                ApplyTradingSymbol(te, sym);  // rotates ids; drops stale ticks
     };
 
     e.win->OnScanRequest = [idx](const std::string& scanCode,
@@ -1464,7 +1514,7 @@ static void SaveChartModesFile() {
         if (!f.is_open()) return;
         for (int i = 0; i < (int)g_chartEntries.size(); ++i) {
             const auto& ce = g_chartEntries[i];
-            if (!ce.win) continue;
+            if (!ce.win || !ce.win->open()) continue;
             std::string sym = ce.win->getSymbol();
             if (sym.empty()) continue;
             f << "INSTANCE:" << i << "\n";
@@ -1553,6 +1603,321 @@ static void RebuildEntitledNewsProviders() {
     g_entitledNewsProviders = std::move(joined);
 }
 
+// ---- Per-chart UI settings persistence (Phase 17 Task #81) -------------------
+//
+// Stores every ChartWindow user-tunable setting: indicator toggles + params,
+// auto-analysis toggles + params, setup-overlay knobs + confluence gates,
+// useRTH / showOvernight / showLegend, subplot height ratios. Distinct from
+// chart-modes.cfg (which holds symbol + trading-style + Free-mode TF).
+//
+// File: ~/.config/ibkr-trading-app/chart-settings.cfg
+// Format: one INSTANCE block per chart, all fields serialized by
+// ChartWindow::SerializeSettings.
+//
+// Per-second flush from RenderTradingUI uses a hash-diff against
+// g_lastChartSettingsHash so unchanged state never touches disk — no need to
+// scatter dirty-flag flips across every toolbar/popup mutation site.
+static size_t g_lastChartSettingsHash = 0;
+
+static std::string BuildChartSettingsText() {
+    if (g_chartEntries.empty()) return std::string();
+    std::vector<core::services::StateBlock> blocks;
+    blocks.reserve(g_chartEntries.size());
+    for (int i = 0; i < (int)g_chartEntries.size(); ++i) {
+        const auto& ce = g_chartEntries[i];
+        if (!ce.win || !ce.win->open()) continue;
+        core::services::StateBlock b;
+        b.instance = i;
+        ce.win->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    return core::services::FormatStateBlocks(blocks);
+}
+
+static void SaveChartSettingsFile() {
+    std::string text = BuildChartSettingsText();
+    if (text.empty()) return;
+    size_t h = std::hash<std::string>{}(text);
+    if (h == g_lastChartSettingsHash) return;   // no change since last write
+    std::string path = core::services::ConfigFilePath("chart-settings.cfg");
+    if (path.empty()) return;
+    if (core::services::AtomicWriteText(path, text))
+        g_lastChartSettingsHash = h;
+}
+
+static void LoadChartSettingsFromFile() {
+    using namespace core::services;
+    std::string path = ConfigFilePath("chart-settings.cfg");
+    if (path.empty()) return;
+    bool exists = false;
+    std::string contents = ReadTextFile(path, &exists);
+    if (!exists) return;
+    auto blocks = ParseStateBlocks(contents);
+    for (const auto& b : blocks) {
+        if (b.instance < 0 || b.instance >= (int)g_chartEntries.size()) continue;
+        auto& ce = g_chartEntries[b.instance];
+        if (!ce.win) continue;
+        ce.win->ApplySettings(b);
+    }
+    // Stash the on-disk hash so the next per-second flush is a no-op until
+    // the user actually changes something.
+    g_lastChartSettingsHash = std::hash<std::string>{}(contents);
+}
+
+// ---- Per-trading-window UI settings persistence (Phase 17 Task #82) ---------
+//
+// L2 mode, exchange filter (by name — survives smart-component refresh),
+// depth row count, splitter ratios, click-to-trade, expand-spread, and order
+// entry defaults (qty / side / type / TIF / outside-RTH).
+//
+// File: ~/.config/ibkr-trading-app/trading-settings.cfg
+// Format: one INSTANCE block per TradingWindow, serialised via
+// TradingWindow::SerializeSettings.
+//
+// Hash-diff flush identical to chart-settings.cfg — no dirty-flag plumbing.
+static size_t g_lastTradingSettingsHash = 0;
+
+static std::string BuildTradingSettingsText() {
+    if (g_tradingEntries.empty()) return std::string();
+    std::vector<core::services::StateBlock> blocks;
+    blocks.reserve(g_tradingEntries.size());
+    for (int i = 0; i < (int)g_tradingEntries.size(); ++i) {
+        const auto& te = g_tradingEntries[i];
+        if (!te.win || !te.win->open()) continue;
+        core::services::StateBlock b;
+        b.instance = i;
+        te.win->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    return core::services::FormatStateBlocks(blocks);
+}
+
+static void SaveTradingSettingsFile() {
+    std::string text = BuildTradingSettingsText();
+    if (text.empty()) return;
+    size_t h = std::hash<std::string>{}(text);
+    if (h == g_lastTradingSettingsHash) return;
+    std::string path = core::services::ConfigFilePath("trading-settings.cfg");
+    if (path.empty()) return;
+    if (core::services::AtomicWriteText(path, text))
+        g_lastTradingSettingsHash = h;
+}
+
+static void LoadTradingSettingsFromFile() {
+    using namespace core::services;
+    std::string path = ConfigFilePath("trading-settings.cfg");
+    if (path.empty()) return;
+    bool exists = false;
+    std::string contents = ReadTextFile(path, &exists);
+    if (!exists) return;
+    auto blocks = ParseStateBlocks(contents);
+    // Spawn missing instances so saved blocks beyond index 0 land.
+    int maxInst = -1;
+    for (const auto& b : blocks)
+        if (b.instance > maxInst) maxInst = b.instance;
+    while (maxInst >= (int)g_tradingEntries.size() &&
+           (int)g_tradingEntries.size() < kMaxMultiWin)
+        SpawnTradingWindow((int)g_tradingEntries.size());
+    for (const auto& b : blocks) {
+        if (b.instance < 0 || b.instance >= (int)g_tradingEntries.size()) continue;
+        auto& te = g_tradingEntries[b.instance];
+        if (!te.win) continue;
+        te.win->ApplySettings(b);
+    }
+    g_lastTradingSettingsHash = std::hash<std::string>{}(contents);
+}
+
+// ---- Per-scanner UI settings persistence (Phase 17 Task #83) ----------------
+//
+// Asset class, preset index, ScanFilter ranges + UI buffers, column
+// visibility (14 columns), sort column + direction, filter-bar expanded
+// flag, auto-refresh toggle + interval.
+//
+// File: ~/.config/ibkr-trading-app/scanner-settings.cfg
+// Hash-diff flush, same pattern as chart/trading.
+static size_t g_lastScannerSettingsHash = 0;
+
+static std::string BuildScannerSettingsText() {
+    if (g_scannerEntries.empty()) return std::string();
+    std::vector<core::services::StateBlock> blocks;
+    blocks.reserve(g_scannerEntries.size());
+    for (int i = 0; i < (int)g_scannerEntries.size(); ++i) {
+        const auto& se = g_scannerEntries[i];
+        if (!se.win || !se.win->open()) continue;
+        core::services::StateBlock b;
+        b.instance = i;
+        se.win->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    return core::services::FormatStateBlocks(blocks);
+}
+
+static void SaveScannerSettingsFile() {
+    std::string text = BuildScannerSettingsText();
+    if (text.empty()) return;
+    size_t h = std::hash<std::string>{}(text);
+    if (h == g_lastScannerSettingsHash) return;
+    std::string path = core::services::ConfigFilePath("scanner-settings.cfg");
+    if (path.empty()) return;
+    if (core::services::AtomicWriteText(path, text))
+        g_lastScannerSettingsHash = h;
+}
+
+static void LoadScannerSettingsFromFile() {
+    using namespace core::services;
+    std::string path = ConfigFilePath("scanner-settings.cfg");
+    if (path.empty()) return;
+    bool exists = false;
+    std::string contents = ReadTextFile(path, &exists);
+    if (!exists) return;
+    auto blocks = ParseStateBlocks(contents);
+    // Spawn missing instances so saved blocks beyond index 0 land.
+    int maxInst = -1;
+    for (const auto& b : blocks)
+        if (b.instance > maxInst) maxInst = b.instance;
+    while (maxInst >= (int)g_scannerEntries.size() &&
+           (int)g_scannerEntries.size() < kMaxMultiWin)
+        SpawnScannerWindow((int)g_scannerEntries.size());
+    for (const auto& b : blocks) {
+        if (b.instance < 0 || b.instance >= (int)g_scannerEntries.size()) continue;
+        auto& se = g_scannerEntries[b.instance];
+        if (!se.win) continue;
+        se.win->ApplySettings(b);
+    }
+    g_lastScannerSettingsHash = std::hash<std::string>{}(contents);
+}
+
+// ---- Singleton-window settings persistence (Phase 17 Task #83) -------------
+//
+// One WINDOW:<name> block each for Portfolio, Orders, and WshCalendar.
+// Portfolio: sort column + direction, 7 column-visibility toggles, trade-
+//   history filter symbol buffer.
+// Orders: history-tab filter symbol, side, date.
+// WshCalendar: filter symbol, date range, type, importance, sort col + asc.
+//
+// Active-tab state on Portfolio / Orders is NOT persisted here — both use
+// ImGui TabItem which ImGui's ini file already preserves (Task 2 wired
+// IniFilename to a stable path).
+//
+// File: ~/.config/ibkr-trading-app/singleton-settings.cfg
+// Hash-diff flush, same pattern as chart/trading/scanner.
+
+static size_t g_lastSingletonSettingsHash = 0;
+
+static std::string BuildSingletonSettingsText() {
+    using namespace core::services;
+    std::vector<StateBlock> blocks;
+    blocks.reserve(3);
+
+    if (g_PortfolioWindow) {
+        StateBlock b;
+        b.windowName = "portfolio";
+        g_PortfolioWindow->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    if (g_OrdersWindow) {
+        StateBlock b;
+        b.windowName = "orders";
+        g_OrdersWindow->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    if (g_WshCalendarWindow) {
+        StateBlock b;
+        b.windowName = "wsh";
+        g_WshCalendarWindow->SerializeSettings(b);
+        blocks.push_back(std::move(b));
+    }
+    return FormatStateBlocks(blocks);
+}
+
+static void SaveSingletonSettingsFile() {
+    std::string text = BuildSingletonSettingsText();
+    if (text.empty()) return;
+    size_t h = std::hash<std::string>{}(text);
+    if (h == g_lastSingletonSettingsHash) return;
+    std::string path = core::services::ConfigFilePath("singleton-settings.cfg");
+    if (path.empty()) return;
+    if (core::services::AtomicWriteText(path, text))
+        g_lastSingletonSettingsHash = h;
+}
+
+static void LoadSingletonSettingsFromFile() {
+    using namespace core::services;
+    std::string path = ConfigFilePath("singleton-settings.cfg");
+    if (path.empty()) return;
+    bool exists = false;
+    std::string contents = ReadTextFile(path, &exists);
+    if (!exists) return;
+    auto blocks = ParseStateBlocks(contents);
+    for (const auto& b : blocks) {
+        if (b.windowName == "portfolio" && g_PortfolioWindow)
+            g_PortfolioWindow->ApplySettings(b);
+        else if (b.windowName == "orders" && g_OrdersWindow)
+            g_OrdersWindow->ApplySettings(b);
+        else if (b.windowName == "wsh" && g_WshCalendarWindow)
+            g_WshCalendarWindow->ApplySettings(b);
+    }
+    g_lastSingletonSettingsHash = std::hash<std::string>{}(contents);
+}
+
+// ---- App-wide UI preferences persistence (Phase 17 Task #80) -----------------
+//
+// Stores font size, default trading style for newly-spawned charts, and the
+// TWS Display Group sync toggle. Loaded once at app startup (before the main
+// loop) so font scale is correct from the first frame. Saved on every
+// Settings UI change.
+//
+// File: ~/.config/ibkr-trading-app/app-prefs.cfg
+// Format (no INSTANCE: blocks — singleton settings):
+//   FONT_SIZE:1                 # 0=Small, 1=Medium, 2=Large
+//   DEFAULT_TRADING_STYLE:2     # int enum value (Scalping=0..Free=4)
+//   SYNC_TWS_DISPLAY_GROUPS:0
+static void SaveAppPrefsFile() {
+    using namespace core::services;
+    StateBlock block;
+    SetInt (block, "FONT_SIZE",               (int)g_fontSize);
+    SetInt (block, "DEFAULT_TRADING_STYLE",   (int)g_defaultTradingStyle);
+    SetBool(block, "SYNC_TWS_DISPLAY_GROUPS", g_twsGroupSync);
+    std::string path = ConfigFilePath("app-prefs.cfg");
+    if (path.empty()) return;
+    AtomicWriteText(path, FormatStateBlocks({block}));
+}
+
+static void LoadAppPrefsFromFile() {
+    using namespace core::services;
+    std::string path = ConfigFilePath("app-prefs.cfg");
+    if (path.empty()) return;
+    bool exists = false;
+    std::string contents = ReadTextFile(path, &exists);
+    if (!exists) return;   // first launch — keep construction defaults
+    auto blocks = ParseStateBlocks(contents);
+    if (blocks.empty()) return;
+    const StateBlock& b = blocks[0];   // single singleton block
+
+    int fs = GetInt(b, "FONT_SIZE", (int)g_fontSize, 0, 2);
+    g_fontSize = static_cast<FontSize>(fs);
+
+    int ts = GetInt(b, "DEFAULT_TRADING_STYLE", (int)g_defaultTradingStyle,
+                    0, (int)core::services::TradingStyle::Free);
+    g_defaultTradingStyle = static_cast<core::services::TradingStyle>(ts);
+
+    g_twsGroupSync = GetBool(b, "SYNC_TWS_DISPLAY_GROUPS", g_twsGroupSync);
+    // Note: g_twsGroupSync's IB subscribe call requires a live connection, so
+    // the actual SubscribeToGroupEvents fan-out is left to FinishConnect's
+    // existing post-connect block (line ~2238) which already inspects the
+    // global. Loading the global here just stages it for that hook to fire.
+}
+
+// Apply font-related app-prefs to the live ImGui style. Separated from
+// LoadAppPrefsFromFile because the style must already be set up (g_baseStyle
+// captured) before we re-scale. Caller invokes after g_baseStyle is snapshot.
+static void ApplyAppPrefsToStyle() {
+    int fs = std::clamp((int)g_fontSize, 0, 2);
+    ImGui::GetIO().FontGlobalScale = kFontScales[fs];
+    ImGui::GetStyle() = g_baseStyle;
+    ImGui::GetStyle().ScaleAllSizes(kFontScales[fs]);
+}
+
 // ---- Replay window persistence ------------------------------------------------
 
 static std::string ReplayWindowsFilePath() {
@@ -1571,7 +1936,7 @@ static void SaveReplayWindowsFile() {
         if (!f.is_open()) return;
         for (int i = 0; i < (int)g_replayEntries.size(); ++i) {
             const auto& re = g_replayEntries[i];
-            if (!re.win) continue;
+            if (!re.win || !re.win->open()) continue;
             std::string sym = re.win->getSymbol();
             if (sym.empty()) continue;
             f << "INSTANCE:"  << i << "\n";
@@ -1941,6 +2306,49 @@ static void CreateTradingWindows() {
     };
 }
 
+// Walk every active subscription registered against the current IB session and
+// queue an explicit cancel.  Called on both shutdown paths (user Disconnect
+// menu click + app exit) BEFORE g_IBClient->Disconnect() so IB Gateway sees
+// orderly cancels rather than pending writes against a closing socket — the
+// "Can't write, socket client is closing" log line was IB reporting it had
+// queued depth / market-data updates for our active subscriptions when our
+// eDisconnect() torn down the TCP socket out from under them.
+//
+// Catches the dominant per-instance subscriptions (market data, depth, hist,
+// tick-by-tick) plus the four /ES + /NQ futures health feeds.  Watchlist and
+// WshCalendar windows own their cancels in their dtors via CancelAll().
+// Singleton account-level subscriptions (account updates, PnL, etc.) are
+// already cancelled by the Disconnect() caller.
+static void CancelAllSubscriptions() {
+    if (!g_IBClient) return;
+
+    for (auto& ce : g_chartEntries) {
+        if (ce.mktId)  g_IBClient->CancelMarketData(ce.mktId);
+        if (ce.histId) g_IBClient->CancelHistoricalData(ce.histId);
+        if (ce.extStreamActive && ce.extId)
+            g_IBClient->CancelHistoricalData(ce.extId);
+    }
+
+    for (auto& te : g_tradingEntries) {
+        if (te.mktId)   g_IBClient->CancelMarketData(te.mktId);
+        if (te.depthId) g_IBClient->CancelMktDepth(te.depthId,
+                            te.win ? te.win->useL2() : false);
+        if (te.tickId)  g_IBClient->CancelTickByTickData(te.tickId);
+    }
+
+    // Futures market health feeds (reqIds 140-143: /ES, /NQ front-month + Dec)
+    for (int rid = 140; rid <= 143; ++rid)
+        g_IBClient->CancelMarketData(rid);
+
+    // Watchlist windows hold per-symbol market data subscriptions.  Their
+    // CancelAll() walks the per-instance subs map and queues cancels.
+    for (auto& we : g_watchlistEntries)
+        if (we.win) we.win->CancelAll();
+
+    // WSH calendar holds per-position WSH event subscriptions
+    if (g_WshCalendarWindow) g_WshCalendarWindow->CancelAll();
+}
+
 static void DestroyTradingWindows() {
     SaveWatchlistsFile();
     // Synchronous flush of any unsaved chart-mode changes before the windows
@@ -1950,6 +2358,19 @@ static void DestroyTradingWindows() {
         SaveChartModesFile();
         g_chartModesDirty = false;
     }
+    // Per-chart UI settings (indicator toggles, auto-analysis, setup overlay,
+    // etc.) — hash-diff means this is a no-op when nothing changed since the
+    // last per-second flush.
+    SaveChartSettingsFile();
+    // Per-TradingWindow UI settings (L2 toggle, exchange filter, depth rows,
+    // splitter ratios, click-to-trade, order-entry defaults) — same hash-diff.
+    SaveTradingSettingsFile();
+    // Per-ScannerWindow UI settings (asset class, preset, filter ranges + UI
+    // buffers, column visibility, sort, auto-refresh) — same hash-diff.
+    SaveScannerSettingsFile();
+    // Per-singleton-window settings (Portfolio sort/columns, Orders filter,
+    // WshCalendar filter/sort) — same hash-diff.
+    SaveSingletonSettingsFile();
 
     // Drop ticker-symbol slots before clearing entries — chart mktIds rotate
     // through AllocChartMktId(), so a static-range loop wouldn't catch them.
@@ -2022,9 +2443,20 @@ static void FinishConnect(bool isReconnect) {
         // historical+market-data subscription with the preset's history
         // horizon. Skips the regular AAPL seed below for any chart that was
         // restored from disk (tracked via `restoredCharts`).
-        std::vector<bool> restoredCharts(g_chartEntries.size(), false);
+        //
+        // Spawn any missing instances so saved blocks beyond instance 0
+        // (e.g. G2/G3 charts the user opened in a prior session) can land.
+        std::vector<bool> restoredCharts;
         {
             auto savedModes = LoadChartModesFromFile();
+            int  maxIdx = -1;
+            for (const auto& b : savedModes)
+                if (b.instanceIdx > maxIdx) maxIdx = b.instanceIdx;
+            while (maxIdx >= (int)g_chartEntries.size() &&
+                   (int)g_chartEntries.size() < kMaxMultiWin)
+                SpawnChartWindow((int)g_chartEntries.size());
+
+            restoredCharts.assign(g_chartEntries.size(), false);
             for (const auto& b : savedModes) {
                 if (b.instanceIdx < 0 ||
                     b.instanceIdx >= (int)g_chartEntries.size()) continue;
@@ -2086,6 +2518,34 @@ static void FinishConnect(bool isReconnect) {
             // Loading from disk is not a user-initiated change.
             g_chartModesDirty = false;
         }
+
+        // Apply per-chart UI settings (indicator toggles, auto-analysis,
+        // setup overlay, useRTH / showOvernight / showLegend, splitter
+        // ratios) on top of the chart-modes restore. setTradingStyle in the
+        // restore loop above stamps preset defaults onto IndicatorSettings /
+        // AutoAnalysisSettings / SetupSettings; this load layers the user's
+        // customisations over those defaults. Settings outside the preset
+        // (useRTH/showOvernight/showLegend/splitter ratios) are also
+        // restored here. m_useRTH may now differ from the value used in the
+        // ReqChartData call above — that just means a few extra bars from
+        // IB get filtered at render time, not a correctness bug.
+        LoadChartSettingsFromFile();
+
+        // Apply per-TradingWindow UI settings (L2 mode, exchange filter,
+        // depth row count, splitter ratios, click-to-trade, order-entry
+        // defaults). No subscription side effects — these only take effect
+        // when the user types a symbol; the user-symbol path then issues
+        // ReqMktDepth/ReqMarketData with the restored numDepthRows/useL2.
+        LoadTradingSettingsFromFile();
+
+        // Apply per-ScannerWindow UI settings (asset class, preset, filter
+        // ranges + UI buffers, column visibility, sort, auto-refresh).
+        // No scan side effects — RunScan is user-initiated.
+        LoadScannerSettingsFromFile();
+        // Singleton-window settings: Portfolio sort/columns, Orders filter,
+        // WshCalendar filter/sort. Applied before the first account-data
+        // fan-out so sort orders are correct from the first frame.
+        LoadSingletonSettingsFromFile();
 
         g_IBClient->ReqAccountUpdates(true, g_selectedAccount);
         g_IBClient->ReqPositions();
@@ -3324,6 +3784,7 @@ static void StartSilentReconnect() {
 
 static void Disconnect() {
     if (g_IBClient) {
+        CancelAllSubscriptions();   // flush per-instance cancels before socket close
         g_IBClient->ReqAccountUpdates(false);
         if (g_pnlSubscribed)
             g_IBClient->CancelPnL(9000);
@@ -4011,10 +4472,39 @@ static void RenderSettingsWindow() {
         if (i > 0) ImGui::SameLine(0, 16);
         if (ImGui::RadioButton(kLabels[i], (int)g_fontSize == i)) {
             g_fontSize = static_cast<FontSize>(i);
-            ImGui::GetIO().FontGlobalScale = kFontScales[i];
-            ImGui::GetStyle() = g_baseStyle;
-            ImGui::GetStyle().ScaleAllSizes(kFontScales[i]);
+            ApplyAppPrefsToStyle();
+            SaveAppPrefsFile();
         }
+    }
+
+    ImGui::Spacing();
+    ImGui::SeparatorText("Default Trading Style (new charts)");
+    ImGui::Spacing();
+
+    {
+        using TS = core::services::TradingStyle;
+        static const TS kOrder[] = { TS::Scalping, TS::DayTrading,
+                                     TS::Swing,    TS::Investment, TS::Free };
+        int curIdx = 0;
+        for (int i = 0; i < 5; ++i)
+            if (kOrder[i] == g_defaultTradingStyle) { curIdx = i; break; }
+        const char* curLabel = core::services::TradingStyleLabel(kOrder[curIdx]);
+        ImGui::SetNextItemWidth(180);
+        if (ImGui::BeginCombo("##default_trading_style", curLabel)) {
+            for (int i = 0; i < 5; ++i) {
+                bool sel = (i == curIdx);
+                if (ImGui::Selectable(core::services::TradingStyleLabel(kOrder[i]), sel)) {
+                    g_defaultTradingStyle = kOrder[i];
+                    SaveAppPrefsFile();
+                }
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Applies only to newly-spawned chart windows.\n"
+                "Existing charts keep their own style (saved per-chart).");
     }
 
     ImGui::Spacing();
@@ -4022,8 +4512,10 @@ static void RenderSettingsWindow() {
     ImGui::Spacing();
 
     bool syncVal = g_twsGroupSync;
-    if (ImGui::Checkbox("Sync with TWS Display Groups", &syncVal))
+    if (ImGui::Checkbox("Sync with TWS Display Groups", &syncVal)) {
         SetTwsGroupSync(syncVal);
+        SaveAppPrefsFile();
+    }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             "When ON: this app's G1–G4 groups stay in sync with\n"
@@ -4405,6 +4897,47 @@ static void RenderTradingUI() {
         }
     }
 
+    // Once-per-second flush of chart-settings.cfg. Internally hash-diff'd
+    // against the last write so unchanged frames don't touch disk.
+    {
+        static double s_lastChartSettingsSave = 0.0;
+        double now = glfwGetTime();
+        if (now - s_lastChartSettingsSave > 1.0) {
+            SaveChartSettingsFile();
+            s_lastChartSettingsSave = now;
+        }
+    }
+
+    // Once-per-second flush of trading-settings.cfg (hash-diff'd).
+    {
+        static double s_lastTradingSettingsSave = 0.0;
+        double now = glfwGetTime();
+        if (now - s_lastTradingSettingsSave > 1.0) {
+            SaveTradingSettingsFile();
+            s_lastTradingSettingsSave = now;
+        }
+    }
+
+    // Once-per-second flush of scanner-settings.cfg (hash-diff'd).
+    {
+        static double s_lastScannerSettingsSave = 0.0;
+        double now = glfwGetTime();
+        if (now - s_lastScannerSettingsSave > 1.0) {
+            SaveScannerSettingsFile();
+            s_lastScannerSettingsSave = now;
+        }
+    }
+
+    // Once-per-second flush of singleton-settings.cfg (hash-diff'd).
+    {
+        static double s_lastSingletonSettingsSave = 0.0;
+        double now = glfwGetTime();
+        if (now - s_lastSingletonSettingsSave > 1.0) {
+            SaveSingletonSettingsFile();
+            s_lastSingletonSettingsSave = now;
+        }
+    }
+
     // Push the unguarded-position warning hints once per frame using each
     // chart's freshly-detected S/R. Cheap (positions × charts is small).
     PushUnguardedHintsToWindows();
@@ -4482,6 +5015,42 @@ int main(int argc, char* argv[]) {
               << "Version: 1.0.0   Build: " << __DATE__ << " " << __TIME__ << "\n"
               << "============================================\n";
 
+#if defined(__APPLE__)
+    // macOS has no native Vulkan. We ship MoltenVK + the Vulkan loader next
+    // to the binary (see CMakeLists.txt APPLE block) and point the loader at
+    // our bundled ICD JSON via VK_ICD_FILENAMES *before* any Vulkan call.
+    // VK_DRIVER_FILES is the newer (1.3.207+) loader env var; setting both
+    // covers the entire range of loader versions a brew/SDK install might
+    // bring along. Resolves the "Vulkan not supported" failure on stock
+    // macOS without requiring the user to install the LunarG SDK.
+    {
+        std::filesystem::path exeDir;
+        try {
+            uint32_t bufSize = 0;
+            _NSGetExecutablePath(nullptr, &bufSize);
+            std::string buf(bufSize, '\0');
+            if (_NSGetExecutablePath(buf.data(), &bufSize) == 0) {
+                std::error_code ec;
+                exeDir = std::filesystem::canonical(buf, ec).parent_path();
+            }
+        } catch (...) {}
+        if (!exeDir.empty()) {
+            std::error_code ec;
+            auto icd = exeDir / "vulkan" / "icd.d" / "MoltenVK_icd.json";
+            if (std::filesystem::exists(icd, ec)) {
+                std::string s = icd.string();
+                setenv("VK_ICD_FILENAMES", s.c_str(), 1);
+                setenv("VK_DRIVER_FILES",  s.c_str(), 1);
+            } else {
+                fprintf(stderr,
+                    "[vulkan] bundled MoltenVK_icd.json not found at %s — "
+                    "falling back to system Vulkan ICD search\n",
+                    icd.string().c_str());
+            }
+        }
+    }
+#endif
+
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) { std::cerr << "Failed to initialise GLFW\n"; return 1; }
     if (!glfwVulkanSupported()) {
@@ -4520,6 +5089,17 @@ int main(int argc, char* argv[]) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+
+    // Point ImGui's auto-persisted settings at our config dir so window
+    // positions, sizes, dock arrangement, splitter regions, and table column
+    // widths survive across launches regardless of where the binary is invoked
+    // from. ImGui defaults to "imgui.ini" in CWD, which is unstable (terminal
+    // launch != desktop launch). The pointer must outlive ImGui — keep it
+    // static so it lives for the duration of main().
+    static const std::string g_imguiIniPath =
+        core::services::ConfigFilePath("imgui.ini");
+    if (!g_imguiIniPath.empty())
+        io.IniFilename = g_imguiIniPath.c_str();
 
     // Font sizes are applied via FontGlobalScale at runtime (no atlas rebuild needed).
     // We load a TTF with extended Unicode coverage so IB-returned strings
@@ -4675,6 +5255,12 @@ int main(int argc, char* argv[]) {
         c[ImGuiCol_TextDisabled]         = ImVec4(0.420f, 0.471f, 0.522f, 1.000f); // #6B7885
     }
     g_baseStyle = ImGui::GetStyle(); // snapshot before any scaling
+
+    // Restore persisted app-wide prefs (font size, default trading style for
+    // new charts, TWS Display Group sync toggle) before the first frame
+    // renders. Font scale applies immediately via ApplyAppPrefsToStyle.
+    LoadAppPrefsFromFile();
+    ApplyAppPrefsToStyle();
 
     ImGui_ImplGlfw_InitForVulkan(g_AppWindow, true);
 
@@ -4837,6 +5423,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     if (g_IBClient) {
+        CancelAllSubscriptions();   // flush per-instance cancels before socket close
         g_IBClient->Disconnect();
         delete g_IBClient;
         g_IBClient = nullptr;

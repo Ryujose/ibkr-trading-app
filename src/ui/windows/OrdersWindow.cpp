@@ -1,4 +1,5 @@
 #include "ui/windows/OrdersWindow.h"
+#include "core/services/state-io.h"
 #include "imgui.h"
 #include <ctime>
 #include <cstring>
@@ -7,6 +8,26 @@ namespace ui {
 
 // ============================================================================
 OrdersWindow::OrdersWindow() {}
+
+// ============================================================================
+// State persistence
+// ============================================================================
+
+void OrdersWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+    if (m_filterSymbol[0]) SetString(b, "ORD_FILTER_SYMBOL", m_filterSymbol);
+    SetInt (b, "ORD_FILTER_SIDE",  m_filterSideIdx);
+    if (m_filterDate[0])   SetString(b, "ORD_FILTER_DATE",   m_filterDate);
+}
+
+void OrdersWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+    std::string fs = GetString(b, "ORD_FILTER_SYMBOL", "");
+    if (!fs.empty()) { std::strncpy(m_filterSymbol, fs.c_str(), sizeof(m_filterSymbol)-1); }
+    m_filterSideIdx = GetInt(b, "ORD_FILTER_SIDE", m_filterSideIdx, 0, 2);
+    std::string fd = GetString(b, "ORD_FILTER_DATE", "");
+    if (!fd.empty()) { std::strncpy(m_filterDate, fd.c_str(), sizeof(m_filterDate)-1); }
+}
 
 // ============================================================================
 // Data push-ins

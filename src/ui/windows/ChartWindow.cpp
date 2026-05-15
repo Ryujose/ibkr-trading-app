@@ -1,6 +1,7 @@
 #include "ui/UiScale.h"
 #include "ui/windows/ChartWindow.h"
 #include "ui/SymbolSearch.h"
+#include "core/services/state-io.h"
 
 #include "imgui.h"
 #include "core/models/WindowGroup.h"
@@ -124,6 +125,141 @@ void ChartWindow::AddToHistory(const std::string& symbol) {
 void ChartWindow::setInstanceId(int id) {
     m_instanceId = id;
     std::snprintf(m_title, sizeof(m_title), "Chart %d##chart%d", id, id);
+}
+
+// ============================================================================
+// State persistence — round-trip every user-tunable setting through a single
+// StateBlock. Pure: no IB calls, no rendering side effects. The host
+// (main.cpp::SaveChartSettingsFile / LoadChartSettingsFromFile) hashes the
+// formatted output to decide whether to flush; per-second flush gates on the
+// hash so unchanged charts never touch disk.
+// ============================================================================
+void ChartWindow::SerializeSettings(core::services::StateBlock& b) const {
+    using namespace core::services;
+
+    // ── Display toggles ──
+    SetBool(b, "USE_RTH",        m_useRTH);
+    SetBool(b, "SHOW_OVERNIGHT", m_showOvernight);
+    SetBool(b, "SHOW_LEGEND",    m_showLegend);
+    SetDouble(b, "VOL_RATIO",    m_volumeHeightRatio);
+    SetDouble(b, "RSI_RATIO",    m_rsiHeightRatio);
+
+    // ── IndicatorSettings ──
+    SetBool(b, "IND_SMA20",          m_ind.sma20);
+    SetBool(b, "IND_SMA50",          m_ind.sma50);
+    SetBool(b, "IND_EMA20",          m_ind.ema20);
+    SetBool(b, "IND_BBANDS",         m_ind.bbands);
+    SetBool(b, "IND_VWAP",           m_ind.vwap);
+    SetBool(b, "IND_VWAP_BANDS",     m_ind.vwapBands);
+    SetBool(b, "IND_VOLUME",         m_ind.volume);
+    SetBool(b, "IND_RSI",            m_ind.rsi);
+    SetBool(b, "IND_VOLUME_PROFILE", m_ind.volumeProfile);
+    SetInt   (b, "SMA1_PERIOD", m_ind.smaPeriod1);
+    SetInt   (b, "SMA2_PERIOD", m_ind.smaPeriod2);
+    SetInt   (b, "EMA_PERIOD",  m_ind.emaPeriod);
+    SetInt   (b, "BB_PERIOD",   m_ind.bbPeriod);
+    SetDouble(b, "BB_SIGMA",    m_ind.bbSigma);
+    SetInt   (b, "RSI_PERIOD",  m_ind.rsiPeriod);
+    SetInt   (b, "VP_BINS",     m_ind.vpBins);
+
+    // ── AutoAnalysisSettings ──
+    SetBool(b, "AUTO_SUPPORTS",       m_auto.supports);
+    SetBool(b, "AUTO_RESISTANCES",    m_auto.resistances);
+    SetBool(b, "AUTO_TREND",          m_auto.trend);
+    SetBool(b, "AUTO_DONCHIAN",       m_auto.donchian);
+    SetBool(b, "AUTO_KELTNER",        m_auto.keltner);
+    SetBool(b, "AUTO_FIB",            m_auto.autoFib);
+    SetBool(b, "AUTO_PIVOTS",         m_auto.pivotPoints);
+    SetBool(b, "AUTO_BREAKOUTS",      m_auto.breakouts);
+    SetBool(b, "AUTO_ZONES",          m_auto.zones);
+    SetInt (b, "AUTO_SWING_K",        m_auto.swingK);
+    SetInt (b, "AUTO_TREND_LB",       m_auto.trendLookback);
+    SetInt (b, "AUTO_DONCHIAN_LEN",   m_auto.donchianLen);
+    SetInt (b, "AUTO_MAX_LEVELS",     m_auto.maxLevels);
+    SetInt (b, "AUTO_MIN_TOUCHES",    m_auto.minTouches);
+    SetInt (b, "AUTO_SCAN_CAP",       m_auto.scanCap);
+    SetBool(b, "AUTO_TREND_CHANNEL",  m_auto.trendChannel);
+
+    // ── SetupSettings ──
+    SetBool  (b, "SETUP_OVERLAY",          m_setupSettings.overlay);
+    SetDouble(b, "SETUP_RR_MIN",           m_setupSettings.rrMin);
+    SetDouble(b, "SETUP_ATR_PAD",          m_setupSettings.atrPad);
+    SetDouble(b, "SETUP_ROUND_PAD",        m_setupSettings.roundPad);
+    SetDouble(b, "SETUP_STOP_OFFSET",      m_setupSettings.stopOffset);
+    SetDouble(b, "SETUP_RISK_PCT",         m_setupSettings.riskPct);
+    SetBool  (b, "SETUP_USE_STOP_LMT",     m_setupSettings.useStopLmt);
+    SetBool  (b, "SETUP_TREND_ALIGN",      m_setupSettings.trendAlign);
+    SetBool  (b, "SETUP_VWAP_CONTEXT",     m_setupSettings.vwapContext);
+    SetBool  (b, "SETUP_MARKET_HEALTH",    m_setupSettings.marketHealth);
+    SetBool  (b, "SETUP_RSI_FILTER",       m_setupSettings.rsiFilter);
+    SetBool  (b, "SETUP_VOLUME_CONFLUENCE", m_setupSettings.volumeConfluence);
+    SetBool  (b, "SETUP_MULTI_TARGET",     m_setupSettings.multiTarget);
+    SetDouble(b, "SETUP_MH_MAX_PCT",       m_setupSettings.mhMaxCounterPct);
+    SetDouble(b, "SETUP_T2_SPLIT_PCT",     m_setupSettings.t2SplitPct);
+}
+
+void ChartWindow::ApplySettings(const core::services::StateBlock& b) {
+    using namespace core::services;
+
+    // ── Display toggles ──
+    m_useRTH            = GetBool  (b, "USE_RTH",        m_useRTH);
+    m_showOvernight     = GetBool  (b, "SHOW_OVERNIGHT", m_showOvernight);
+    m_showLegend        = GetBool  (b, "SHOW_LEGEND",    m_showLegend);
+    m_volumeHeightRatio = (float)GetDouble(b, "VOL_RATIO", m_volumeHeightRatio, 0.05, 0.50);
+    m_rsiHeightRatio    = (float)GetDouble(b, "RSI_RATIO", m_rsiHeightRatio,    0.05, 0.40);
+
+    // ── IndicatorSettings ──
+    m_ind.sma20         = GetBool(b, "IND_SMA20",          m_ind.sma20);
+    m_ind.sma50         = GetBool(b, "IND_SMA50",          m_ind.sma50);
+    m_ind.ema20         = GetBool(b, "IND_EMA20",          m_ind.ema20);
+    m_ind.bbands        = GetBool(b, "IND_BBANDS",         m_ind.bbands);
+    m_ind.vwap          = GetBool(b, "IND_VWAP",           m_ind.vwap);
+    m_ind.vwapBands     = GetBool(b, "IND_VWAP_BANDS",     m_ind.vwapBands);
+    m_ind.volume        = GetBool(b, "IND_VOLUME",         m_ind.volume);
+    m_ind.rsi           = GetBool(b, "IND_RSI",            m_ind.rsi);
+    m_ind.volumeProfile = GetBool(b, "IND_VOLUME_PROFILE", m_ind.volumeProfile);
+    m_ind.smaPeriod1    = GetInt   (b, "SMA1_PERIOD", m_ind.smaPeriod1, 2, 500);
+    m_ind.smaPeriod2    = GetInt   (b, "SMA2_PERIOD", m_ind.smaPeriod2, 2, 500);
+    m_ind.emaPeriod     = GetInt   (b, "EMA_PERIOD",  m_ind.emaPeriod,  2, 500);
+    m_ind.bbPeriod      = GetInt   (b, "BB_PERIOD",   m_ind.bbPeriod,   2, 500);
+    m_ind.bbSigma       = (float)GetDouble(b, "BB_SIGMA", m_ind.bbSigma, 0.1, 5.0);
+    m_ind.rsiPeriod     = GetInt   (b, "RSI_PERIOD",  m_ind.rsiPeriod,  2, 500);
+    m_ind.vpBins        = GetInt   (b, "VP_BINS",     m_ind.vpBins,     10, 200);
+
+    // ── AutoAnalysisSettings ──
+    m_auto.supports      = GetBool(b, "AUTO_SUPPORTS",      m_auto.supports);
+    m_auto.resistances   = GetBool(b, "AUTO_RESISTANCES",   m_auto.resistances);
+    m_auto.trend         = GetBool(b, "AUTO_TREND",         m_auto.trend);
+    m_auto.donchian      = GetBool(b, "AUTO_DONCHIAN",      m_auto.donchian);
+    m_auto.keltner       = GetBool(b, "AUTO_KELTNER",       m_auto.keltner);
+    m_auto.autoFib       = GetBool(b, "AUTO_FIB",           m_auto.autoFib);
+    m_auto.pivotPoints   = GetBool(b, "AUTO_PIVOTS",        m_auto.pivotPoints);
+    m_auto.breakouts     = GetBool(b, "AUTO_BREAKOUTS",     m_auto.breakouts);
+    m_auto.zones         = GetBool(b, "AUTO_ZONES",         m_auto.zones);
+    m_auto.swingK        = GetInt (b, "AUTO_SWING_K",       m_auto.swingK,        1, 20);
+    m_auto.trendLookback = GetInt (b, "AUTO_TREND_LB",      m_auto.trendLookback, 5, 500);
+    m_auto.donchianLen   = GetInt (b, "AUTO_DONCHIAN_LEN",  m_auto.donchianLen,   2, 200);
+    m_auto.maxLevels     = GetInt (b, "AUTO_MAX_LEVELS",    m_auto.maxLevels,     1, 10);
+    m_auto.minTouches    = GetInt (b, "AUTO_MIN_TOUCHES",   m_auto.minTouches,    1, 10);
+    m_auto.scanCap       = GetInt (b, "AUTO_SCAN_CAP",      m_auto.scanCap,       0, 100000);
+    m_auto.trendChannel  = GetBool(b, "AUTO_TREND_CHANNEL", m_auto.trendChannel);
+
+    // ── SetupSettings ──
+    m_setupSettings.overlay          = GetBool  (b, "SETUP_OVERLAY",          m_setupSettings.overlay);
+    m_setupSettings.rrMin            = GetDouble(b, "SETUP_RR_MIN",           m_setupSettings.rrMin,       1.0, 10.0);
+    m_setupSettings.atrPad           = GetDouble(b, "SETUP_ATR_PAD",          m_setupSettings.atrPad,      0.1, 5.0);
+    m_setupSettings.roundPad         = GetDouble(b, "SETUP_ROUND_PAD",        m_setupSettings.roundPad,    0.0, 1.0);
+    m_setupSettings.stopOffset       = GetDouble(b, "SETUP_STOP_OFFSET",      m_setupSettings.stopOffset,  0.0, 5.0);
+    m_setupSettings.riskPct          = GetDouble(b, "SETUP_RISK_PCT",         m_setupSettings.riskPct,     0.05, 10.0);
+    m_setupSettings.useStopLmt       = GetBool  (b, "SETUP_USE_STOP_LMT",     m_setupSettings.useStopLmt);
+    m_setupSettings.trendAlign       = GetBool  (b, "SETUP_TREND_ALIGN",      m_setupSettings.trendAlign);
+    m_setupSettings.vwapContext      = GetBool  (b, "SETUP_VWAP_CONTEXT",     m_setupSettings.vwapContext);
+    m_setupSettings.marketHealth     = GetBool  (b, "SETUP_MARKET_HEALTH",    m_setupSettings.marketHealth);
+    m_setupSettings.rsiFilter        = GetBool  (b, "SETUP_RSI_FILTER",       m_setupSettings.rsiFilter);
+    m_setupSettings.volumeConfluence = GetBool  (b, "SETUP_VOLUME_CONFLUENCE", m_setupSettings.volumeConfluence);
+    m_setupSettings.multiTarget      = GetBool  (b, "SETUP_MULTI_TARGET",     m_setupSettings.multiTarget);
+    m_setupSettings.mhMaxCounterPct  = GetDouble(b, "SETUP_MH_MAX_PCT",       m_setupSettings.mhMaxCounterPct, 0.0, 5.0);
+    m_setupSettings.t2SplitPct       = GetDouble(b, "SETUP_T2_SPLIT_PCT",     m_setupSettings.t2SplitPct,      0.0, 100.0);
 }
 
 void ChartWindow::setTradingStyle(core::services::TradingStyle s, bool silent) {
@@ -333,7 +469,23 @@ void ChartWindow::PrependHistoricalData(const core::BarSeries& older) {
         return;
     }
 
-    int prependCount = (int)merged.bars.size();
+    int rawPrependCount = (int)merged.bars.size();
+
+    // Snapshot the filtered-array size before the rebuild. The shift below
+    // must use the *filtered* prepend count, not the raw older-bar count:
+    // RebuildFlatArrays() drops bars that fall in filtered sessions
+    // (Overnight when m_showOvernight=false; anything non-Regular when
+    // m_useRTH=true). For stocks during RTH that's ~0 bars; for /ES
+    // intraday with useRTH=false + showOvernight=false it's ~8 hours of
+    // Overnight bars per trading day. Using the raw count there
+    // over-shifts m_xMin/m_xMax past the new filtered tail, sliding every
+    // previously-visible candle off-screen to the left — the symptom the
+    // user reports as "candles disappear suddenly" on futures. New live
+    // bars then accumulate at the actual filtered tail, and only when
+    // they pile up enough for UpdateLiveBar's auto-scroll (newIdx >=
+    // m_xMax - 0.5) to catch up does the view snap back ("continues
+    // printing again new candles").
+    int filteredBefore = (int)m_idxs.size();
 
     // Append existing bars after the older ones
     for (const auto& b : m_series.bars) merged.bars.push_back(b);
@@ -342,9 +494,20 @@ void ChartWindow::PrependHistoricalData(const core::BarSeries& older) {
     RebuildFlatArrays();
     ComputeIndicators();
 
+    int filteredAfter        = (int)m_idxs.size();
+    int filteredPrependCount = filteredAfter - filteredBefore;
+
     // Shift the X axis links right so the visible window stays on the same candles
-    m_xMin += prependCount;
-    m_xMax += prependCount;
+    m_xMin += filteredPrependCount;
+    m_xMax += filteredPrependCount;
+
+    if (filteredPrependCount != rawPrependCount) {
+        fprintf(stderr, "[ChartWindow] PrependHistoricalData session-filtered: "
+                        "%s raw=%d filtered=%d (%d dropped)\n",
+                m_symbol, rawPrependCount, filteredPrependCount,
+                rawPrependCount - filteredPrependCount);
+        fflush(stderr);
+    }
 }
 
 void ChartWindow::UpdateLiveBar(const core::Bar& bar) {
@@ -367,11 +530,23 @@ void ChartWindow::UpdateLiveBar(const core::Bar& bar) {
         m_volumes[i] = bar.volume;
         ComputeIndicators();
     } else if (bar.timestamp > m_xs.back()) {
-        // New bar completed — append
+        // New bar completed — append.
+        //
+        // m_idxs is built by RebuildFlatArrays as a *sequential* filtered
+        // index (idx++ only on bars that pass the session filter), not the
+        // raw m_series.bars index. For futures with useRTH=false +
+        // showOvernight=false ~8 hours of Overnight bars are dropped per
+        // trading day, so the raw series index is much larger than the
+        // filtered count. Pushing the raw index here creates a huge gap in
+        // m_idxs — the new bar plots far to the right of the existing
+        // candles, the auto-scroll below shifts m_xMax/m_xMin past the
+        // filtered tail, and every previously-visible candle slides
+        // off-screen ("candles disappear suddenly; a new candle appears
+        // alone again") until the next full RebuildFlatArrays renormalises
+        // the indices.
         m_series.bars.push_back(bar);
-        int n = (int)m_series.bars.size();
         m_xs.push_back(bar.timestamp);
-        m_idxs.push_back((double)(n - 1));
+        m_idxs.push_back((double)m_idxs.size());
         m_opens.push_back(bar.open);   m_highs.push_back(bar.high);
         m_lows.push_back(bar.low);     m_closes.push_back(bar.close);
         m_volumes.push_back(bar.volume);

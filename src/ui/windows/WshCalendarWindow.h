@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace core::services { struct StateBlock; }
+
 namespace ui {
 
 struct WshCalendarEntry {
@@ -52,6 +54,10 @@ public:
     std::function<void(int reqId, long conId)> OnReqWshEvents;
     std::function<void(int reqId)>             OnCancelWshEvents;
     std::function<void(const std::string&)>    OnBroadcastSymbol;
+
+    // ── State persistence ───────────────────────────────────────────────────
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
 
 private:
     bool m_open = true;

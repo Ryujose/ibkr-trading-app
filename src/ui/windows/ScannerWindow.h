@@ -7,6 +7,8 @@
 #include <random>
 #include <functional>
 
+namespace core::services { struct StateBlock; }   // state-io.h, used by SerializeSettings/ApplySettings
+
 namespace ui {
 
 // ============================================================================
@@ -45,6 +47,16 @@ public:
     void        setInstanceId(int id);
     int         instanceId() const    { return m_instanceId; }
     const char* getPresetLabel() const;
+
+    // ── State persistence ────────────────────────────────────────────────────
+    // SerializeSettings fills `b` with every user-tunable preference: asset
+    // class, preset index, filter ranges (price / %chg / volume / mkt cap /
+    // RSI / sector / exchange), filter UI buffers, column visibility toggles,
+    // sort column + direction, filter-bar expanded flag, auto-refresh
+    // settings. ApplySettings reads the same keys back. Both are pure — no
+    // IB calls, no scan side effects.
+    void SerializeSettings(core::services::StateBlock& b) const;
+    void ApplySettings    (const core::services::StateBlock& b);
 
     // --- IB Gateway callbacks (future integration) ---
     void OnScanData(int reqId, const std::vector<core::ScanResult>& results);
