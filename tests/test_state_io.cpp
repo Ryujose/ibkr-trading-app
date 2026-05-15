@@ -2,8 +2,8 @@
 //
 // Filesystem helpers (EnsureConfigDir, AtomicWriteText, ReadTextFile) are
 // exercised in a fresh temp dir to stay isolated from the developer's actual
-// ~/.config/ibkr-trading-app. We override $HOME for the duration of the test
-// block so EnsureConfigDir lands in /tmp.
+// ~/.config/ibkr-trading-app. We override $HOME (and $USERPROFILE on Windows)
+// for the duration of the test block so EnsureConfigDir lands in /tmp.
 
 #include "core/services/state-io.h"
 
@@ -13,6 +13,26 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+
+namespace {
+// MSVC has no setenv/unsetenv — use _putenv_s. Empty value on _putenv_s
+// unsets the variable, matching unsetenv() semantics. POSIX setenv with
+// overwrite=1 maps directly.
+inline void SetEnvVar(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, 1);
+#endif
+}
+inline void UnsetEnvVar(const char* name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    ::unsetenv(name);
+#endif
+}
+}  // namespace
 
 using core::services::AtomicWriteText;
 using core::services::ConfigFilePath;
@@ -32,10 +52,13 @@ using core::services::StateBlock;
 
 namespace {
 
-// Test fixture: redirects $HOME so EnsureConfigDir hits a temp dir.
+// Test fixture: redirects $HOME (and $USERPROFILE on Windows, since
+// EnsureConfigDir falls back to it) so EnsureConfigDir hits a temp dir.
 struct HomeOverride {
     std::string oldHome;
+    std::string oldUserProfile;
     bool hadHome = false;
+    bool hadUserProfile = false;
     std::filesystem::path tempHome;
 
     HomeOverride() {
@@ -43,15 +66,22 @@ struct HomeOverride {
             hadHome = true;
             oldHome = h;
         }
+        if (const char* u = std::getenv("USERPROFILE")) {
+            hadUserProfile = true;
+            oldUserProfile = u;
+        }
         tempHome = std::filesystem::temp_directory_path() /
                    ("ibkr-stateio-test-" + std::to_string(std::rand()));
         std::filesystem::create_directories(tempHome);
-        setenv("HOME", tempHome.string().c_str(), 1);
+        SetEnvVar("HOME", tempHome.string().c_str());
+        SetEnvVar("USERPROFILE", tempHome.string().c_str());
     }
 
     ~HomeOverride() {
-        if (hadHome) setenv("HOME", oldHome.c_str(), 1);
-        else         unsetenv("HOME");
+        if (hadHome) SetEnvVar("HOME", oldHome.c_str());
+        else         UnsetEnvVar("HOME");
+        if (hadUserProfile) SetEnvVar("USERPROFILE", oldUserProfile.c_str());
+        else                UnsetEnvVar("USERPROFILE");
         std::error_code ec;
         std::filesystem::remove_all(tempHome, ec);
     }
